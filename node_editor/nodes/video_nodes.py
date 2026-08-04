@@ -1,0 +1,1405 @@
+# node_editor/nodes/video_nodes.py
+
+import tkinter as tk
+from tkinter import ttk
+import threading
+import queue
+import time
+import platform
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+
+from node_editor.base_node import BaseNode
+from node_editor.pin_types import PinSchema, PinDef, PinType
+from node_editor.execution import ExecutionMode
+
+
+class WebcamInputNode(BaseNode):
+    """
+    Captures frames from a camera device (cv2.VideoCapture).
+    Runs in STREAMING mode: a dedicated thread reads frames
+    and pushes them downstream via push_output().
+
+    Supports:
+      - Camera index selector (0, 1, 2 ...)
+      - Resolution selector
+      - Target FPS control
+      - Start / Stop button
+      - Live FPS display
+    """
+    EXECUTION_MODE = ExecutionMode.STREAMING
+    NODE_TYPE      = "webcam_input"
+    DISPLAY_NAME   = "Webcam Input"
+    CATEGORY       = "source"
+    NODE_WIDTH     = 250
+    NODE_HEIGHT    = 155
+    # Pin labels are drawn by NodeEditorApp. Use a light color because this
+    # node's dark body makes the default dark output-label text unreadable.
+    OUTPUT_PIN_LABEL_COLOR = "#d8efff"
+
+    _RESOLUTIONS = [
+        ("320 x 240",   320,  240),
+        ("640 x 480",   640,  480),
+        ("1280 x 720",  1280, 720),
+        ("1920 x 1080", 1920, 1080),
+        ("3840 x 2160", 3840, 2160),
+    ]
+    _DEFAULT_RES_IDX = 1   # 640 x 480
+
+    def get_pin_schema(self) -> PinSchema:
+        return PinSchema(
+            inputs=[],
+            outputs=[PinDef("image", PinType.IMAGE, "frame",
+                            shape=(-1, -1, 3), dtype="uint8")]
+        )
+
+    def build_body(self) -> None:
+        x, y, w, h = self.x, self.y, self.width, self.height
+
+        if not hasattr(self, "_cam_idx_var"):
+            self._cam_idx_var = tk.IntVar(value=0)
+            self._res_var = tk.StringVar(value=self._RESOLUTIONS[self._DEFAULT_RES_IDX][0])
+            self._fps_var = tk.IntVar(value=30)
+            self._btn_var = tk.StringVar(value="Start")
+            self._status_var = tk.StringVar(value="stopped")
+            self._btn = None
+
+        # Compact canvas shell (Phase 2).
+        self._body_rect = self.canvas.create_rectangle(
+            x, y, x+w, y+h,
+            fill="#1a1a2e", outline="#4488cc", width=2,
+            tags=(self.node_id, "node_body"))
+        self._title_item = self.canvas.create_text(
+            x+w/2, y+13,
+            text=self.DISPLAY_NAME,
+            font=("Arial", 9, "bold"), fill="#88ccff",
+            tags=(self.node_id,))
+
+        status_lbl = tk.Label(
+            self.canvas, textvariable=self._status_var,
+            font=("Arial", 8), bg="#1a1a2e", fg="#55ff88")
+        self.canvas.create_window(
+            x+w/2, y+h-12, window=status_lbl,
+            tags=(self.node_id,))
+
+        self._canvas_items += [self._body_rect, self._title_item]
+
+        # ── internal state ────────────────────────────────────────
+        self._cap:        cv2.VideoCapture | None = None
+        self._thread:     threading.Thread | None = None
+        self._stop_event: threading.Event         = threading.Event()
+        self._is_running: bool                    = False
+        self._frame_times: list[float]            = []
+
+    def build_inspector(self, parent: tk.Frame) -> None:
+        tk.Label(parent, text="Camera:", font=("Arial", 9)).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=2)
+        cam_sb = tk.Spinbox(parent, from_=0, to=9, textvariable=self._cam_idx_var, width=4, font=("Arial", 9))
+        cam_sb.grid(row=0, column=1, sticky="w", pady=2)
+
+        tk.Label(parent, text="Resolution:", font=("Arial", 9)).grid(row=1, column=0, sticky="w", padx=(0, 8), pady=2)
+        res_cb = ttk.Combobox(parent, textvariable=self._res_var, values=[r[0] for r in self._RESOLUTIONS],
+                              width=14, state="readonly", font=("Arial", 9))
+        res_cb.grid(row=1, column=1, sticky="ew", pady=2)
+
+        tk.Label(parent, text="Target FPS:", font=("Arial", 9)).grid(row=2, column=0, sticky="w", padx=(0, 8), pady=2)
+        fps_sb = tk.Spinbox(parent, from_=1, to=60, textvariable=self._fps_var, width=5, font=("Arial", 9))
+        fps_sb.grid(row=2, column=1, sticky="w", pady=2)
+
+        self._btn = tk.Button(parent, textvariable=self._btn_var, font=("Arial", 9, "bold"),
+                              bg="#226688", fg="white", activebackground="#338899",
+                              command=self._toggle_stream, relief=tk.FLAT, padx=8)
+        self._btn.grid(row=3, column=0, columnspan=2, pady=(8, 4), sticky="w")
+
+        status_lbl = tk.Label(parent, textvariable=self._status_var, font=("Arial", 9), fg="#226622")
+        status_lbl.grid(row=4, column=0, columnspan=2, sticky="w")
+
+        parent.grid_columnconfigure(1, weight=1)
+
+    def close_inspector(self) -> None:
+        super().close_inspector()
+        self._btn = None
+
+    # ── stream control ────────────────────────────────────────────
+
+    def _toggle_stream(self) -> None:
+        if self._is_running:
+            self.stop_stream()
+        else:
+            self.start_stream()
+
+    def start_stream(self) -> None:
+        if self._is_running:
+            return
+
+        idx    = self._cam_idx_var.get()
+        res    = self._res_var.get()
+        rentry = next((r for r in self._RESOLUTIONS
+                       if r[0] == res),
+                      self._RESOLUTIONS[self._DEFAULT_RES_IDX])
+
+        system_name = platform.system().lower()
+        if system_name.startswith("win"):
+            # Windows: DirectShow backend is often needed for BRIO 4K.
+            self._cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        elif system_name.startswith("linux"):
+            # Linux: V4L2 backend is typically required for high-res webcam modes.
+            self._cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        else:
+            # macOS and other platforms.
+            self._cap = cv2.VideoCapture(idx)
+
+        if not self._cap.isOpened():
+            self._status_var.set(f"cannot open cam {idx}")
+            return
+
+        # Request MJPG first; many webcams need this for 4K/30 capture modes.
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        self._cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  rentry[1])
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rentry[2])
+        self._cap.set(cv2.CAP_PROP_FPS, self._fps_var.get())
+
+        actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0.0)
+
+        req_w, req_h = int(rentry[1]), int(rentry[2])
+        if actual_w != req_w or actual_h != req_h:
+            self._status_var.set(
+                f"requested {req_w}x{req_h}, got {actual_w}x{actual_h} @ {actual_fps:.1f}fps"
+            )
+        else:
+            self._status_var.set(
+                f"{actual_w}x{actual_h} @ {actual_fps:.1f}fps"
+            )
+
+        self._stop_event.clear()
+        self._is_running = True
+        self._btn_var.set("Stop")
+        if self._btn is not None and self._btn.winfo_exists():
+            self._btn.config(bg="#882222")
+        if "requested" not in self._status_var.get():
+            self._status_var.set("starting...")
+        self._frame_times = []
+
+        self._thread = threading.Thread(
+            target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def stop_stream(self) -> None:
+        self._stop_event.set()
+        self._is_running = False
+        self._btn_var.set("Start")
+        if self._btn is not None and self._btn.winfo_exists():
+            self._btn.config(bg="#226688")
+        self._status_var.set("stopped")
+        if self._cap:
+            self._cap.release()
+            self._cap = None
+
+    def _capture_loop(self) -> None:
+        """
+        Runs in a worker thread.
+        Reads frames from the camera and calls push_output().
+        Throttles to the target FPS using a sleep.
+        """
+        target_fps      = max(1, self._fps_var.get())
+        frame_interval  = 1.0 / target_fps
+
+        while not self._stop_event.is_set():
+            t0 = time.perf_counter()
+
+            if self._cap is None or not self._cap.isOpened():
+                break
+
+            ret, frame = self._cap.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
+
+            # BGR → RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # track real FPS
+            now = time.perf_counter()
+            self._frame_times.append(now)
+            self._frame_times = [
+                t for t in self._frame_times if now - t < 2.0]
+            real_fps = len(self._frame_times) / 2.0
+
+            # push to downstream (thread-safe via Engine queue)
+            self.push_output({
+                "image": frame_rgb,
+                "_fps":  real_fps,       # metadata, not a pin
+            })
+
+            # throttle
+            elapsed = time.perf_counter() - t0
+            sleep   = frame_interval - elapsed
+            if sleep > 0:
+                time.sleep(sleep)
+
+        # update UI from main thread
+        self.canvas.after(
+            0, lambda: self._status_var.set("stopped"))
+
+    def _update_fps_display(self, fps: float) -> None:
+        """Called from main thread by VideoPlayOutputNode or Engine."""
+        self._status_var.set(f"{fps:.1f} fps")
+
+    # ── compute (not used in STREAMING) ──────────────────────────
+
+    def compute(self, inputs: dict) -> dict:
+        return {}
+
+    # ── serialization ─────────────────────────────────────────────
+
+    def get_params(self) -> dict:
+        return {
+            "cam_idx":    self._cam_idx_var.get(),
+            "resolution": self._res_var.get(),
+            "fps":        self._fps_var.get(),
+        }
+
+    def set_params(self, params: dict) -> None:
+        self._cam_idx_var.set(params.get("cam_idx",    0))
+        self._res_var.set(    params.get("resolution",
+                              self._RESOLUTIONS[self._DEFAULT_RES_IDX][0]))
+        self._fps_var.set(    params.get("fps", 30))
+
+    def on_destroy(self) -> None:
+        self.stop_stream()
+        super().on_destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class VideoPlayOutputNode(BaseNode):
+    """
+    Receives IMAGE frames and displays them inside the node body.
+    Automatically updates at the rate frames arrive.
+
+    Features:
+      - Resize-aware display area with preserved image aspect ratio
+      - Hover highlight and optional cursor image-coordinate readout
+      - Mouse-centered wheel zoom and left-drag panning
+      - Optional FPS display overlay
+    - Larger floating preview window
+      - Freeze button to pause display without stopping upstream
+    """
+    EXECUTION_MODE = ExecutionMode.SYNC
+    NODE_TYPE      = "video_play_output"
+    DISPLAY_NAME   = "Video Output"
+    CATEGORY       = "visualize"
+    NODE_WIDTH     = 220
+    NODE_HEIGHT    = 200
+    _GRID_PIXEL_THRESHOLD = 5.0
+    _MAX_GRID_LINES = 400
+
+    _INTERPOLATIONS = {
+        "NEAREST": cv2.INTER_NEAREST,
+        "LINEAR": cv2.INTER_LINEAR,
+        "CUBIC": cv2.INTER_CUBIC,
+        "AREA": cv2.INTER_AREA,
+        "LANCZOS4": cv2.INTER_LANCZOS4,
+    }
+
+    def __init__(self, node_id: str, canvas: tk.Canvas):
+        super().__init__(node_id, canvas)
+
+        # Initialize callback-referenced state early so events can never
+        # observe missing attributes.
+        self._photo = None
+        self._preview_win = None
+        self._preview_label = None
+        self._preview_photo = None
+        self._frame_times = []
+        self._last_frame = None
+        self._first_frame_received = False
+
+        self._img_hover = False
+        self._is_panning = False
+        self._pan_anchor_canvas = None
+        self._pan_anchor_center = None
+
+        self._zoom = 1.0
+        self._view_cx = None
+        self._view_cy = None
+        self._min_zoom = 0.01
+        self._max_zoom = 500.0
+
+        self._grid_items = []
+        self._interp_var = tk.StringVar(value="NEAREST")
+        self._interp_menu = None
+        self._last_coords_value: str | None = None
+        self._coords_copied = False
+        self._help_popup: tk.Toplevel | None = None
+
+    def get_pin_schema(self) -> PinSchema:
+        return PinSchema(
+            inputs=[PinDef("image", PinType.IMAGE, "frame",
+                           shape=(-1, -1, 3), dtype="uint8")],
+            outputs=[
+                PinDef("image_coords", PinType.ARRAY, "coords", shape=(1, 2), dtype="float32"),
+            ]
+        )
+
+    def build_body(self) -> None:
+        x, y, w, h = self.x, self.y, self.width, self.height
+
+        # ── body & title ─────────────────────────────────────────
+        self._body_rect = self.canvas.create_rectangle(
+            x, y, x+w, y+h,
+            fill="#0d0d1a", outline="#4488cc", width=2,
+            tags=(self.node_id, "node_body"))
+        self._title_item = self.canvas.create_text(
+            x+w/2, y+13,
+            text=self.DISPLAY_NAME,
+            font=("Arial", 9, "bold"), fill="#88ccff",
+            tags=(self.node_id,))
+
+        self._img_area_tag = f"img_area_{self.node_id}"
+
+        # ── image display area ────────────────────────────────────
+        self._img_w = w - 8
+        self._img_h = h - 50
+
+        self._img_border = self.canvas.create_rectangle(
+            x+4, y+22, x+w-4, y+22+self._img_h,
+            fill="#111133", outline="#334466", width=1,
+            tags=(self.node_id, self._img_area_tag))
+
+        self._img_canvas_item = self.canvas.create_image(
+            x + w//2, y + 22 + self._img_h//2,
+            anchor="center",
+            tags=(self.node_id, self._img_area_tag))
+
+        # placeholder rectangle (shown before first frame)
+        self._placeholder = self.canvas.create_rectangle(
+            x+4, y+22, x+w-4, y+22+self._img_h,
+            fill="#111133", outline="#334466",
+            tags=(self.node_id, self._img_area_tag))
+        self._placeholder_text = self.canvas.create_text(
+            x+w/2, y+22+self._img_h//2,
+            text="awaiting frames...",
+            font=("Arial", 8), fill="#446688",
+            tags=(self.node_id, self._img_area_tag))
+
+        # ── bottom controls ───────────────────────────────────────
+        ctrl_y = y + h - 26
+
+        self._freeze_var = tk.BooleanVar(value=False)
+        freeze_cb = tk.Checkbutton(
+            self.canvas, text="Freeze",
+            variable=self._freeze_var,
+            font=("Arial", 8),
+            bg="#0d0d1a", fg="#aaccff",
+            selectcolor="#223344",
+            activebackground="#0d0d1a",
+            activeforeground="#ffffff")
+        self.canvas.create_window(
+            x+10, ctrl_y, window=freeze_cb, anchor="nw",
+            tags=(self.node_id,))
+
+        self._show_fps_var = tk.BooleanVar(value=True)
+        fps_cb = tk.Checkbutton(
+            self.canvas, text="FPS",
+            variable=self._show_fps_var,
+            font=("Arial", 8),
+            bg="#0d0d1a", fg="#aaccff",
+            selectcolor="#223344",
+            activebackground="#0d0d1a",
+            activeforeground="#ffffff")
+        self.canvas.create_window(
+            x+w-55, ctrl_y, window=fps_cb, anchor="nw",
+            tags=(self.node_id,))
+
+        self._show_coords_var = tk.BooleanVar(value=True)
+        coords_cb = tk.Checkbutton(
+            self.canvas, text="Coords",
+            variable=self._show_coords_var,
+            font=("Arial", 8),
+            bg="#0d0d1a", fg="#aaccff",
+            selectcolor="#223344",
+            activebackground="#0d0d1a",
+            activeforeground="#ffffff")
+        self.canvas.create_window(
+            x+w-120, ctrl_y, window=coords_cb, anchor="nw",
+            tags=(self.node_id,))
+
+        self._show_grid_var = tk.BooleanVar(value=False)
+        grid_cb = tk.Checkbutton(
+            self.canvas, text="Grid",
+            variable=self._show_grid_var,
+            font=("Arial", 8),
+            bg="#0d0d1a", fg="#aaccff",
+            selectcolor="#223344",
+            activebackground="#0d0d1a",
+            activeforeground="#ffffff")
+        self.canvas.create_window(
+            x+66, ctrl_y, window=grid_cb, anchor="nw",
+            tags=(self.node_id,))
+
+        # ── FPS overlay text on canvas ────────────────────────────
+        self._fps_text = self.canvas.create_text(
+            x+w-10, y+26,
+            text="", anchor="ne",
+            font=("Arial", 8, "bold"),
+            fill="#00ff88",
+            tags=(self.node_id,))
+
+        self._coords_text = self.canvas.create_text(
+            x+8, y+26,
+            text="", anchor="nw",
+            font=("Arial", 8, "bold"),
+            fill="#ffd060",
+            tags=(self.node_id,))
+
+        # ── status ────────────────────────────────────────────────
+        self._status_var = tk.StringVar(value="")
+        status_lbl = tk.Label(
+            self.canvas, textvariable=self._status_var,
+            font=("Arial", 7), bg="#0d0d1a", fg="#aaaaaa")
+        self.canvas.create_window(
+            x+w/2, y+h-10, window=status_lbl,
+            tags=(self.node_id,))
+
+        # ── double-click → floating preview ──────────────────────
+        self.canvas.tag_bind(
+            self.node_id, "<Double-Button-1>",
+            lambda e: self._open_preview())
+
+        self.canvas.tag_bind(self._img_area_tag, "<Enter>", self._on_img_enter)
+        self.canvas.tag_bind(self._img_area_tag, "<Leave>", self._on_img_leave)
+        self.canvas.tag_bind(self._img_area_tag, "<Motion>", self._on_img_motion)
+        self.canvas.tag_bind(self._img_area_tag, "<ButtonPress-1>", self._on_img_press)
+        self.canvas.tag_bind(self._img_area_tag, "<B1-Motion>", self._on_img_drag)
+        self.canvas.tag_bind(self._img_area_tag, "<ButtonRelease-1>", self._on_img_release)
+        self.canvas.tag_bind(self._img_area_tag, "<Button-3>", self._on_img_right_click)
+
+        # Mouse wheel cannot be bound with tag_bind on canvas items; bind at canvas level
+        # and gate by this node's hover/focus state.
+        self.canvas.bind("<MouseWheel>", self._on_canvas_mousewheel, add="+")
+        self.canvas.bind("<Button-4>", self._on_canvas_wheel_linux, add="+")
+        self.canvas.bind("<Button-5>", self._on_canvas_wheel_linux, add="+")
+        self.canvas.bind("<KeyPress-plus>", self._on_zoom_in_hotkey, add="+")
+        self.canvas.bind("<KeyPress-minus>", self._on_zoom_out_hotkey, add="+")
+        self.canvas.bind("<KeyPress-KP_Add>", self._on_zoom_in_hotkey, add="+")
+        self.canvas.bind("<KeyPress-KP_Subtract>", self._on_zoom_out_hotkey, add="+")
+        self.canvas.bind("<KeyPress-c>", self._on_copy_coords_hotkey, add="+")
+        self.canvas.bind("<KeyPress-C>", self._on_copy_coords_hotkey, add="+")
+        self.canvas.bind("<Control-h>", self._on_help_hotkey, add="+")
+        self.canvas.bind("<Control-H>", self._on_help_hotkey, add="+")
+
+        self._canvas_items += [
+            self._body_rect, self._title_item,
+            self._img_border, self._img_canvas_item, self._placeholder,
+            self._placeholder_text, self._fps_text, self._coords_text]
+
+        # ── internal state ────────────────────────────────────────
+        self._photo:         ImageTk.PhotoImage | None = None
+        self._preview_win:   tk.Toplevel | None        = None
+        self._preview_label: tk.Label   | None        = None
+        self._preview_photo: ImageTk.PhotoImage | None = None
+        self._frame_times:   list[float]               = []
+        self._last_frame:    np.ndarray | None         = None
+        self._first_frame_received = False
+
+        self._img_hover = False
+        self._is_panning = False
+        self._pan_anchor_canvas: tuple[float, float] | None = None
+        self._pan_anchor_center: tuple[float, float] | None = None
+
+        # Viewport state in image coordinates: displayed center and zoom multiplier.
+        self._zoom = 1.0
+        self._view_cx: float | None = None
+        self._view_cy: float | None = None
+        self._min_zoom = 0.05
+        self._max_zoom = 500.0
+
+    # ── compute ───────────────────────────────────────────────────
+
+    def compute(self, inputs: dict) -> dict:
+        frame = inputs.get("image")
+        if frame is None or not isinstance(frame, np.ndarray):
+            return {}
+        if self._freeze_var.get():
+            return {}
+
+        self._last_frame = frame
+        self._display_frame(frame)
+        return {}
+
+    def _display_frame(self, frame: np.ndarray) -> None:
+        # remove placeholder on first frame
+        if not self._first_frame_received:
+            self.canvas.itemconfigure(
+                self._placeholder,      state="hidden")
+            self.canvas.itemconfigure(
+                self._placeholder_text, state="hidden")
+            self._first_frame_received = True
+
+        # track FPS
+        now = time.perf_counter()
+        self._frame_times.append(now)
+        self._frame_times = [
+            t for t in self._frame_times if now - t < 2.0]
+        fps = len(self._frame_times) / 2.0
+
+        if self._show_fps_var.get():
+            self.canvas.itemconfigure(
+                self._fps_text, text=f"{fps:.1f} fps")
+        else:
+            self.canvas.itemconfigure(self._fps_text, text="")
+
+        self._status_var.set(
+            f"{frame.shape[1]} x {frame.shape[0]}  "
+            f"{frame.dtype}")
+
+        img_h, img_w = frame.shape[:2]
+        self._ensure_view_center(img_w, img_h)
+
+        area = self._image_area_rect()
+        aw = max(1, int(area[2] - area[0]))
+        ah = max(1, int(area[3] - area[1]))
+
+        fit_scale = min(aw / max(1, img_w), ah / max(1, img_h))
+        scale = max(1e-6, fit_scale * self._zoom)
+
+        self._view_cx = float(np.clip(self._view_cx, 0.0, img_w - 1.0))
+        self._view_cy = float(np.clip(self._view_cy, 0.0, img_h - 1.0))
+
+        tx = (aw / 2.0) - self._view_cx * scale
+        ty = (ah / 2.0) - self._view_cy * scale
+
+        transformed = cv2.warpAffine(
+            frame,
+            np.array([[scale, 0.0, tx], [0.0, scale, ty]], dtype=np.float32),
+            (aw, ah),
+            flags=self._current_interpolation_flag(),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(17, 17, 51),
+        )
+
+        img_pil = Image.fromarray(transformed)
+
+        # ── update canvas image ───────────────────────────────────
+        self._photo = ImageTk.PhotoImage(img_pil)
+        self.canvas.itemconfigure(
+            self._img_canvas_item, image=self._photo)
+
+        area_cx = (area[0] + area[2]) / 2.0
+        area_cy = (area[1] + area[3]) / 2.0
+        self.canvas.coords(self._img_canvas_item, area_cx, area_cy)
+        self.canvas.coords(self._placeholder_text, area_cx, area_cy)
+
+        self._draw_grid_overlay(img_w, img_h, aw, ah, scale)
+
+        # ── update floating preview if open ──────────────────────
+        if (self._preview_win
+                and self._preview_win.winfo_exists()
+                and self._preview_label):
+            pw = self._preview_win.winfo_width()
+            ph = self._preview_win.winfo_height() - 30
+            preview_pil = self._scale_frame(
+                frame, max(pw, 320), max(ph, 240),
+                interpolation=self._current_interpolation_flag())
+            self._preview_photo = ImageTk.PhotoImage(preview_pil)
+            self._preview_label.config(
+                image=self._preview_photo)
+
+    def _current_interpolation_flag(self) -> int:
+        return self._INTERPOLATIONS.get(self._interp_var.get(), cv2.INTER_NEAREST)
+
+    def _clear_grid_overlay(self) -> None:
+        for item in self._grid_items:
+            self.canvas.delete(item)
+        self._grid_items = []
+
+    def _draw_grid_overlay(self, img_w: int, img_h: int,
+                           aw: int, ah: int, scale: float) -> None:
+        self._clear_grid_overlay()
+
+        if not self._show_grid_var.get() or scale <= self._GRID_PIXEL_THRESHOLD:
+            return
+
+        x1, y1, x2, y2 = self._image_area_rect()
+        view_cx = float(self._view_cx)
+        view_cy = float(self._view_cy)
+
+        left_x = view_cx - aw / (2.0 * scale)
+        right_x = view_cx + aw / (2.0 * scale)
+        top_y = view_cy - ah / (2.0 * scale)
+        bottom_y = view_cy + ah / (2.0 * scale)
+
+        # Pixel boundaries are at k - 0.5
+        kx_min = max(0, int(np.ceil(left_x + 0.5)))
+        kx_max = min(img_w, int(np.floor(right_x + 0.5)))
+        ky_min = max(0, int(np.ceil(top_y + 0.5)))
+        ky_max = min(img_h, int(np.floor(bottom_y + 0.5)))
+
+        # Safety cap to avoid UI stalls when line count gets too high.
+        if (kx_max - kx_min + 1) > self._MAX_GRID_LINES:
+            mid = (kx_min + kx_max) // 2
+            half = self._MAX_GRID_LINES // 2
+            kx_min = max(0, mid - half)
+            kx_max = min(img_w, kx_min + self._MAX_GRID_LINES - 1)
+        if (ky_max - ky_min + 1) > self._MAX_GRID_LINES:
+            mid = (ky_min + ky_max) // 2
+            half = self._MAX_GRID_LINES // 2
+            ky_min = max(0, mid - half)
+            ky_max = min(img_h, ky_min + self._MAX_GRID_LINES - 1)
+
+        line_color = "#ffffff"
+        for k in range(kx_min, kx_max + 1):
+            bx = k - 0.5
+            cx = x1 + (bx - view_cx) * scale + aw / 2.0
+            line = self.canvas.create_line(
+                cx, y1, cx, y2,
+                fill=line_color,
+                width=1,
+                stipple="gray50",
+                tags=(self.node_id, self._img_area_tag, "img_grid"),
+            )
+            self._grid_items.append(line)
+
+        for k in range(ky_min, ky_max + 1):
+            by = k - 0.5
+            cy = y1 + (by - view_cy) * scale + ah / 2.0
+            line = self.canvas.create_line(
+                x1, cy, x2, cy,
+                fill=line_color,
+                width=1,
+                stipple="gray50",
+                tags=(self.node_id, self._img_area_tag, "img_grid"),
+            )
+            self._grid_items.append(line)
+
+        self.canvas.tag_raise(self._coords_text)
+        self.canvas.tag_raise(self._fps_text)
+
+    def _show_interpolation_menu(self, x_root: int, y_root: int) -> None:
+        if self._interp_menu is None:
+            self._interp_menu = tk.Menu(self.canvas, tearoff=0)
+            self._interp_menu.add_command(label="Interpolation", state="disabled")
+            self._interp_menu.add_separator()
+            for label in ("NEAREST", "LINEAR", "CUBIC", "AREA", "LANCZOS4"):
+                self._interp_menu.add_radiobutton(
+                    label=label,
+                    value=label,
+                    variable=self._interp_var,
+                    command=self._on_interpolation_changed,
+                )
+
+        self._interp_menu.tk_popup(int(x_root), int(y_root))
+        self._interp_menu.grab_release()
+
+    def _on_interpolation_changed(self) -> None:
+        if self._last_frame is not None:
+            self._display_frame(self._last_frame)
+
+    def _image_area_rect(self) -> tuple[float, float, float, float]:
+        x1, y1, x2, y2 = self.canvas.coords(self._img_border)
+        return x1, y1, x2, y2
+
+    def _ensure_view_center(self, img_w: int, img_h: int) -> None:
+        if self._view_cx is None or self._view_cy is None:
+            self._view_cx = (img_w - 1.0) / 2.0
+            self._view_cy = (img_h - 1.0) / 2.0
+
+    @staticmethod
+    def _clamp_view_center(cx: float, cy: float,
+                           img_w: int, img_h: int) -> tuple[float, float]:
+        return (
+            float(np.clip(cx, 0.0, img_w - 1.0)),
+            float(np.clip(cy, 0.0, img_h - 1.0)),
+        )
+
+    def _focus_border(self, focused: bool) -> None:
+        self.canvas.itemconfigure(
+            self._img_border,
+            outline="#ffd060" if focused else "#334466",
+            width=2 if focused else 1,
+        )
+
+    def _canvas_to_image_coords(self, canvas_x: float, canvas_y: float) -> tuple[float, float] | None:
+        if self._last_frame is None:
+            return None
+
+        img_h, img_w = self._last_frame.shape[:2]
+        self._ensure_view_center(img_w, img_h)
+
+        x1, y1, x2, y2 = self._image_area_rect()
+        aw = max(1.0, x2 - x1)
+        ah = max(1.0, y2 - y1)
+        fit_scale = min(aw / max(1.0, img_w), ah / max(1.0, img_h))
+        scale = max(1e-6, fit_scale * self._zoom)
+
+        local_x = canvas_x - x1
+        local_y = canvas_y - y1
+
+        img_x = self._view_cx + (local_x - aw / 2.0) / scale
+        img_y = self._view_cy + (local_y - ah / 2.0) / scale
+        return float(img_x), float(img_y)
+
+    def _update_coords_overlay(self, canvas_x: float | None = None,
+                               canvas_y: float | None = None) -> None:
+        if not self._show_coords_var.get() or not self._img_hover:
+            self.canvas.itemconfigure(self._coords_text, text="")
+            self._last_coords_value = None
+            self._coords_copied = False
+            return
+
+        if canvas_x is None or canvas_y is None:
+            self.canvas.itemconfigure(self._coords_text, text="")
+            self._last_coords_value = None
+            self._coords_copied = False
+            return
+
+        mapped = self._canvas_to_image_coords(canvas_x, canvas_y)
+        if mapped is None:
+            self.canvas.itemconfigure(self._coords_text, text="")
+            self._last_coords_value = None
+            self._coords_copied = False
+            return
+
+        img_x, img_y = mapped
+        if self._last_frame is not None:
+            img_h, img_w = self._last_frame.shape[:2]
+            if (img_x < -0.5 or img_x > (img_w - 0.5)
+                    or img_y < -0.5 or img_y > (img_h - 0.5)):
+                self.canvas.itemconfigure(self._coords_text, text="")
+                self._last_coords_value = None
+                self._coords_copied = False
+                return
+
+        self._last_coords_value = f"{img_x:.3f}, {img_y:.3f}"
+        copied_suffix = " (copied)" if self._coords_copied else ""
+        self.canvas.itemconfigure(
+            self._coords_text,
+            text=f"({self._last_coords_value}){copied_suffix}",
+        )
+
+    def _on_copy_coords_hotkey(self, _event) -> str | None:
+        if not self._show_coords_var.get() or not self._img_hover:
+            return None
+        if not self._last_coords_value:
+            return None
+
+        try:
+            self.canvas.clipboard_clear()
+            self.canvas.clipboard_append(self._last_coords_value)
+        except tk.TclError:
+            return None
+
+        self._coords_copied = True
+        self.canvas.itemconfigure(
+            self._coords_text,
+            text=f"({self._last_coords_value}) (copied)",
+        )
+
+        # Also publish picked image coordinates for downstream array processing.
+        try:
+            sx, sy = (part.strip() for part in self._last_coords_value.split(",", 1))
+            coord = np.array([[float(sx), float(sy)]], dtype=np.float32)
+            self.push_output({"image_coords": coord})
+        except Exception:
+            pass
+
+        return "break"
+
+    def _pointer_on_this_node(self) -> bool:
+        px, py = self.canvas.winfo_pointerxy()
+        cx = self.canvas.canvasx(px - self.canvas.winfo_rootx())
+        cy = self.canvas.canvasy(py - self.canvas.winfo_rooty())
+        hit = self.canvas.find_overlapping(cx - 1, cy - 1, cx + 1, cy + 1)
+        return any(self.node_id in self.canvas.gettags(item) for item in hit)
+
+    def _close_help_popup(self) -> None:
+        if self._help_popup is not None and self._help_popup.winfo_exists():
+            self._help_popup.destroy()
+        self._help_popup = None
+
+    def _show_help_popup(self) -> None:
+        self._close_help_popup()
+
+        popup = tk.Toplevel(self.canvas)
+        popup.title("Video Output Help")
+        popup.transient(self.canvas.winfo_toplevel())
+        popup.resizable(False, False)
+
+        px, py = self.canvas.winfo_pointerxy()
+        popup.geometry(f"+{px + 14}+{py + 14}")
+
+        help_text = (
+            "Video Output Node Usage\n\n"
+            "- Wheel: zoom in/out at cursor\n"
+            "- '+' / '-': zoom in/out (same as wheel up/down)\n"
+            "- Left-drag: pan image\n"
+            "- Right-click: interpolation menu\n"
+            "- Floating preview available\n"
+            "- Toggle FPS/Coords/Grid checkboxes for overlays\n"
+            "- Press C or c (while cursor is over image and Coords is ON) to copy coordinates\n"
+            "- Press Ctrl-H to show this help"
+        )
+
+        body = tk.Frame(popup, bg="#111111", padx=10, pady=8)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(
+            body,
+            text=help_text,
+            justify="left",
+            anchor="w",
+            bg="#111111",
+            fg="#dddddd",
+            font=("Arial", 9),
+        ).pack(fill="both", expand=True)
+
+        tk.Button(body, text="Close", command=self._close_help_popup).pack(anchor="e", pady=(8, 0))
+
+        popup.bind("<Escape>", lambda _e: self._close_help_popup())
+        popup.protocol("WM_DELETE_WINDOW", self._close_help_popup)
+
+        self._help_popup = popup
+
+    def _on_help_hotkey(self, _event) -> str | None:
+        if not self._pointer_on_this_node():
+            return None
+        self._show_help_popup()
+        return "break"
+
+    def _zoom_about_canvas_point(self, canvas_x: float, canvas_y: float,
+                                 zoom_factor: float) -> None:
+        if self._last_frame is None:
+            return
+
+        # Canvas mouse events report viewport-relative coordinates.
+        # Convert them to the scrolled canvas coordinate space so the
+        # image point under the cursor remains fixed while zooming.
+        canvas_x = float(self.canvas.canvasx(canvas_x))
+        canvas_y = float(self.canvas.canvasy(canvas_y))
+
+        img_h, img_w = self._last_frame.shape[:2]
+        self._ensure_view_center(img_w, img_h)
+
+        x1, y1, x2, y2 = self._image_area_rect()
+        aw = max(1.0, x2 - x1)
+        ah = max(1.0, y2 - y1)
+        fit_scale = min(aw / max(1.0, img_w), ah / max(1.0, img_h))
+
+        old_zoom = self._zoom
+        new_zoom = float(np.clip(old_zoom * zoom_factor,
+                                 self._min_zoom, self._max_zoom))
+        if abs(new_zoom - old_zoom) < 1e-9:
+            return
+
+        old_scale = max(1e-6, fit_scale * old_zoom)
+        new_scale = max(1e-6, fit_scale * new_zoom)
+
+        local_x = canvas_x - x1
+        local_y = canvas_y - y1
+
+        img_x = self._view_cx + (local_x - aw / 2.0) / old_scale
+        img_y = self._view_cy + (local_y - ah / 2.0) / old_scale
+
+        self._zoom = new_zoom
+        self._view_cx, self._view_cy = self._clamp_view_center(
+            img_x - (local_x - aw / 2.0) / new_scale,
+            img_y - (local_y - ah / 2.0) / new_scale,
+            img_w,
+            img_h,
+        )
+
+        self._display_frame(self._last_frame)
+        self._update_coords_overlay(canvas_x, canvas_y)
+
+    def _on_img_enter(self, event) -> str:
+        self.canvas.focus_set()
+        self._img_hover = True
+        self._focus_border(True)
+        self._update_coords_overlay(event.x, event.y)
+        return "break"
+
+    def _on_img_leave(self, _event) -> str:
+        self._img_hover = False
+        self._is_panning = False
+        self._pan_anchor_canvas = None
+        self._pan_anchor_center = None
+        self._focus_border(False)
+        self._update_coords_overlay(None, None)
+        return "break"
+
+    def _on_img_motion(self, event) -> str:
+        self._coords_copied = False
+        self._update_coords_overlay(event.x, event.y)
+        return "break"
+
+    def _on_img_mousewheel(self, event) -> str:
+        if not self._img_hover:
+            return "break"
+        factor = 1.12 if event.delta > 0 else 1 / 1.12
+        self._zoom_about_canvas_point(event.x, event.y, factor)
+        return "break"
+
+    def _on_img_wheel_linux(self, event) -> str:
+        if not self._img_hover:
+            return "break"
+        factor = 1.12 if event.num == 4 else 1 / 1.12
+        self._zoom_about_canvas_point(event.x, event.y, factor)
+        return "break"
+
+    def _on_canvas_mousewheel(self, event):
+        if not self._img_hover:
+            return
+        return self._on_img_mousewheel(event)
+
+    def _on_canvas_wheel_linux(self, event):
+        if not self._img_hover:
+            return
+        return self._on_img_wheel_linux(event)
+
+    def _zoom_by_factor_at_pointer(self, zoom_factor: float) -> bool:
+        if not self._img_hover or self._last_frame is None:
+            return False
+        px, py = self.canvas.winfo_pointerxy()
+        ex = px - self.canvas.winfo_rootx()
+        ey = py - self.canvas.winfo_rooty()
+        self._zoom_about_canvas_point(ex, ey, zoom_factor)
+        return True
+
+    def _on_zoom_in_hotkey(self, _event) -> str | None:
+        if not self._zoom_by_factor_at_pointer(1.12):
+            return None
+        return "break"
+
+    def _on_zoom_out_hotkey(self, _event) -> str | None:
+        if not self._zoom_by_factor_at_pointer(1 / 1.12):
+            return None
+        return "break"
+
+    def _on_img_press(self, event) -> str:
+        self._is_panning = self._img_hover and self._last_frame is not None
+        if self._is_panning:
+            self._pan_anchor_canvas = (event.x, event.y)
+            self._pan_anchor_center = (float(self._view_cx), float(self._view_cy))
+        self._update_coords_overlay(event.x, event.y)
+        return "break"
+
+    def _on_img_drag(self, event) -> str:
+        self._coords_copied = False
+        if not self._is_panning or self._last_frame is None:
+            self._update_coords_overlay(event.x, event.y)
+            return "break"
+
+        img_h, img_w = self._last_frame.shape[:2]
+        self._ensure_view_center(img_w, img_h)
+
+        x1, y1, x2, y2 = self._image_area_rect()
+        aw = max(1.0, x2 - x1)
+        ah = max(1.0, y2 - y1)
+        fit_scale = min(aw / max(1.0, img_w), ah / max(1.0, img_h))
+        scale = max(1e-6, fit_scale * self._zoom)
+
+        if self._pan_anchor_canvas is None or self._pan_anchor_center is None:
+            self._is_panning = False
+            return "break"
+
+        ax, ay = self._pan_anchor_canvas
+        base_cx, base_cy = self._pan_anchor_center
+
+        dx = event.x - ax
+        dy = event.y - ay
+
+        next_cx, next_cy = self._clamp_view_center(
+            base_cx - dx / scale,
+            base_cy - dy / scale,
+            img_w,
+            img_h,
+        )
+
+        # If we are already clamped at the boundary, skip expensive redraw.
+        if (self._view_cx is not None and self._view_cy is not None
+                and abs(next_cx - self._view_cx) < 1e-6
+                and abs(next_cy - self._view_cy) < 1e-6):
+            self._update_coords_overlay(event.x, event.y)
+            return "break"
+
+        self._view_cx = next_cx
+        self._view_cy = next_cy
+
+        self._display_frame(self._last_frame)
+        self._update_coords_overlay(event.x, event.y)
+        return "break"
+
+    def _on_img_release(self, event) -> str:
+        self._is_panning = False
+        self._pan_anchor_canvas = None
+        self._pan_anchor_center = None
+        self._update_coords_overlay(event.x, event.y)
+        return "break"
+
+    def _on_img_right_click(self, event) -> str:
+        self._show_interpolation_menu(event.x_root, event.y_root)
+        return "break"
+
+    def on_resize(self, old_width: int, old_height: int,
+                  new_width: int, new_height: int) -> None:
+        super().on_resize(old_width, old_height, new_width, new_height)
+
+        x, y, w, h = self.x, self.y, self.width, self.height
+        self._img_w = max(1, w - 8)
+        self._img_h = max(1, h - 50)
+
+        self.canvas.coords(self._img_border, x+4, y+22, x+w-4, y+22+self._img_h)
+        self.canvas.coords(self._placeholder, x+4, y+22, x+w-4, y+22+self._img_h)
+        self.canvas.coords(self._placeholder_text, x+w/2, y+22+self._img_h/2)
+
+        self.canvas.coords(self._fps_text, x+w-10, y+26)
+        self.canvas.coords(self._coords_text, x+8, y+26)
+
+        if self._last_frame is not None:
+            self._display_frame(self._last_frame)
+
+    @staticmethod
+    def _scale_frame(frame: np.ndarray,
+                     max_w: int, max_h: int,
+                     interpolation: int = cv2.INTER_NEAREST) -> Image.Image:
+        """Scale a numpy HxWxC frame to fit within max_w × max_h,
+        preserving aspect ratio."""
+        h, w = frame.shape[:2]
+        scale = min(max_w / w, max_h / h, 1.0)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = cv2.resize(
+            frame, (new_w, new_h),
+            interpolation=interpolation)
+        return Image.fromarray(resized)
+
+    # ── floating preview window ───────────────────────────────────
+
+    def _open_preview(self) -> None:
+        preview_win = getattr(self, "_preview_win", None)
+        if preview_win and preview_win.winfo_exists():
+            self._preview_win.lift()
+            return
+
+        self._preview_win = tk.Toplevel()
+        self._preview_win.title(
+            f"Video Preview — {self.node_id}")
+        self._preview_win.geometry("720x540")
+        self._preview_win.protocol(
+            "WM_DELETE_WINDOW", self._close_preview)
+
+        self._preview_label = tk.Label(
+            self._preview_win, bg="black")
+        self._preview_label.pack(fill="both", expand=True)
+
+        info = tk.Label(
+            self._preview_win,
+            text="Live preview — resizable",
+            font=("Arial", 8), bg="#111111", fg="#666666")
+        info.pack(fill="x")
+
+        # show last frame immediately if available
+        if self._last_frame is not None:
+            self._display_frame(self._last_frame)
+
+    def _close_preview(self) -> None:
+        if self._preview_win:
+            self._preview_win.destroy()
+            self._preview_win  = None
+            self._preview_label = None
+
+    def on_destroy(self) -> None:
+        self._close_help_popup()
+        self._close_preview()
+        self._clear_grid_overlay()
+        super().on_destroy()
+
+    # ── serialization ─────────────────────────────────────────────
+
+    def get_params(self) -> dict:
+        return {
+            "show_fps": self._show_fps_var.get(),
+            "show_coords": self._show_coords_var.get(),
+            "show_grid": self._show_grid_var.get(),
+            "interpolation": self._interp_var.get(),
+        }
+
+    def set_params(self, params: dict) -> None:
+        self._show_fps_var.set(params.get("show_fps", True))
+        self._show_coords_var.set(params.get("show_coords", False))
+        self._show_grid_var.set(params.get("show_grid", False))
+        interp = str(params.get("interpolation", "NEAREST")).upper()
+        self._interp_var.set(interp if interp in self._INTERPOLATIONS else "NEAREST")
+
+
+# node_editor/nodes/video_nodes.py — add after VideoPlayOutputNode
+
+class GaussianBlurNode(BaseNode):
+    """
+    Applies cv2.GaussianBlur to an incoming image.
+
+    Pin layout:
+      inputs:
+        image      — IMAGE  (required)
+        ksize      — SCALAR — kernel size (odd integer, default 5)
+        sigma_x    — SCALAR — sigmaX (default 1.0)
+        sigma_y    — SCALAR — sigmaY (default 0.0, means same as sigmaX)
+        border     — SCALAR — borderType as int (default 4 = BORDER_REFLECT_101)
+      outputs:
+        image      — IMAGE
+
+    All scalar inputs are optional: if not connected, the value
+    shown in the node body's entry widgets is used as default.
+    When a pin IS connected, the connected value overrides the widget.
+    """
+    EXECUTION_MODE = ExecutionMode.SYNC
+    NODE_TYPE      = "gaussian_blur"
+    DISPLAY_NAME   = "Gaussian Blur"
+    CATEGORY       = "process"
+    NODE_WIDTH     = 200
+    NODE_HEIGHT    = 190
+
+    # cv2 border type options shown in the node body
+    _BORDER_TYPES = {
+        "REFLECT_101 (4)": cv2.BORDER_REFLECT_101,
+        "REFLECT (2)":     cv2.BORDER_REFLECT,
+        "REPLICATE (1)":   cv2.BORDER_REPLICATE,
+        "CONSTANT (0)":    cv2.BORDER_CONSTANT,
+        "WRAP (3)":        cv2.BORDER_WRAP,
+    }
+
+    def get_pin_schema(self) -> PinSchema:
+        return PinSchema(
+            inputs=[
+                PinDef("image",   PinType.IMAGE,  "src",    optional=False),
+                PinDef("ksize",   PinType.SCALAR, "ksize",  optional=True),
+                PinDef("sigma_x", PinType.SCALAR, "sigmaX", optional=True),
+                PinDef("sigma_y", PinType.SCALAR, "sigmaY", optional=True),
+                PinDef("border",  PinType.SCALAR, "border", optional=True),
+            ],
+            outputs=[
+                PinDef("image", PinType.IMAGE, "out"),
+            ]
+        )
+
+    def _init_param_state(self) -> None:
+        if hasattr(self, "_param_ksize"):
+            return
+        self._param_ksize = "5"
+        self._param_sigma_x = "1.0"
+        self._param_sigma_y = "0.0"
+        self._param_border = "REFLECT_101 (4)"
+
+        # Optional inspector widgets (exist only while popup is open)
+        self._ksize_entry = None
+        self._sigma_x_entry = None
+        self._sigma_y_entry = None
+        self._border_var = None
+
+    def build_body(self) -> None:
+        self._init_param_state()
+        x, y, w, h = self.x, self.y, self.width, self.height
+
+        # Compact canvas body (Phase 2): full controls live in popup inspector.
+        self._body_rect = self.canvas.create_rectangle(
+            x, y, x+w, y+h,
+            fill="#eaf6ea", outline="#55aa55", width=2,
+            tags=(self.node_id, "node_body"))
+        self._title_item = self.canvas.create_text(
+            x+w/2, y+13,
+            text=self.DISPLAY_NAME,
+            font=("Arial", 9, "bold"), fill="#2f6b2f",
+            tags=(self.node_id,))
+
+        # ── status ────────────────────────────────────────────────
+        self._status_var = tk.StringVar(value="")
+        status_lbl = tk.Label(
+            self.canvas, textvariable=self._status_var,
+            font=("Arial", 7), bg="#eaf6ea", fg="#3f6f3f")
+        self.canvas.create_window(
+            x+w/2, y+h-14, window=status_lbl,
+            tags=(self.node_id,))
+
+        self._canvas_items += [self._body_rect, self._title_item]
+
+    def build_inspector(self, parent: tk.Frame) -> None:
+        self._init_param_state()
+
+        title = tk.Label(
+            parent,
+            text="Gaussian Blur Parameters",
+            font=("Arial", 10, "bold"),
+            anchor="w",
+        )
+        title.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        def _row(label: str, value: str, row: int) -> tk.Entry:
+            tk.Label(parent, text=label, anchor="w", font=("Arial", 9)).grid(
+                row=row, column=0, sticky="w", padx=(0, 8), pady=2
+            )
+            ent = tk.Entry(parent, width=14, font=("Arial", 9), justify="center")
+            ent.insert(0, value)
+            ent.grid(row=row, column=1, sticky="ew", pady=2)
+            return ent
+
+        self._ksize_entry = _row("ksize", self._param_ksize, 1)
+        self._sigma_x_entry = _row("sigmaX", self._param_sigma_x, 2)
+        self._sigma_y_entry = _row("sigmaY", self._param_sigma_y, 3)
+
+        tk.Label(parent, text="border", anchor="w", font=("Arial", 9)).grid(
+            row=4, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        self._border_var = tk.StringVar(value=self._param_border)
+        border_cb = ttk.Combobox(
+            parent,
+            textvariable=self._border_var,
+            values=list(self._BORDER_TYPES.keys()),
+            state="readonly",
+            width=18,
+            font=("Arial", 9),
+        )
+        border_cb.grid(row=4, column=1, sticky="ew", pady=2)
+
+        parent.grid_columnconfigure(1, weight=1)
+
+        def _commit_and_trigger(_event=None):
+            self._sync_params_from_widgets()
+            self._trigger_recompute_from_ui()
+
+        for ent in (self._ksize_entry, self._sigma_x_entry, self._sigma_y_entry):
+            ent.bind("<FocusOut>", _commit_and_trigger)
+            ent.bind("<Return>", _commit_and_trigger)
+
+        border_cb.bind("<<ComboboxSelected>>", _commit_and_trigger)
+
+    def _sync_params_from_widgets(self) -> None:
+        if self._ksize_entry is not None and self._ksize_entry.winfo_exists():
+            self._param_ksize = self._ksize_entry.get().strip() or "5"
+        if self._sigma_x_entry is not None and self._sigma_x_entry.winfo_exists():
+            self._param_sigma_x = self._sigma_x_entry.get().strip() or "1.0"
+        if self._sigma_y_entry is not None and self._sigma_y_entry.winfo_exists():
+            self._param_sigma_y = self._sigma_y_entry.get().strip() or "0.0"
+        if self._border_var is not None:
+            self._param_border = self._border_var.get().strip() or "REFLECT_101 (4)"
+
+    def _trigger_recompute_from_ui(self) -> None:
+        if self._request_downstream:
+            self._request_downstream(self.node_id)
+
+    # ── helpers ───────────────────────────────────────────────────
+
+    def _get_ksize(self, inputs: dict) -> int:
+        """
+        ksize must be a positive odd integer.
+        If connected value is even, round up to next odd number.
+        """
+        raw = inputs.get("ksize")
+        if raw is not None:
+            val = int(round(float(raw)))
+        else:
+            try:
+                val = int(float(self._param_ksize))
+            except ValueError:
+                val = 5
+        val = max(1, val)
+        if val % 2 == 0:
+            val += 1
+        return val
+
+    def _get_float(self, inputs: dict,
+                   pin: str, widget: tk.Entry,
+                   default: float) -> float:
+        raw = inputs.get(pin)
+        if raw is not None:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return default
+        try:
+            return float(widget)
+        except ValueError:
+            return default
+
+    def _get_border(self, inputs: dict) -> int:
+        raw = inputs.get("border")
+        if raw is not None:
+            return int(round(float(raw)))
+        return self._BORDER_TYPES.get(
+            self._param_border, cv2.BORDER_REFLECT_101)
+
+    # ── compute ───────────────────────────────────────────────────
+
+    def compute(self, inputs: dict) -> dict:
+        frame = inputs.get("image")
+        if frame is None or not isinstance(frame, np.ndarray):
+            self._status_var.set("no image")
+            return {}
+
+        try:
+            ksize   = self._get_ksize(inputs)
+            sigma_x = self._get_float(
+                inputs, "sigma_x", self._param_sigma_x, 1.0)
+            sigma_y = self._get_float(
+                inputs, "sigma_y", self._param_sigma_y, 0.0)
+            border  = self._get_border(inputs)
+
+            result = cv2.GaussianBlur(
+                frame,
+                ksize=(ksize, ksize),
+                sigmaX=sigma_x,
+                sigmaY=sigma_y,
+                borderType=border)
+
+            self._status_var.set(
+                f"k={ksize}  σx={sigma_x:.2g}"
+                f"  σy={sigma_y:.2g}")
+            self.set_status("ok", "#55aa55")
+            return {"image": result}
+
+        except Exception as e:
+            self._status_var.set(f"error: {e}")
+            self.set_status("error", "#cc0000")
+            return {}
+
+    # ── serialization ─────────────────────────────────────────────
+
+    def get_params(self) -> dict:
+        self._sync_params_from_widgets()
+        return {
+            "ksize":   self._param_ksize,
+            "sigma_x": self._param_sigma_x,
+            "sigma_y": self._param_sigma_y,
+            "border":  self._param_border,
+        }
+
+    def set_params(self, params: dict) -> None:
+        self._init_param_state()
+        self._param_ksize = str(params.get("ksize", "5"))
+        self._param_sigma_x = str(params.get("sigma_x", "1.0"))
+        self._param_sigma_y = str(params.get("sigma_y", "0.0"))
+        self._param_border = str(params.get("border", "REFLECT_101 (4)"))
+
+        if self._ksize_entry is not None and self._ksize_entry.winfo_exists():
+            self._ksize_entry.delete(0, tk.END)
+            self._ksize_entry.insert(0, self._param_ksize)
+        if self._sigma_x_entry is not None and self._sigma_x_entry.winfo_exists():
+            self._sigma_x_entry.delete(0, tk.END)
+            self._sigma_x_entry.insert(0, self._param_sigma_x)
+        if self._sigma_y_entry is not None and self._sigma_y_entry.winfo_exists():
+            self._sigma_y_entry.delete(0, tk.END)
+            self._sigma_y_entry.insert(0, self._param_sigma_y)
+        if self._border_var is not None:
+            self._border_var.set(self._param_border)
+
+    def close_inspector(self) -> None:
+        self._sync_params_from_widgets()
+        super().close_inspector()
+        self._ksize_entry = None
+        self._sigma_x_entry = None
+        self._sigma_y_entry = None
+        self._border_var = None

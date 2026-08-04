@@ -1,0 +1,352 @@
+import tkinter as tk
+
+import cv2
+import numpy as np
+
+from node_editor.base_node import BaseNode
+from node_editor.pin_types import PinSchema, PinDef, PinType
+from node_editor.execution import ExecutionMode
+
+def triangulatePoints2(
+        cmat1, dvec1, rvec1, tvec1, 
+        cmat2, dvec2, rvec2, tvec2, 
+        imgPoints1, imgPoints2):
+    """
+    This function triangulates points from given two sets of image 
+    coordinates of N points, intrinsic and extrinsic parameters of 
+    two cameras.   
+    
+    Parameters
+    ----------
+    cmat1 : numpy ndarray, a 3x3 np.float64 numpy matrix
+    dvec1 : numpy ndarray, a 1D np.floatr64 numpy matrix
+    rvec1 : numpy ndarray, 3-element np.float64 numpy matrix
+    tvec1 : numpy ndarray, 3-element np.float64 numpy matrix
+    cmat2 : numpy ndarray, a 3x3 np.float64 numpy matrix
+    dvec2 : numpy ndarray, a 1D np.floatr64 numpy matrix
+    rvec2 : numpy ndarray, 3-element np.float64 numpy matrix
+    tvec2 : numpy ndarray, 3-element np.float64 numpy matrix
+    imgPoints1 : numpy ndarray, Nx2 2D array of N points 
+        image coordinates of N points in camera 1 (in original photo)
+    imgPoints2 : numpy ndarray, Nx2 2D array of N points 
+        image coordinates of N points in camera 2 (in original photo)
+
+    Returns
+    -------
+    objPoints : numpy ndarray, Nx3 np.float64 numpy matrix
+        object points triangulated, in world coordinate
+    objPoints1 : numpy ndarray, Nx3 np.float64 numpy matrix
+        object points triangulated, in camera-1 coordinate
+    objPoints2 : numpy ndarray, Nx3 np.float64 numpy matrix
+        object points triangulated, in camera-2 coordinate
+    prjPoints1 : numpy ndarray, Nx2 np.float64 numpy matrix
+        projected points in camera-1 image coordinate
+    prjPoints2 : numpy ndarray, Nx2 np.float64 numpy matrix
+        projected points in camera-2 image coordinate
+    prjErrors1 : numpy ndarray, Nx2 np.float64 numpy matrix
+        projected errors in camera-1 image coordinate
+        i.e., prjPoints1 - imgPoints1
+    prjErrors2 : numpy ndarray, Nx2 np.float64 numpy matrix
+        projected errors in camera-2 image coordinate
+        i.e., prjPoints2 - imgPoints2
+
+
+    """
+    # force reshape and type conversion 
+    imgPoints1 = np.array(imgPoints1, dtype=np.float64).reshape(-1,2)
+    imgPoints2 = np.array(imgPoints2, dtype=np.float64).reshape(-1,2)
+    # initialization (to zero-size arrays)
+    objPoints = np.zeros((0))
+    prjPoints1 = np.zeros((0))
+    prjPoints2 = np.zeros((0))
+    prjErrors1 = np.zeros((0))
+    prjErrors2 = np.zeros((0))
+    # check 
+    nPoints = imgPoints1.shape[0]
+    if imgPoints2.shape[0] != nPoints:
+        print("# Error: triangulatePoints2(): imgPoints1 and 2 have"
+              " different number of points.")
+        return objPoints, prjPoints1, prjPoints2, prjErrors1, prjErrors2 
+    # memory allocation
+    objPoints = np.ones((nPoints, 3), dtype=np.float64) * np.nan
+#    prjPoints1 = np.ones((nPoints, 2), dtype=np.float64) * np.nan
+#    prjPoints2 = np.ones((nPoints, 2), dtype=np.float64) * np.nan
+#    prjErrors1 = np.ones((nPoints, 2), dtype=np.float64) * np.nan
+#    prjErrors2 = np.ones((nPoints, 2), dtype=np.float64) * np.nan
+    prjMat1 = np.zeros((3,4), dtype=np.float64)
+    prjMat2 = np.zeros((3,4), dtype=np.float64)
+    rctMat1 = np.zeros((3,3), dtype=np.float64)
+    rctMat2 = np.zeros((3,3), dtype=np.float64)
+    qMat = np.zeros((3,4), dtype=np.float64)
+    undPoints1 = np.ones((nPoints, 2), dtype=np.float64) * np.nan
+    undPoints2 = np.ones((nPoints, 2), dtype=np.float64) * np.nan
+    # Calculate rmat, tvec from coord of left to right 
+    r44L = np.eye(4, dtype=np.float64)
+    r44R = np.eye(4, dtype=np.float64)
+    r44L[0:3,0:3] = cv2.Rodrigues(rvec1)[0]
+    r44L[0:3,3] = tvec1.flatten()
+    r44R[0:3,0:3] = cv2.Rodrigues(rvec2)[0]
+    r44R[0:3,3] = tvec2.flatten()
+    r44 = np.matmul(r44R, np.linalg.inv(r44L))
+    r33 = r44[0:3,0:3].copy()
+    rvec = cv2.Rodrigues(r33)[0]
+    tvec = r44[0:3,3].copy()
+    # stereo rectify
+    rctMat1, rctMat2, prjMat1, prjMat2, qMat, dum1, dum2 = \
+        cv2.stereoRectify(cmat1, dvec1, cmat2, dvec2, (1000,1200), r33, tvec)
+    # undistortion
+    #    cv::undistortPoints(xLC2, uL, camMatrix1, distVect1, rcL, pmL);
+    #    cv::undistortPoints(xRC2, uR, camMatrix2, distVect2, rcR, pmR);
+    undPoints1 = cv2.undistortPoints(imgPoints1, cmat1, dvec1, undPoints1, 
+                                    rctMat1, prjMat1).reshape(-1,2)
+    undPoints2 = cv2.undistortPoints(imgPoints2, cmat2, dvec2, undPoints2, 
+                                    rctMat2, prjMat2).reshape(-1,2)
+    # triangulation 
+    objPoints = cv2.triangulatePoints(prjMat1, prjMat2, undPoints1.transpose(), 
+                                     undPoints2.transpose())
+    # coordinate transformation to cam-1 coord.
+    rctInv1 = np.eye(4, dtype=np.float64)
+    rctInv1[0:3,0:3] = np.linalg.inv(rctMat1)
+    objPoints = np.matmul(rctInv1, objPoints)
+    # object points in cam1, cam2, world coordinate
+    objPoints1 = objPoints.copy()
+    objPoints2 = np.matmul(r44, objPoints1)
+    objPoints = np.matmul(np.linalg.inv(r44L), objPoints).transpose()
+    objPoints1 = objPoints1.transpose()
+    objPoints2 = objPoints2.transpose()
+    for iPt in range(objPoints.shape[0]):
+        for ix in range(3):
+            objPoints[iPt,ix] /= objPoints[iPt,3]
+            objPoints1[iPt,ix] /= objPoints1[iPt,3]
+            objPoints2[iPt,ix] /= objPoints2[iPt,3]
+    objPoints = objPoints[:,0:3]
+    objPoints1 = objPoints1[:,0:3]
+    objPoints2 = objPoints2[:,0:3]
+    # project points 
+    prjPoints1 = cv2.projectPoints(objPoints, rvec1, tvec1, cmat1, dvec1)[0].reshape(-1,2)
+    prjPoints2 = cv2.projectPoints(objPoints, rvec2, tvec2, cmat2, dvec2)[0].reshape(-1,2)
+    # projection errors
+    prjErrors1 = prjPoints1 - imgPoints1
+    prjErrors2 = prjPoints2 - imgPoints2
+    
+    return objPoints, objPoints1, objPoints2, prjPoints1, prjPoints2, prjErrors1, prjErrors2
+
+
+class StereoTriangulationNode(BaseNode):
+    """
+    Triangulates 3D world points from two calibrated camera views.
+
+    Inputs:
+      cmat1, dvec1, rvec1, tvec1, imgPoints1
+      cmat2, dvec2, rvec2, tvec2, imgPoints2
+
+    Outputs:
+      xw      : (N, 3) float64 world coordinates
+      reproj1 : (N, 2) float64 reprojected points on camera 1
+      reproj2 : (N, 2) float64 reprojected points on camera 2
+    """
+
+    EXECUTION_MODE = ExecutionMode.SYNC
+    NODE_TYPE = "stereo_triangulation"
+    DISPLAY_NAME = "Stereo Triangulation"
+    CATEGORY = "process"
+    NODE_WIDTH = 250
+    NODE_HEIGHT = 120
+
+    def get_pin_schema(self) -> PinSchema:
+        return PinSchema(
+            inputs=[
+                PinDef("cmat1", PinType.ARRAY, "cmat1"),
+                PinDef("dvec1", PinType.ARRAY, "dvec1"),
+                PinDef("rvec1", PinType.ARRAY, "rvec1"),
+                PinDef("tvec1", PinType.ARRAY, "tvec1"),
+                PinDef("imgPoints1", PinType.ARRAY, "imgPts1"),
+                PinDef("cmat2", PinType.ARRAY, "cmat2"),
+                PinDef("dvec2", PinType.ARRAY, "dvec2"),
+                PinDef("rvec2", PinType.ARRAY, "rvec2"),
+                PinDef("tvec2", PinType.ARRAY, "tvec2"),
+                PinDef("imgPoints2", PinType.ARRAY, "imgPts2"),
+            ],
+            outputs=[
+                PinDef("xw", PinType.ARRAY, "xw", shape=(-1, 3), dtype="float64"),
+                PinDef("reproj1", PinType.ARRAY, "reproj1", shape=(-1, 2), dtype="float64"),
+                PinDef("reproj2", PinType.ARRAY, "reproj2", shape=(-1, 2), dtype="float64"),
+                PinDef("reprojerr1", PinType.ARRAY, "err1", shape=(-1, 2), dtype="float64"),
+                PinDef("reprojerr2", PinType.ARRAY, "err2", shape=(-1, 2), dtype="float64"),
+            ],
+        )
+
+    def build_body(self) -> None:
+        x, y, w, h = self.x, self.y, self.width, self.height
+
+        self._body_rect = self.canvas.create_rectangle(
+            x, y, x + w, y + h,
+            fill="#1c1a24", outline="#7d64b8", width=2,
+            tags=(self.node_id, "node_body"),
+        )
+        self._title_item = self.canvas.create_text(
+            x + w / 2, y + 13,
+            text=self.DISPLAY_NAME,
+            font=("Arial", 9, "bold"), fill="#d7c9ff",
+            tags=(self.node_id,),
+        )
+
+        hint = tk.Label(
+            self.canvas,
+            text="Inputs: cmat/dvec/rvec/tvec/imgPoints x2",
+            font=("Arial", 7), bg="#1c1a24", fg="#c6bcde",
+        )
+        self.canvas.create_window(
+            x + w / 2, y + 38, window=hint,
+            tags=(self.node_id,),
+        )
+
+        self._status_var = tk.StringVar(value="waiting for inputs")
+        status_lbl = tk.Label(
+            self.canvas,
+            textvariable=self._status_var,
+            font=("Arial", 8), bg="#1c1a24", fg="#9fdc9f",
+        )
+        self.canvas.create_window(
+            x + w / 2, y + h - 14, window=status_lbl,
+            tags=(self.node_id,),
+        )
+
+        self._canvas_items += [self._body_rect, self._title_item]
+
+    @staticmethod
+    def _coerce_matrix3x3(value) -> np.ndarray:
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.size < 9:
+            raise ValueError("camera matrix needs at least 9 values")
+        return arr.reshape(-1)[:9].reshape(3, 3)
+
+    @staticmethod
+    def _coerce_dvec(value) -> np.ndarray:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+        if arr.size == 0:
+            raise ValueError("distortion vector is empty")
+        return arr
+
+    @staticmethod
+    def _coerce_rvec_and_R(value) -> tuple[np.ndarray, np.ndarray]:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+        if arr.size >= 9:
+            R = arr[:9].reshape(3, 3)
+            rvec, _ = cv2.Rodrigues(R)
+            return rvec.reshape(3, 1), R
+        if arr.size >= 3:
+            rvec = arr[:3].reshape(3, 1)
+            R, _ = cv2.Rodrigues(rvec)
+            return rvec, R
+        raise ValueError("rvec needs 3 values (or 9 for rotation matrix)")
+
+    @staticmethod
+    def _coerce_tvec(value) -> np.ndarray:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+        if arr.size < 3:
+            raise ValueError("tvec needs at least 3 values")
+        return arr[:3].reshape(3, 1)
+
+    @staticmethod
+    def _coerce_points2(value) -> np.ndarray:
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.size < 2:
+            raise ValueError("image points need at least one (x, y) pair")
+
+        if arr.ndim == 1:
+            if arr.size % 2 != 0:
+                raise ValueError("image points must have even number of values")
+            pts = arr.reshape(-1, 2)
+        elif arr.ndim == 2:
+            if arr.shape[1] == 2:
+                pts = arr
+            elif arr.shape[0] == 2:
+                pts = arr.T
+            else:
+                flat = arr.reshape(-1)
+                if flat.size % 2 != 0:
+                    raise ValueError("image points must reshape to Nx2")
+                pts = flat.reshape(-1, 2)
+        else:
+            flat = arr.reshape(-1)
+            if flat.size % 2 != 0:
+                raise ValueError("image points must reshape to Nx2")
+            pts = flat.reshape(-1, 2)
+
+        return np.asarray(pts, dtype=np.float64)
+
+    def compute(self, inputs: dict) -> dict:
+        required = [
+            "cmat1", "dvec1", "rvec1", "tvec1", "imgPoints1",
+            "cmat2", "dvec2", "rvec2", "tvec2", "imgPoints2",
+        ]
+        missing = [k for k in required if inputs.get(k) is None]
+        if missing:
+            self._status_var.set(f"missing: {', '.join(missing[:3])}{'...' if len(missing) > 3 else ''}")
+            self.set_status("missing", "#cc6666")
+            return {}
+
+        try:
+            cmat1 = self._coerce_matrix3x3(inputs["cmat1"])
+            dvec1 = self._coerce_dvec(inputs["dvec1"])
+            rvec1, R1 = self._coerce_rvec_and_R(inputs["rvec1"])
+            tvec1 = self._coerce_tvec(inputs["tvec1"])
+            pts1 = self._coerce_points2(inputs["imgPoints1"])
+
+            cmat2 = self._coerce_matrix3x3(inputs["cmat2"])
+            dvec2 = self._coerce_dvec(inputs["dvec2"])
+            rvec2, R2 = self._coerce_rvec_and_R(inputs["rvec2"])
+            tvec2 = self._coerce_tvec(inputs["tvec2"])
+            pts2 = self._coerce_points2(inputs["imgPoints2"])
+
+            n = min(len(pts1), len(pts2))
+            if n <= 0:
+                raise ValueError("no point pairs available")
+            pts1 = pts1[:n]
+            pts2 = pts2[:n]
+
+            u1 = cv2.undistortPoints(pts1.reshape(-1, 1, 2), cmat1, dvec1).reshape(-1, 2)
+            u2 = cv2.undistortPoints(pts2.reshape(-1, 1, 2), cmat2, dvec2).reshape(-1, 2)
+
+            P1 = np.hstack((R1, tvec1))
+            P2 = np.hstack((R2, tvec2))
+
+            X_h = cv2.triangulatePoints(P1, P2, u1.T, u2.T)
+            w = X_h[3, :]
+            valid = np.abs(w) > 1e-12
+
+            xw = np.full((n, 3), np.nan, dtype=np.float64)
+            if np.any(valid):
+                xw[valid] = (X_h[:3, valid] / w[valid]).T
+
+            reproj1 = np.full((n, 2), np.nan, dtype=np.float64)
+            reproj2 = np.full((n, 2), np.nan, dtype=np.float64)
+            if np.any(valid):
+                obj = xw[valid].reshape(-1, 1, 3)
+                r1, _ = cv2.projectPoints(obj, rvec1, tvec1, cmat1, dvec1)
+                r2, _ = cv2.projectPoints(obj, rvec2, tvec2, cmat2, dvec2)
+                reproj1[valid] = r1.reshape(-1, 2)
+                reproj2[valid] = r2.reshape(-1, 2)
+
+            reprojerr1 = reproj1 - pts1
+            reprojerr2 = reproj2 - pts2
+
+#            xw, xw1, xw2, reproj1, reproj2, reprojerr1, reprojerr2 = \
+#                triangulatePoints2(cmat1, dvec1, rvec1, tvec1, \
+#                           cmat2, dvec2, rvec2, tvec2, pts1, pts2)
+
+            self._status_var.set(f"ok: pairs={n} valid={int(np.count_nonzero(valid))}")
+            self.set_status("ok", "#55aa55")
+            return {
+                "xw": xw,
+                "reproj1": reproj1,
+                "reproj2": reproj2,
+                "reprojerr1": reprojerr1,
+                "reprojerr2": reprojerr2,
+            }
+
+        except Exception as e:
+            self._status_var.set(f"error: {e}")
+            self.set_status("error", "#cc0000")
+            return {}
