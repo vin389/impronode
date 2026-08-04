@@ -108,6 +108,55 @@ class BaseNode(ABC):
             return node_name.strip()
         return self.DISPLAY_NAME
 
+    def get_help_text(self) -> str:
+        """Return Ctrl-H help, with a useful fallback for every node type."""
+        explicit_help = getattr(self, "HELP_TEXT", "")
+        if isinstance(explicit_help, str) and explicit_help.strip():
+            return explicit_help.strip()
+
+        description = ""
+        for line in (self.__class__.__doc__ or "").splitlines():
+            line = line.strip()
+            if line:
+                description = line
+                break
+
+        try:
+            schema = self.get_pin_schema()
+            inputs = list(schema.inputs)
+            outputs = list(schema.outputs)
+        except Exception:
+            inputs = []
+            outputs = []
+
+        lines = [f"{self.DISPLAY_NAME} Help", ""]
+        if description:
+            lines.extend((description, ""))
+
+        if inputs:
+            lines.append("Inputs:")
+            for pin in inputs:
+                label = pin.label or pin.name
+                optional = " (optional)" if pin.optional else ""
+                lines.append(f"- {label}: {pin.type.name}{optional}")
+            lines.append("")
+
+        if outputs:
+            lines.append("Outputs:")
+            for pin in outputs:
+                label = pin.label or pin.name
+                lines.append(f"- {label}: {pin.type.name}")
+            lines.append("")
+
+        if self.CATEGORY == "source":
+            usage = "Configure this source, then connect its output pins to downstream nodes."
+        elif self.CATEGORY == "visualize":
+            usage = "Connect data to this node to inspect or display it."
+        else:
+            usage = "Connect compatible input pins, configure any options, and use its outputs downstream."
+        lines.extend((usage, "", "Double-click the node to open its inspector."))
+        return "\n".join(lines)
+
     def is_inspector_open(self) -> bool:
         return self._inspector_win is not None and self._inspector_win.winfo_exists()
 
