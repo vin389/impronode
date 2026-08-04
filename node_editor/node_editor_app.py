@@ -612,6 +612,10 @@ class NodeEditorApp:
 
         # Input pins: left side, vertically distributed
         n_in = len(schema.inputs)
+        input_label_color = getattr(
+            node, "INPUT_PIN_LABEL_COLOR",
+            getattr(node, "PIN_LABEL_COLOR", "#1a1a1a"),
+        )
         for i, pin_def in enumerate(schema.inputs):
             py = y + (i + 1) * h // (n_in + 1)
             px = x
@@ -624,11 +628,15 @@ class NodeEditorApp:
             # Label
             self.canvas.create_text(px + r + 3, py, text=pin_def.label or pin_def.name,
                                     anchor="w", font=("Arial", 7),
+                                    fill=input_label_color,
                                     tags=(node.node_id, f"pin_label_{node.node_id}_in_{pin_def.name}"))
 
         # Output pins: right side
         n_out = len(schema.outputs)
-        output_label_color = getattr(node, "OUTPUT_PIN_LABEL_COLOR", "#1a1a1a")
+        output_label_color = getattr(
+            node, "OUTPUT_PIN_LABEL_COLOR",
+            getattr(node, "PIN_LABEL_COLOR", "#1a1a1a"),
+        )
         for i, pin_def in enumerate(schema.outputs):
             py = y + (i + 1) * h // (n_out + 1)
             px = x + w

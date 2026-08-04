@@ -50,6 +50,8 @@ class ArrayAccumulatorNode(BaseNode):
     CATEGORY       = "process"
     NODE_WIDTH     = 200
     NODE_HEIGHT    = 120
+    # Pin labels are rendered over the dark green body.
+    PIN_LABEL_COLOR = "#d8efd8"
 
     MAX_PREVIEW_ROWS = 500
     MAX_PREVIEW_COLS = 50
@@ -419,12 +421,13 @@ class ArrayAccumulatorNode(BaseNode):
                     else:
                         header = [f"col_{c}"
                                   for c in range(n_cols)]
-                    writer.writerow(["index"] + header)
+                    writer.writerow(["row"] + header)
                     # data rows
                     is_float = np.issubdtype(
                         table_snapshot.dtype, np.floating)
                     for r, row in enumerate(table_snapshot):
-                        idx_str = f"{indices_snapshot[r]:.0f}"
+                        # Match the inspector's one-based row display.
+                        idx_str = f"{indices_snapshot[r] + 1:.0f}"
                         if is_float:
                             vals = [f"{v:.8g}" for v in row]
                         else:

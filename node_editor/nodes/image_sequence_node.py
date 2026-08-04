@@ -31,7 +31,7 @@ class ImageSequenceNode(BaseNode):
     save.
 
     Playback uses tk.after() on the main thread (no extra thread needed).
-    Output pins: image, image_2 (PinType.IMAGE)
+    Output pins: image, image_2 (PinType.IMAGE), trigger (PinType.TRIGGER)
     Additional output pins: frame_index (PinType.SCALAR), 
                             frame_count (PinType.SCALAR)
     """
@@ -78,6 +78,7 @@ class ImageSequenceNode(BaseNode):
                 PinDef("image_2",     PinType.IMAGE,  "frame 2"),
                 PinDef("frame_index", PinType.SCALAR, "index"),
                 PinDef("frame_count", PinType.SCALAR, "count"),
+                PinDef("trigger",     PinType.TRIGGER, "trig"),
             ]
         )
 
@@ -1094,8 +1095,24 @@ class ImageSequenceNode(BaseNode):
         trigger downstream.
         We call the engine callback directly.
         """
-        if self._on_output_ready:
-            self._on_output_ready(self.node_id, outputs)
+        if not self._on_output_ready:
+            return
+
+        # A published frame update is also a trigger pulse.  Emit the high
+        # edge followed by a low/reset edge, matching TriggerNode so the
+        # signal can be used to advance downstream trigger-driven nodes.
+        frame_update_keys = {"image", "image_2", "frame_index", "frame_count"}
+        if frame_update_keys.intersection(outputs):
+            pulse_outputs = dict(outputs)
+            pulse_outputs["trigger"] = 1.0
+            self._on_output_ready(self.node_id, pulse_outputs)
+
+            reset_outputs = dict(outputs)
+            reset_outputs["trigger"] = 0.0
+            self._on_output_ready(self.node_id, reset_outputs)
+            return
+
+        self._on_output_ready(self.node_id, outputs)
 
     # ── compute (called by engine for SYNC nodes) ─────────────────
 
