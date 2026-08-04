@@ -842,10 +842,10 @@ class NpyFileInputNode(BaseNode):
 
 class SubArraySelectorNode(BaseNode):
     """
-    Select a 2D sub-array using 1-based row/column indices.
+    Select a 2D sub-array using 0-based row/column indices.
 
     Output is equivalent to:
-      data[np.ix_(rows - 1, cols - 1)]
+      data[np.ix_(rows, cols)]
 
     rows/cols can come from input pins or from the node text boxes.
     Pin inputs take priority over text boxes.
@@ -873,11 +873,16 @@ class SubArraySelectorNode(BaseNode):
     def _init_state(self) -> None:
         if hasattr(self, "_rows_var"):
             return
-        self._rows_var = tk.StringVar(value="1,2")
-        self._cols_var = tk.StringVar(value="1,2")
+        self._rows_var = tk.StringVar(value="0,1")
+        self._cols_var = tk.StringVar(value="0,1")
+        self._reshape_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="waiting for data")
         self._rows_entry = None
         self._cols_entry = None
+        self._reshape_entry = None
+        self._current_data: np.ndarray | None = None
+        for variable in (self._rows_var, self._cols_var, self._reshape_var):
+            variable.trace_add("write", self._on_selector_text_changed)
 
     def build_body(self) -> None:
         self._init_state()
@@ -909,23 +914,34 @@ class SubArraySelectorNode(BaseNode):
     def build_inspector(self, parent: tk.Frame) -> None:
         self._init_state()
 
-        tk.Label(parent, text="rows (1-based):", font=("Arial", 9)).grid(row=0, column=0, sticky="w", pady=2)
+        tk.Label(parent, text="rows (0-based):", font=("Arial", 9)).grid(row=0, column=0, sticky="w", pady=2)
         self._rows_entry = tk.Entry(parent, textvariable=self._rows_var, width=24, font=("Arial", 9))
         self._rows_entry.grid(row=0, column=1, sticky="ew", pady=2)
 
-        tk.Label(parent, text="cols (1-based):", font=("Arial", 9)).grid(row=1, column=0, sticky="w", pady=2)
+        tk.Label(parent, text="cols (0-based):", font=("Arial", 9)).grid(row=1, column=0, sticky="w", pady=2)
         self._cols_entry = tk.Entry(parent, textvariable=self._cols_var, width=24, font=("Arial", 9))
         self._cols_entry.grid(row=1, column=1, sticky="ew", pady=2)
 
-        tk.Button(parent, text="Apply", font=("Arial", 9), command=self._on_apply).grid(row=2, column=1, sticky="e", pady=(6, 2))
-        tk.Label(parent, textvariable=self._status_var, font=("Arial", 9)).grid(row=2, column=0, sticky="w", pady=(6, 2))
+        tk.Label(parent, text="reshape:", font=("Arial", 9)).grid(row=2, column=0, sticky="w", pady=2)
+        self._reshape_entry = tk.Entry(parent, textvariable=self._reshape_var, width=24, font=("Arial", 9))
+        self._reshape_entry.grid(row=2, column=1, sticky="ew", pady=2)
+
+        tk.Label(
+            parent,
+            text="Indices are 0-based: 0 is first, -1 is last. Ranges are inclusive (0:2 selects 0, 1, 2).",
+            justify="left", anchor="w", wraplength=360, font=("Arial", 8), fg="#555555",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        tk.Button(parent, text="Apply", font=("Arial", 9), command=self._on_apply).grid(row=4, column=1, sticky="e", pady=(6, 2))
+        tk.Label(parent, textvariable=self._status_var, font=("Arial", 9)).grid(row=4, column=0, sticky="w", pady=(6, 2))
 
         parent.grid_columnconfigure(1, weight=1)
+        self._validate_selector_text()
 
     def close_inspector(self) -> None:
         super().close_inspector()
         self._rows_entry = None
         self._cols_entry = None
+        self._reshape_entry = None
 
     def _on_apply(self) -> None:
         if self._request_downstream:
@@ -943,20 +959,95 @@ class SubArraySelectorNode(BaseNode):
         return ints
 
     @staticmethod
-    def _parse_text_indices(text: str, name: str) -> np.ndarray:
+    def _normalise_indices(indices: np.ndarray, size: int, name: str) -> np.ndarray:
+        normalised = np.where(indices < 0, indices + size, indices)
+        if np.any(normalised < 0) or np.any(normalised >= size):
+            raise ValueError(f"{name} out of range for axis length {size}")
+        return normalised.astype(np.int64)
+
+    @classmethod
+    def _parse_text_indices(cls, text: str, name: str, size: int) -> np.ndarray:
         raw = text.strip()
         if not raw:
             raise ValueError(f"{name} text is empty")
         tokens = raw.replace(",", " ").replace(";", " ").split()
         if not tokens:
             raise ValueError(f"{name} text is empty")
+        values: list[int] = []
         try:
-            vals = np.array([int(t) for t in tokens], dtype=np.int64)
-        except Exception as e:
-            raise ValueError(f"{name} text parse error") from e
-        if vals.size == 0:
+            for token in tokens:
+                if ":" not in token:
+                    values.append(int(token))
+                    continue
+                parts = token.split(":")
+                if len(parts) != 2 or not parts[0] or not parts[1]:
+                    raise ValueError
+                start, end = (int(part) for part in parts)
+                start = start + size if start < 0 else start
+                end = end + size if end < 0 else end
+                if not (0 <= start < size and 0 <= end < size):
+                    raise ValueError
+                step = 1 if end >= start else -1
+                values.extend(range(start, end + step, step))
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} text parse error") from None
+        if not values:
             raise ValueError(f"{name} is empty")
-        return vals
+        return cls._normalise_indices(np.array(values, dtype=np.int64), size, name)
+
+    @staticmethod
+    def _parse_reshape(text: str) -> tuple[int, ...] | None:
+        raw = text.strip()
+        if not raw:
+            return None
+        tokens = raw.replace(",", " ").replace(";", " ").split()
+        if not tokens:
+            return None
+        try:
+            shape = tuple(int(token) for token in tokens)
+        except ValueError:
+            raise ValueError("reshape text parse error") from None
+        if shape.count(-1) > 1 or any(size < -1 for size in shape):
+            raise ValueError("reshape dimensions are invalid")
+        return shape
+
+    def _set_entry_validity(self, entry: tk.Entry | None, valid: bool) -> None:
+        if entry is not None and entry.winfo_exists():
+            entry.configure(fg="#000000" if valid else "#cc0000")
+
+    def _validate_selector_text(self) -> None:
+        mat = self._current_data
+        if mat is None or mat.ndim != 2:
+            self._set_entry_validity(self._rows_entry, True)
+            self._set_entry_validity(self._cols_entry, True)
+            self._set_entry_validity(self._reshape_entry, True)
+            return
+        try:
+            rows = self._parse_text_indices(self._rows_var.get(), "rows", mat.shape[0])
+            rows_valid = True
+        except ValueError:
+            rows = None
+            rows_valid = False
+        try:
+            cols = self._parse_text_indices(self._cols_var.get(), "cols", mat.shape[1])
+            cols_valid = True
+        except ValueError:
+            cols = None
+            cols_valid = False
+        self._set_entry_validity(self._rows_entry, rows_valid)
+        self._set_entry_validity(self._cols_entry, cols_valid)
+
+        reshape_valid = True
+        try:
+            reshape = self._parse_reshape(self._reshape_var.get())
+            if reshape is not None and rows is not None and cols is not None:
+                mat[np.ix_(rows, cols)].reshape(reshape)
+        except ValueError:
+            reshape_valid = False
+        self._set_entry_validity(self._reshape_entry, reshape_valid)
+
+    def _on_selector_text_changed(self, *_args) -> None:
+        self._validate_selector_text()
 
     def compute(self, inputs: dict) -> dict:
         data = inputs.get("data")
@@ -969,27 +1060,26 @@ class SubArraySelectorNode(BaseNode):
             mat = np.asarray(data)
             if mat.ndim != 2:
                 raise ValueError("data must be a 2D array")
+            self._current_data = mat
+            self._validate_selector_text()
 
             rows_raw = inputs.get("rows")
             cols_raw = inputs.get("cols")
             if rows_raw is None:
-                rows_1b = self._parse_text_indices(self._rows_var.get(), "rows")
+                rows = self._parse_text_indices(self._rows_var.get(), "rows", mat.shape[0])
             else:
-                rows_1b = self._coerce_1d_int_indices(rows_raw, "rows")
+                rows = self._normalise_indices(
+                    self._coerce_1d_int_indices(rows_raw, "rows"), mat.shape[0], "rows")
             if cols_raw is None:
-                cols_1b = self._parse_text_indices(self._cols_var.get(), "cols")
+                cols = self._parse_text_indices(self._cols_var.get(), "cols", mat.shape[1])
             else:
-                cols_1b = self._coerce_1d_int_indices(cols_raw, "cols")
+                cols = self._normalise_indices(
+                    self._coerce_1d_int_indices(cols_raw, "cols"), mat.shape[1], "cols")
 
-            nr, nc = mat.shape
-            if np.any(rows_1b < 1) or np.any(rows_1b > nr):
-                raise ValueError(f"rows out of range (1..{nr})")
-            if np.any(cols_1b < 1) or np.any(cols_1b > nc):
-                raise ValueError(f"cols out of range (1..{nc})")
-
-            rows_0b = rows_1b - 1
-            cols_0b = cols_1b - 1
-            out = mat[np.ix_(rows_0b, cols_0b)]
+            out = mat[np.ix_(rows, cols)]
+            reshape = self._parse_reshape(self._reshape_var.get())
+            if reshape is not None:
+                out = out.reshape(reshape)
 
             self._status_var.set(f"ok: {out.shape}")
             self.set_status("ok", "#339966")
@@ -1003,9 +1093,12 @@ class SubArraySelectorNode(BaseNode):
         return {
             "rows_text": self._rows_var.get(),
             "cols_text": self._cols_var.get(),
+            "reshape_text": self._reshape_var.get(),
         }
 
     def set_params(self, params: dict) -> None:
         self._init_state()
-        self._rows_var.set(str(params.get("rows_text", "1,2")))
-        self._cols_var.set(str(params.get("cols_text", "1,2")))
+        self._rows_var.set(str(params.get("rows_text", "0,1")))
+        self._cols_var.set(str(params.get("cols_text", "0,1")))
+        self._reshape_var.set(str(params.get("reshape_text", "")))
+        self._validate_selector_text()

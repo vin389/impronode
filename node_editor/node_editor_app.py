@@ -706,17 +706,18 @@ class NodeEditorApp:
             return None
 
         tags = self.canvas.gettags(item)
-        # Keep existing image-area double-click behavior (for example preview popups)
-        # in node-specific handlers without opening the inspector.
-        if any(tag.startswith("img_area_") for tag in tags):
-            return None
-
         node_id = self._node_id_from_tags(tags)
         if node_id is None:
             return None
 
         node = self.canvas_nodes.get(node_id)
         if node is None:
+            return None
+
+        # Image nodes may retain a custom double-click action.  Nodes that
+        # opt in use the same gesture to open their inspector instead.
+        if (any(tag.startswith("img_area_") for tag in tags)
+                and not getattr(node, "OPEN_INSPECTOR_ON_IMAGE_DOUBLE_CLICK", False)):
             return None
 
         self._select_node(node_id)

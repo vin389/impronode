@@ -25,7 +25,6 @@ class ImageDisplayNode(BaseNode):
       - Hover highlight and optional cursor image-coordinate readout
       - Mouse-centered wheel zoom and left-drag panning
       - Optional FPS display overlay
-    - Larger floating preview window
       - Freeze button to pause display without stopping upstream
     """
     EXECUTION_MODE = ExecutionMode.SYNC
@@ -34,6 +33,7 @@ class ImageDisplayNode(BaseNode):
     CATEGORY       = "visualize"
     NODE_WIDTH     = 220
     NODE_HEIGHT    = 200
+    OPEN_INSPECTOR_ON_IMAGE_DOUBLE_CLICK = True
     # Pin labels are rendered over the dark preview body.
     PIN_LABEL_COLOR = "#d8efff"
     _GRID_PIXEL_THRESHOLD = 5.0
@@ -55,11 +55,10 @@ class ImageDisplayNode(BaseNode):
         # Initialize callback-referenced state early so events can never
         # observe missing attributes.
         self._photo = None
-        self._preview_win = None
-        self._preview_label = None
-        self._preview_photo = None
         self._frame_times = []
         self._last_frame = None
+        self._points = np.empty((0, 2), dtype=np.float32)
+        self._point_items = []
         self._first_frame_received = False
 
         self._img_hover = False
@@ -84,6 +83,12 @@ class ImageDisplayNode(BaseNode):
         self._coords_update_scheduled = False
         self._pending_coords_overlay: tuple[float | None, float | None] | None = None
         self._coords_overlay_text = ""
+
+        self._marker_var = tk.StringVar(value="+")
+        self._marker_red_var = tk.IntVar(value=0)
+        self._marker_green_var = tk.IntVar(value=255)
+        self._marker_blue_var = tk.IntVar(value=0)
+        self._marker_width_var = tk.IntVar(value=2)
 
     @classmethod
     def _bind_shared_canvas_events(cls, canvas: tk.Canvas) -> None:
@@ -178,8 +183,12 @@ class ImageDisplayNode(BaseNode):
 
     def get_pin_schema(self) -> PinSchema:
         return PinSchema(
-            inputs=[PinDef("image", PinType.IMAGE, "frame",
-                           shape=(-1, -1, 3), dtype="uint8")],
+            inputs=[
+                PinDef("image", PinType.IMAGE, "frame",
+                       shape=(-1, -1, 3), dtype="uint8"),
+                PinDef("points", PinType.ARRAY, "points", shape=None,
+                       optional=True),
+            ],
             outputs=[
                 PinDef("image_coords", PinType.ARRAY, "coords", shape=(1, 2), dtype="float32"),
             ]
@@ -305,11 +314,7 @@ class ImageDisplayNode(BaseNode):
             x+w/2, y+h-10, window=status_lbl,
             tags=(self.node_id,))
 
-        # ── double-click → floating preview ──────────────────────
-        self.canvas.tag_bind(
-            self.node_id, "<Double-Button-1>",
-            lambda e: self._open_preview())
-
+        # Double-click is handled by the editor and opens this node's inspector.
         self.canvas.tag_bind(self._img_area_tag, "<Enter>", self._on_img_enter)
         self.canvas.tag_bind(self._img_area_tag, "<Leave>", self._on_img_leave)
         self.canvas.tag_bind(self._img_area_tag, "<Motion>", self._on_img_motion)
@@ -329,9 +334,6 @@ class ImageDisplayNode(BaseNode):
 
         # ── internal state ────────────────────────────────────────
         self._photo:         ImageTk.PhotoImage | None = None
-        self._preview_win:   tk.Toplevel | None        = None
-        self._preview_label: tk.Label   | None        = None
-        self._preview_photo: ImageTk.PhotoImage | None = None
         self._frame_times:   list[float]               = []
         self._last_frame:    np.ndarray | None         = None
         self._first_frame_received = False
@@ -357,14 +359,26 @@ class ImageDisplayNode(BaseNode):
 
     def compute(self, inputs: dict) -> dict:
         frame = inputs.get("image")
-        if frame is None or not isinstance(frame, np.ndarray):
-            return {}
-        if self._freeze_var.get():
-            return {}
-
-        self._last_frame = frame
-        self._display_frame(frame)
+        self._points = self._normalise_points(inputs.get("points"))
+        if frame is not None and isinstance(frame, np.ndarray) and not self._freeze_var.get():
+            self._last_frame = frame
+            self._display_frame(frame)
+        elif self._last_frame is not None:
+            self._display_frame(self._last_frame)
         return {}
+
+    @staticmethod
+    def _normalise_points(points) -> np.ndarray:
+        """Return finite N-by-(2..4) image-coordinate point data."""
+        if points is None:
+            return np.empty((0, 2), dtype=np.float32)
+        try:
+            array = np.asarray(points, dtype=np.float32)
+        except (TypeError, ValueError):
+            return np.empty((0, 2), dtype=np.float32)
+        if array.ndim != 2 or array.shape[1] not in (2, 3, 4):
+            return np.empty((0, 2), dtype=np.float32)
+        return array[np.isfinite(array).all(axis=1)]
 
     def _display_frame(self, frame: np.ndarray) -> None:
         # remove placeholder on first frame
@@ -431,21 +445,80 @@ class ImageDisplayNode(BaseNode):
 
         self._draw_grid_overlay(img_w, img_h, aw, ah, scale)
 
-        # ── update floating preview if open ──────────────────────
-        if (self._preview_win
-                and self._preview_win.winfo_exists()
-                and self._preview_label):
-            pw = self._preview_win.winfo_width()
-            ph = self._preview_win.winfo_height() - 30
-            preview_pil = self._scale_frame(
-                frame, max(pw, 320), max(ph, 240),
-                interpolation=self._current_interpolation_flag())
-            self._preview_photo = ImageTk.PhotoImage(preview_pil)
-            self._preview_label.config(
-                image=self._preview_photo)
+        # Draw markers after the image and pixel grid so they remain visible.
+        self._draw_point_overlay(aw, ah, scale)
 
     def _current_interpolation_flag(self) -> int:
         return self._INTERPOLATIONS.get(self._interp_var.get(), cv2.INTER_NEAREST)
+
+    def _clear_point_overlay(self) -> None:
+        for item in self._point_items:
+            self.canvas.delete(item)
+        self._point_items = []
+
+    def _marker_color(self) -> str:
+        try:
+            values = (
+                self._marker_red_var.get(),
+                self._marker_green_var.get(),
+                self._marker_blue_var.get(),
+            )
+        except tk.TclError:
+            values = (0, 255, 0)
+        red, green, blue = (max(0, min(255, int(value))) for value in values)
+        return f"#{red:02x}{green:02x}{blue:02x}"
+
+    def _draw_point_overlay(self, aw: int, ah: int, scale: float) -> None:
+        self._clear_point_overlay()
+        if self._points.size == 0 or self._view_cx is None or self._view_cy is None:
+            return
+
+        x1, y1, x2, y2 = self._image_area_rect()
+        color = self._marker_color()
+        try:
+            width = max(1, int(self._marker_width_var.get()))
+        except tk.TclError:
+            width = 2
+        marker = self._marker_var.get()
+        radius = 5.0
+
+        for point in self._points:
+            cx = x1 + (float(point[0]) - self._view_cx) * scale + aw / 2.0
+            cy = y1 + (float(point[1]) - self._view_cy) * scale + ah / 2.0
+            if cx < x1 - radius or cx > x2 + radius or cy < y1 - radius or cy > y2 + radius:
+                continue
+
+            if point.shape[0] >= 3:
+                window_w = abs(float(point[2]))
+                window_h = abs(float(point[3])) if point.shape[0] == 4 else window_w
+                self._point_items.append(self.canvas.create_rectangle(
+                    cx - window_w * scale / 2.0, cy - window_h * scale / 2.0,
+                    cx + window_w * scale / 2.0, cy + window_h * scale / 2.0,
+                    outline=color, width=width,
+                    tags=(self.node_id, self._img_area_tag, "point_overlay"),
+                ))
+
+            if marker == "o":
+                self._point_items.append(self.canvas.create_oval(
+                    cx - radius, cy - radius, cx + radius, cy + radius,
+                    outline=color, width=width,
+                    tags=(self.node_id, self._img_area_tag, "point_overlay"),
+                ))
+            else:
+                segments = [(-radius, 0.0, radius, 0.0), (0.0, -radius, 0.0, radius)]
+                if marker == "*":
+                    diagonal = radius * 0.72
+                    segments += [(-diagonal, -diagonal, diagonal, diagonal),
+                                 (-diagonal, diagonal, diagonal, -diagonal)]
+                for dx1, dy1, dx2, dy2 in segments:
+                    self._point_items.append(self.canvas.create_line(
+                        cx + dx1, cy + dy1, cx + dx2, cy + dy2,
+                        fill=color, width=width,
+                        tags=(self.node_id, self._img_area_tag, "point_overlay"),
+                    ))
+
+        self.canvas.tag_raise(self._coords_text)
+        self.canvas.tag_raise(self._fps_text)
 
     def _clear_grid_overlay(self) -> None:
         for item in self._grid_items:
@@ -697,7 +770,6 @@ class ImageDisplayNode(BaseNode):
             "- '+' / '-': zoom in/out (same as wheel up/down)\n"
             "- Left-drag: pan image\n"
             "- Right-click: interpolation menu\n"
-            "- Floating preview available\n"
             "- Toggle FPS/Coords/Grid checkboxes for overlays\n"
             "- Press C or c (while cursor is over image and Coords is ON) to copy coordinates\n"
             "- Press Ctrl-H to show this help"
@@ -948,65 +1020,65 @@ class ImageDisplayNode(BaseNode):
         if self._last_frame is not None:
             self._display_frame(self._last_frame)
 
-    @staticmethod
-    def _scale_frame(frame: np.ndarray,
-                     max_w: int, max_h: int,
-                     interpolation: int = cv2.INTER_NEAREST) -> Image.Image:
-        """Scale a numpy HxWxC frame to fit within max_w × max_h,
-        preserving aspect ratio."""
-        h, w = frame.shape[:2]
-        scale = min(max_w / w, max_h / h, 1.0)
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        resized = cv2.resize(
-            frame, (new_w, new_h),
-            interpolation=interpolation)
-        return Image.fromarray(resized)
-
-    # ── floating preview window ───────────────────────────────────
-
-    def _open_preview(self) -> None:
-        preview_win = getattr(self, "_preview_win", None)
-        if preview_win and preview_win.winfo_exists():
-            self._preview_win.lift()
-            return
-
-        self._preview_win = tk.Toplevel()
-        self._preview_win.title(
-            f"Image Preview — {self.node_id}")
-        self._preview_win.geometry("720x540")
-        self._preview_win.protocol(
-            "WM_DELETE_WINDOW", self._close_preview)
-
-        self._preview_label = tk.Label(
-            self._preview_win, bg="black")
-        self._preview_label.pack(fill="both", expand=True)
-
-        info = tk.Label(
-            self._preview_win,
-            text="Live preview — resizable",
-            font=("Arial", 8), bg="#111111", fg="#666666")
-        info.pack(fill="x")
-
-        # show last frame immediately if available
-        if self._last_frame is not None:
-            self._display_frame(self._last_frame)
-
-    def _close_preview(self) -> None:
-        if self._preview_win:
-            self._preview_win.destroy()
-            self._preview_win  = None
-            self._preview_label = None
-
     def on_destroy(self) -> None:
         if self._HOVERED_BY_CANVAS.get(self.canvas) is self:
             self._HOVERED_BY_CANVAS.pop(self.canvas, None)
         self._close_help_popup()
-        self._close_preview()
         self._clear_grid_overlay()
+        self._clear_point_overlay()
         super().on_destroy()
 
     # ── serialization ─────────────────────────────────────────────
+
+    def build_inspector(self, parent: tk.Frame) -> None:
+        tk.Label(parent, text="Point symbols", font=("Arial", 10, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
+        tk.Label(parent, text="Marker", font=("Arial", 9)).grid(
+            row=1, column=0, sticky="w", pady=2
+        )
+        marker_menu = ttk.Combobox(
+            parent, textvariable=self._marker_var, values=("+", "*", "o"),
+            state="readonly", width=8, font=("Arial", 9),
+        )
+        marker_menu.grid(row=1, column=1, sticky="w", pady=2)
+
+        tk.Label(parent, text="Color (R, G, B)", font=("Arial", 9)).grid(
+            row=2, column=0, sticky="w", pady=2
+        )
+        color_row = tk.Frame(parent)
+        color_row.grid(row=2, column=1, sticky="w", pady=2)
+        for variable in (self._marker_red_var, self._marker_green_var, self._marker_blue_var):
+            tk.Spinbox(
+                color_row, from_=0, to=255, textvariable=variable,
+                width=4, font=("Arial", 9), justify="center",
+            ).pack(side="left", padx=(0, 3))
+
+        tk.Label(parent, text="Line width", font=("Arial", 9)).grid(
+            row=3, column=0, sticky="w", pady=2
+        )
+        tk.Spinbox(
+            parent, from_=1, to=20, textvariable=self._marker_width_var,
+            width=5, font=("Arial", 9), justify="center",
+        ).grid(row=3, column=1, sticky="w", pady=2)
+
+        tk.Label(
+            parent,
+            text="Points must be an N x 2, N x 3, or N x 4 array.\n"
+                 "Columns: x, y, [window size] or [window width, height].",
+            justify="left", anchor="w", font=("Arial", 8), fg="#555555",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        marker_menu.bind("<<ComboboxSelected>>", self._on_marker_style_changed)
+        for variable in (
+            self._marker_red_var, self._marker_green_var,
+            self._marker_blue_var, self._marker_width_var,
+        ):
+            variable.trace_add("write", self._on_marker_style_changed)
+
+    def _on_marker_style_changed(self, *_args) -> None:
+        if self._last_frame is not None:
+            self._display_frame(self._last_frame)
 
     def get_params(self) -> dict:
         return {
@@ -1014,6 +1086,12 @@ class ImageDisplayNode(BaseNode):
             "show_coords": self._show_coords_var.get(),
             "show_grid": self._show_grid_var.get(),
             "interpolation": self._interp_var.get(),
+            "marker": self._marker_var.get(),
+            "marker_color": [
+                self._marker_red_var.get(), self._marker_green_var.get(),
+                self._marker_blue_var.get(),
+            ],
+            "marker_width": self._marker_width_var.get(),
         }
 
     def set_params(self, params: dict) -> None:
@@ -1022,6 +1100,21 @@ class ImageDisplayNode(BaseNode):
         self._show_grid_var.set(params.get("show_grid", False))
         interp = str(params.get("interpolation", "NEAREST")).upper()
         self._interp_var.set(interp if interp in self._INTERPOLATIONS else "NEAREST")
+        marker = str(params.get("marker", "+"))
+        self._marker_var.set(marker if marker in ("+", "*", "o") else "+")
+        color = params.get("marker_color", (0, 255, 0))
+        try:
+            red, green, blue = (max(0, min(255, int(value))) for value in color)
+        except (TypeError, ValueError):
+            red, green, blue = 0, 255, 0
+        self._marker_red_var.set(red)
+        self._marker_green_var.set(green)
+        self._marker_blue_var.set(blue)
+        try:
+            width = int(params.get("marker_width", 2))
+        except (TypeError, ValueError):
+            width = 2
+        self._marker_width_var.set(max(1, min(20, width)))
 
 
 
