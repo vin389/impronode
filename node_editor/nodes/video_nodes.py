@@ -6,6 +6,7 @@ import threading
 import queue
 import time
 import platform
+import weakref
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
@@ -305,6 +306,8 @@ class VideoPlayOutputNode(BaseNode):
         "AREA": cv2.INTER_AREA,
         "LANCZOS4": cv2.INTER_LANCZOS4,
     }
+    _BOUND_CANVASES: "weakref.WeakSet[tk.Canvas]" = weakref.WeakSet()
+    _HOVERED_BY_CANVAS: "weakref.WeakKeyDictionary[tk.Canvas, VideoPlayOutputNode]" = weakref.WeakKeyDictionary()
 
     def __init__(self, node_id: str, canvas: tk.Canvas):
         super().__init__(node_id, canvas)
@@ -336,6 +339,102 @@ class VideoPlayOutputNode(BaseNode):
         self._last_coords_value: str | None = None
         self._coords_copied = False
         self._help_popup: tk.Toplevel | None = None
+        self._pan_redraw_scheduled = False
+        self._pending_pan_overlay: tuple[float, float] | None = None
+        self._coords_update_scheduled = False
+        self._pending_coords_overlay: tuple[float | None, float | None] | None = None
+        self._coords_overlay_text = ""
+
+    @classmethod
+    def _bind_shared_canvas_events(cls, canvas: tk.Canvas) -> None:
+        if canvas in cls._BOUND_CANVASES:
+            return
+        cls._BOUND_CANVASES.add(canvas)
+        canvas.bind(
+            "<MouseWheel>",
+            lambda event, c=canvas: cls._dispatch_canvas_mousewheel(c, event),
+            add="+",
+        )
+        canvas.bind(
+            "<Button-4>",
+            lambda event, c=canvas: cls._dispatch_canvas_wheel_linux(c, event),
+            add="+",
+        )
+        canvas.bind(
+            "<Button-5>",
+            lambda event, c=canvas: cls._dispatch_canvas_wheel_linux(c, event),
+            add="+",
+        )
+        canvas.bind(
+            "<KeyPress-plus>",
+            lambda event, c=canvas: cls._dispatch_hover_hotkey(c, event, "_on_zoom_in_hotkey"),
+            add="+",
+        )
+        canvas.bind(
+            "<KeyPress-minus>",
+            lambda event, c=canvas: cls._dispatch_hover_hotkey(c, event, "_on_zoom_out_hotkey"),
+            add="+",
+        )
+        canvas.bind(
+            "<KeyPress-KP_Add>",
+            lambda event, c=canvas: cls._dispatch_hover_hotkey(c, event, "_on_zoom_in_hotkey"),
+            add="+",
+        )
+        canvas.bind(
+            "<KeyPress-KP_Subtract>",
+            lambda event, c=canvas: cls._dispatch_hover_hotkey(c, event, "_on_zoom_out_hotkey"),
+            add="+",
+        )
+        canvas.bind(
+            "<KeyPress-c>",
+            lambda event, c=canvas: cls._dispatch_hover_hotkey(c, event, "_on_copy_coords_hotkey"),
+            add="+",
+        )
+        canvas.bind(
+            "<KeyPress-C>",
+            lambda event, c=canvas: cls._dispatch_hover_hotkey(c, event, "_on_copy_coords_hotkey"),
+            add="+",
+        )
+        canvas.bind(
+            "<Control-h>",
+            lambda event, c=canvas: cls._dispatch_hover_hotkey(c, event, "_on_help_hotkey"),
+            add="+",
+        )
+        canvas.bind(
+            "<Control-H>",
+            lambda event, c=canvas: cls._dispatch_hover_hotkey(c, event, "_on_help_hotkey"),
+            add="+",
+        )
+
+    @classmethod
+    def _hover_target_for_canvas(cls, canvas: tk.Canvas):
+        node = cls._HOVERED_BY_CANVAS.get(canvas)
+        if node is not None and getattr(node, "_img_hover", False):
+            return node
+        if node is not None:
+            cls._HOVERED_BY_CANVAS.pop(canvas, None)
+        return None
+
+    @classmethod
+    def _dispatch_canvas_mousewheel(cls, canvas: tk.Canvas, event):
+        node = cls._hover_target_for_canvas(canvas)
+        if node is None:
+            return None
+        return node._on_img_mousewheel(event)
+
+    @classmethod
+    def _dispatch_canvas_wheel_linux(cls, canvas: tk.Canvas, event):
+        node = cls._hover_target_for_canvas(canvas)
+        if node is None:
+            return None
+        return node._on_img_wheel_linux(event)
+
+    @classmethod
+    def _dispatch_hover_hotkey(cls, canvas: tk.Canvas, event, handler_name: str):
+        node = cls._hover_target_for_canvas(canvas)
+        if node is None:
+            return None
+        return getattr(node, handler_name)(event)
 
     def get_pin_schema(self) -> PinSchema:
         return PinSchema(
@@ -481,17 +580,7 @@ class VideoPlayOutputNode(BaseNode):
 
         # Mouse wheel cannot be bound with tag_bind on canvas items; bind at canvas level
         # and gate by this node's hover/focus state.
-        self.canvas.bind("<MouseWheel>", self._on_canvas_mousewheel, add="+")
-        self.canvas.bind("<Button-4>", self._on_canvas_wheel_linux, add="+")
-        self.canvas.bind("<Button-5>", self._on_canvas_wheel_linux, add="+")
-        self.canvas.bind("<KeyPress-plus>", self._on_zoom_in_hotkey, add="+")
-        self.canvas.bind("<KeyPress-minus>", self._on_zoom_out_hotkey, add="+")
-        self.canvas.bind("<KeyPress-KP_Add>", self._on_zoom_in_hotkey, add="+")
-        self.canvas.bind("<KeyPress-KP_Subtract>", self._on_zoom_out_hotkey, add="+")
-        self.canvas.bind("<KeyPress-c>", self._on_copy_coords_hotkey, add="+")
-        self.canvas.bind("<KeyPress-C>", self._on_copy_coords_hotkey, add="+")
-        self.canvas.bind("<Control-h>", self._on_help_hotkey, add="+")
-        self.canvas.bind("<Control-H>", self._on_help_hotkey, add="+")
+        self._bind_shared_canvas_events(self.canvas)
 
         self._canvas_items += [
             self._body_rect, self._title_item,
@@ -511,6 +600,11 @@ class VideoPlayOutputNode(BaseNode):
         self._is_panning = False
         self._pan_anchor_canvas: tuple[float, float] | None = None
         self._pan_anchor_center: tuple[float, float] | None = None
+        self._pan_redraw_scheduled = False
+        self._pending_pan_overlay: tuple[float, float] | None = None
+        self._coords_update_scheduled = False
+        self._pending_coords_overlay: tuple[float | None, float | None] | None = None
+        self._coords_overlay_text = ""
 
         # Viewport state in image coordinates: displayed center and zoom multiplier.
         self._zoom = 1.0
@@ -747,20 +841,20 @@ class VideoPlayOutputNode(BaseNode):
     def _update_coords_overlay(self, canvas_x: float | None = None,
                                canvas_y: float | None = None) -> None:
         if not self._show_coords_var.get() or not self._img_hover:
-            self.canvas.itemconfigure(self._coords_text, text="")
+            self._set_coords_overlay_text("")
             self._last_coords_value = None
             self._coords_copied = False
             return
 
         if canvas_x is None or canvas_y is None:
-            self.canvas.itemconfigure(self._coords_text, text="")
+            self._set_coords_overlay_text("")
             self._last_coords_value = None
             self._coords_copied = False
             return
 
         mapped = self._canvas_to_image_coords(canvas_x, canvas_y)
         if mapped is None:
-            self.canvas.itemconfigure(self._coords_text, text="")
+            self._set_coords_overlay_text("")
             self._last_coords_value = None
             self._coords_copied = False
             return
@@ -770,17 +864,42 @@ class VideoPlayOutputNode(BaseNode):
             img_h, img_w = self._last_frame.shape[:2]
             if (img_x < -0.5 or img_x > (img_w - 0.5)
                     or img_y < -0.5 or img_y > (img_h - 0.5)):
-                self.canvas.itemconfigure(self._coords_text, text="")
+                self._set_coords_overlay_text("")
                 self._last_coords_value = None
                 self._coords_copied = False
                 return
 
         self._last_coords_value = f"{img_x:.3f}, {img_y:.3f}"
         copied_suffix = " (copied)" if self._coords_copied else ""
-        self.canvas.itemconfigure(
-            self._coords_text,
-            text=f"({self._last_coords_value}){copied_suffix}",
+        self._set_coords_overlay_text(
+            f"({self._last_coords_value}){copied_suffix}",
         )
+
+    def _set_coords_overlay_text(self, text: str) -> None:
+        if text == self._coords_overlay_text:
+            return
+        self._coords_overlay_text = text
+        self.canvas.itemconfigure(self._coords_text, text=text)
+
+    def _schedule_coords_overlay_update(self, canvas_x: float | None,
+                                        canvas_y: float | None) -> None:
+        self._pending_coords_overlay = (canvas_x, canvas_y)
+        if self._coords_update_scheduled:
+            return
+        self._coords_update_scheduled = True
+
+        def _flush() -> None:
+            self._coords_update_scheduled = False
+            pending = self._pending_coords_overlay
+            self._pending_coords_overlay = None
+            if pending is None:
+                return
+            try:
+                self._update_coords_overlay(*pending)
+            except tk.TclError:
+                pass
+
+        self.canvas.after_idle(_flush)
 
     def _on_copy_coords_hotkey(self, _event) -> str | None:
         if not self._show_coords_var.get() or not self._img_hover:
@@ -795,9 +914,8 @@ class VideoPlayOutputNode(BaseNode):
             return None
 
         self._coords_copied = True
-        self.canvas.itemconfigure(
-            self._coords_text,
-            text=f"({self._last_coords_value}) (copied)",
+        self._set_coords_overlay_text(
+            f"({self._last_coords_value}) (copied)",
         )
 
         # Also publish picked image coordinates for downstream array processing.
@@ -919,22 +1037,25 @@ class VideoPlayOutputNode(BaseNode):
     def _on_img_enter(self, event) -> str:
         self.canvas.focus_set()
         self._img_hover = True
+        self._HOVERED_BY_CANVAS[self.canvas] = self
         self._focus_border(True)
-        self._update_coords_overlay(event.x, event.y)
+        self._schedule_coords_overlay_update(event.x, event.y)
         return "break"
 
     def _on_img_leave(self, _event) -> str:
         self._img_hover = False
+        if self._HOVERED_BY_CANVAS.get(self.canvas) is self:
+            self._HOVERED_BY_CANVAS.pop(self.canvas, None)
         self._is_panning = False
         self._pan_anchor_canvas = None
         self._pan_anchor_center = None
         self._focus_border(False)
-        self._update_coords_overlay(None, None)
+        self._schedule_coords_overlay_update(None, None)
         return "break"
 
     def _on_img_motion(self, event) -> str:
         self._coords_copied = False
-        self._update_coords_overlay(event.x, event.y)
+        self._schedule_coords_overlay_update(event.x, event.y)
         return "break"
 
     def _on_img_mousewheel(self, event) -> str:
@@ -982,11 +1103,33 @@ class VideoPlayOutputNode(BaseNode):
 
     def _on_img_press(self, event) -> str:
         self._is_panning = self._img_hover and self._last_frame is not None
+        self._HOVERED_BY_CANVAS[self.canvas] = self
         if self._is_panning:
             self._pan_anchor_canvas = (event.x, event.y)
             self._pan_anchor_center = (float(self._view_cx), float(self._view_cy))
-        self._update_coords_overlay(event.x, event.y)
+        self._schedule_coords_overlay_update(event.x, event.y)
         return "break"
+
+    def _schedule_pan_redraw(self, canvas_x: float, canvas_y: float) -> None:
+        self._pending_pan_overlay = (canvas_x, canvas_y)
+        if self._pan_redraw_scheduled:
+            return
+        self._pan_redraw_scheduled = True
+
+        def _flush() -> None:
+            self._pan_redraw_scheduled = False
+            overlay = self._pending_pan_overlay
+            self._pending_pan_overlay = None
+            if self._last_frame is None:
+                return
+            try:
+                self._display_frame(self._last_frame)
+                if overlay is not None:
+                    self._update_coords_overlay(*overlay)
+            except tk.TclError:
+                pass
+
+        self.canvas.after_idle(_flush)
 
     def _on_img_drag(self, event) -> str:
         self._coords_copied = False
@@ -1030,15 +1173,17 @@ class VideoPlayOutputNode(BaseNode):
         self._view_cx = next_cx
         self._view_cy = next_cy
 
-        self._display_frame(self._last_frame)
-        self._update_coords_overlay(event.x, event.y)
+        self._schedule_pan_redraw(event.x, event.y)
         return "break"
 
     def _on_img_release(self, event) -> str:
         self._is_panning = False
         self._pan_anchor_canvas = None
         self._pan_anchor_center = None
-        self._update_coords_overlay(event.x, event.y)
+        if self._pan_redraw_scheduled:
+            self._pending_pan_overlay = (event.x, event.y)
+        else:
+            self._schedule_coords_overlay_update(event.x, event.y)
         return "break"
 
     def _on_img_right_click(self, event) -> str:
@@ -1114,6 +1259,8 @@ class VideoPlayOutputNode(BaseNode):
             self._preview_label = None
 
     def on_destroy(self) -> None:
+        if self._HOVERED_BY_CANVAS.get(self.canvas) is self:
+            self._HOVERED_BY_CANVAS.pop(self.canvas, None)
         self._close_help_popup()
         self._close_preview()
         self._clear_grid_overlay()
