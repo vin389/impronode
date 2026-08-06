@@ -151,7 +151,7 @@ class AddNode(BaseNode):
 class ScalarOutputNode(BaseNode):
     EXECUTION_MODE = ExecutionMode.SYNC
     NODE_TYPE      = "scalar_output"
-    DISPLAY_NAME   = "Result Output"
+    DISPLAY_NAME   = "Scalar Display"
     CATEGORY       = "visualize"
 #    NODE_HEIGHT    = 80
 

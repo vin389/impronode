@@ -108,6 +108,8 @@ class DataFlowEngine:
         adjacency: dict[str, list[str]] = {nid: [] for nid in self.nodes}
 
         for lk in self.links:
+            if not self._is_causal_link(lk):
+                continue
             src, dst = lk["src_node"], lk["dst_node"]
             if src in adjacency:
                 adjacency[src].append(dst)
@@ -156,7 +158,14 @@ class DataFlowEngine:
         self._execute_in_order(suborder)
 
     def _downstream_set(self, start_id: str) -> set[str]:
-        """Use BFS to find all downstream nodes from start_id, including itself."""
+        """
+        Use BFS to find all downstream nodes from start_id, including itself.
+
+        Delayed links are included here so nodes that consume delayed inputs
+        still get recomputed when their upstream source publishes new data.
+        Topological sort remains causal-only, so cycle rejection behaviour is
+        unchanged.
+        """
         visited = set()
         queue_  = [start_id]
         while queue_:
@@ -168,6 +177,15 @@ class DataFlowEngine:
                 if lk["src_node"] == cur and lk["dst_node"] not in visited:
                     queue_.append(lk["dst_node"])
         return visited
+
+    def _is_causal_link(self, link: dict) -> bool:
+        """
+        Delayed feedback links carry cached values from a previous pass and must
+        not participate in cycle detection or same-pass scheduling.
+        """
+        destination = self.nodes.get(link["dst_node"])
+        delayed_pins = getattr(destination, "DELAYED_INPUT_PINS", ())
+        return link["dst_pin"] not in delayed_pins
 
     # ══ Execution scheduling (core) ═══════════════════════════════
 

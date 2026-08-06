@@ -22,7 +22,7 @@ class UndistortNode(BaseNode):
 
 	EXECUTION_MODE = ExecutionMode.SYNC
 	NODE_TYPE = "undistort"
-	DISPLAY_NAME = "Undistort"
+	DISPLAY_NAME = "Undistort img."
 	CATEGORY = "process"
 	NODE_WIDTH = 210
 	NODE_HEIGHT = 105

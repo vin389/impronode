@@ -24,7 +24,9 @@ class TriggerNode(BaseNode):
 
 	def get_pin_schema(self) -> PinSchema:
 		return PinSchema(
-			inputs=[],
+			inputs=[
+				PinDef("trig", PinType.TRIGGER, "trig", optional=True),
+			],
 			outputs=[
 				PinDef("trigger", PinType.TRIGGER, "trig"),
 				PinDef("button_count", PinType.SCALAR, "btn_n"),
@@ -52,6 +54,7 @@ class TriggerNode(BaseNode):
 		self._timer_running = False
 		self._timer_after_id: str | None = None
 		self._interval_trace_id: str | None = None
+		self._input_latched_high = False
 
 		self._last_outputs = {
 			"trigger": 0.0,
@@ -261,6 +264,18 @@ class TriggerNode(BaseNode):
 
 		self._sync_output_cache()
 
+	@staticmethod
+	def _truthy_trigger(value) -> bool:
+		if isinstance(value, str):
+			text = value.strip().lower()
+			if text in ("", "0", "false", "no", "off"):
+				return False
+			return True
+		try:
+			return bool(float(value))
+		except (TypeError, ValueError):
+			return bool(value)
+
 	def _on_manual_trigger(self) -> None:
 		self._emit_trigger("button")
 		self._status_var.set("manual trigger sent")
@@ -360,6 +375,16 @@ class TriggerNode(BaseNode):
 
 	def compute(self, inputs: dict) -> dict:
 		self._init_state()
+		raw_trig = inputs.get("trig")
+		trig_high = self._truthy_trigger(raw_trig)
+		if trig_high and not self._input_latched_high:
+			# Input-triggered one-shot behaves the same as pressing Trigger Once.
+			self._emit_trigger("button")
+			self._status_var.set("input trigger sent")
+			self.set_status("input", "#4f7f2a")
+			self._input_latched_high = True
+		elif not trig_high:
+			self._input_latched_high = False
 		return dict(self._last_outputs)
 
 	def get_params(self) -> dict:

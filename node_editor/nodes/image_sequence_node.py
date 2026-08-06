@@ -53,6 +53,9 @@ class ImageSequenceNode(BaseNode):
         "Play: with no link on the next input, one frame pair is emitted at "
         "each FPS interval. Connect a TRIGGER output to next to advance one "
         "frame for each trigger pulse instead.\n\n"
+        "Batch outputs:\n"
+        "- trigger pulses on every emitted batch step.\n"
+        "- batch_start pulses only on the first emitted step of a batch run.\n\n"
         "The index and index 2 inputs still select the two image outputs "
         "directly. They take precedence over manual and batch playback."
     )
@@ -79,6 +82,7 @@ class ImageSequenceNode(BaseNode):
                 PinDef("frame_index", PinType.SCALAR, "index"),
                 PinDef("frame_count", PinType.SCALAR, "count"),
                 PinDef("trigger",     PinType.TRIGGER, "trig"),
+                PinDef("batch_start", PinType.TRIGGER, "start"),
             ]
         )
 
@@ -580,7 +584,12 @@ class ImageSequenceNode(BaseNode):
         loop_index = self._batch_indices[self._batch_position]
         self._batch_position += 1
         self._batch_current_var.set(str(loop_index))
-        self._emit_batch_frames(loop_index)
+        is_first_step = self._batch_position == 1
+        self._emit_batch_frames(
+            loop_index,
+            emit_trigger=True,
+            emit_batch_start=is_first_step,
+        )
         if not self._batch_running:
             return
         self._status_var.set(
@@ -592,7 +601,9 @@ class ImageSequenceNode(BaseNode):
         elif not self._trigger_linked:
             self._schedule_batch_tick()
 
-    def _emit_batch_frames(self, loop_index: int) -> None:
+    def _emit_batch_frames(self, loop_index: int,
+                           emit_trigger: bool = False,
+                           emit_batch_start: bool = False) -> None:
         """Decode and publish the two frame expressions for one batch index."""
         frame_1_expression = self._parse_batch_expression(self._batch_frame_1_var.get())
         frame_2_expression = self._parse_batch_expression(self._batch_frame_2_var.get())
@@ -627,12 +638,15 @@ class ImageSequenceNode(BaseNode):
         self._fname_var.set(Path(self._file_paths[frame_1_index]).name)
         height, width = frame_1.shape[:2]
         self._size_var.set(f"{width} x {height}")
-        self.push_output({
+        outputs = {
             "image": frame_1,
             "image_2": frame_2,
             "frame_index": float(frame_1_index + 1),
             "frame_count": float(len(self._file_paths)),
-        })
+        }
+        self.push_output(outputs)
+        if emit_trigger:
+            self._emit_trigger_pulse(outputs, emit_batch_start=emit_batch_start)
 
     def close_inspector(self) -> None:
         super().close_inspector()
@@ -1048,7 +1062,7 @@ class ImageSequenceNode(BaseNode):
             self._stop_batch("manual batch control")
         loop_index = values[position]
         self._batch_current_var.set(str(loop_index))
-        self._emit_batch_frames(loop_index)
+        self._emit_batch_frames(loop_index, emit_trigger=True)
         if not self._batch_running:
             self._status_var.set(f"sent i={loop_index}")
 
@@ -1087,6 +1101,23 @@ class ImageSequenceNode(BaseNode):
 
     # ── override push_output for SYNC mode ───────────────────────
 
+    def _emit_trigger_pulse(self, base_outputs: dict | None = None,
+                            emit_batch_start: bool = False) -> None:
+        """Emit a high->low trigger pulse, optionally with a first-step pulse."""
+        if not self._on_output_ready:
+            return
+        pulse_outputs = dict(base_outputs or {})
+        pulse_outputs["trigger"] = 1.0
+        if emit_batch_start:
+            pulse_outputs["batch_start"] = 1.0
+        self._on_output_ready(self.node_id, pulse_outputs)
+
+        reset_outputs = dict(base_outputs or {})
+        reset_outputs["trigger"] = 0.0
+        if emit_batch_start:
+            reset_outputs["batch_start"] = 0.0
+        self._on_output_ready(self.node_id, reset_outputs)
+
     def push_output(self, outputs: dict) -> None:
         """
         ImageSequenceNode is SYNC but needs to push frames
@@ -1097,21 +1128,6 @@ class ImageSequenceNode(BaseNode):
         """
         if not self._on_output_ready:
             return
-
-        # A published frame update is also a trigger pulse.  Emit the high
-        # edge followed by a low/reset edge, matching TriggerNode so the
-        # signal can be used to advance downstream trigger-driven nodes.
-        frame_update_keys = {"image", "image_2", "frame_index", "frame_count"}
-        if frame_update_keys.intersection(outputs):
-            pulse_outputs = dict(outputs)
-            pulse_outputs["trigger"] = 1.0
-            self._on_output_ready(self.node_id, pulse_outputs)
-
-            reset_outputs = dict(outputs)
-            reset_outputs["trigger"] = 0.0
-            self._on_output_ready(self.node_id, reset_outputs)
-            return
-
         self._on_output_ready(self.node_id, outputs)
 
     # ── compute (called by engine for SYNC nodes) ─────────────────
@@ -1174,19 +1190,13 @@ class ImageSequenceNode(BaseNode):
         if trigger_is_linked:
             if self._truthy_trigger(inputs.get("trigger")):
                 self._move_batch_current("next")
-                if self._last_frame is None:
-                    return {
-                        "_skip_downstream": True,
-                        "_preserve_cache": True,
-                    }
-                outputs = {
-                    "image": self._last_frame,
-                    "frame_index": float(self._current_index + 1),
-                    "frame_count": float(len(self._file_paths)),
+                # The next-step action already pushed frame output and the
+                # trigger pulse through push_output(). Avoid emitting a second
+                # sync-path payload that could race with trigger propagation.
+                return {
+                    "_skip_downstream": True,
+                    "_preserve_cache": True,
                 }
-                if self._last_frame_2 is not None:
-                    outputs["image_2"] = self._last_frame_2
-                return outputs
 
             # Low/reset edge from trigger source: suppress downstream recompute.
             return {

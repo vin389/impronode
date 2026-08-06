@@ -29,6 +29,7 @@ class BaseNode(ABC):
     DISPLAY_NAME:   str           = "Base"    # Displayed in the Toolbox and node title
     CATEGORY:       str           = "misc"    # "source" / "process" / "visualize"
     SEARCH_KEYWORDS: tuple[str, ...] = ()      # Optional toolbox-search aliases
+    DELAYED_INPUT_PINS: tuple[str, ...] = ()   # Inputs that read cached upstream values from a previous pass
 
     # ── Default node appearance, overridable by subclasses ─────────
     NODE_WIDTH:  int = 140

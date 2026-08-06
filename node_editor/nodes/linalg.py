@@ -16,7 +16,7 @@ class MatMulNode(BaseNode):
 
     EXECUTION_MODE = ExecutionMode.SYNC
     NODE_TYPE = "matmul"
-    DISPLAY_NAME = "matmul"
+    DISPLAY_NAME = "Matrix mult."
     CATEGORY = "process"
     NODE_WIDTH = 180
     NODE_HEIGHT = 90
@@ -90,7 +90,7 @@ class InvNode(BaseNode):
 
     EXECUTION_MODE = ExecutionMode.SYNC
     NODE_TYPE = "inv"
-    DISPLAY_NAME = "inv"
+    DISPLAY_NAME = "Matrix inv."
     CATEGORY = "process"
     NODE_WIDTH = 160
     NODE_HEIGHT = 90
