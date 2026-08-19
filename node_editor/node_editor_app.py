@@ -503,8 +503,9 @@ class NodeEditorApp:
         cy = self.canvas.canvasy(rel_y)
 
         cls = self._tb_drag["cls"]
+        preview_node = cls("tb_preview", self.canvas)
         w   = cls.NODE_WIDTH
-        h   = cls.NODE_HEIGHT
+        h   = preview_node.get_default_height()
 
         if self._tb_drag["preview"] is None:
             # First time entering the canvas: create the preview outline
@@ -555,7 +556,9 @@ class NodeEditorApp:
                     y: int = 150) -> BaseNode:
         node_id = f"node_{self._node_counter}"
         self._node_counter += 1
-        node = self._create_node_instance(cls, node_id, x, y, cls.NODE_WIDTH, cls.NODE_HEIGHT, {})
+        preview_node = cls(node_id, self.canvas)
+        default_h = preview_node.get_default_height()
+        node = self._create_node_instance(cls, node_id, x, y, cls.NODE_WIDTH, default_h, {})
         self.engine.trigger_all()
         self._mark_dirty()
         return node

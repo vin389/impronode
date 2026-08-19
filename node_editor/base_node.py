@@ -64,7 +64,7 @@ class BaseNode(ABC):
         self.x: int = 0
         self.y: int = 0
         self.width: int = self.NODE_WIDTH
-        self.height: int = self.NODE_HEIGHT
+        self.height: int = self.get_default_height()
 
         # Optional non-modal inspector window (Phase 1 infrastructure).
         self._inspector_win: Optional[tk.Toplevel] = None
@@ -108,6 +108,21 @@ class BaseNode(ABC):
         if isinstance(node_name, str) and node_name.strip():
             return node_name.strip()
         return self.DISPLAY_NAME
+
+    def get_default_height(self) -> int:
+        """Return a pin-aware default height so nodes start tall enough for their pin layout."""
+        base_height = int(getattr(self, "NODE_HEIGHT", self.MIN_HEIGHT))
+        try:
+            schema = self.get_pin_schema()
+        except Exception:
+            return max(self.MIN_HEIGHT, base_height)
+
+        pin_count = max(len(schema.inputs), len(schema.outputs), 0)
+        if pin_count <= 4:
+            return max(self.MIN_HEIGHT, base_height)
+
+        extra = max(0, pin_count - 4) * 20
+        return max(self.MIN_HEIGHT, base_height + extra)
 
     def get_help_text(self) -> str:
         """Return Ctrl-H help, with a useful fallback for every node type."""

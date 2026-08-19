@@ -115,20 +115,20 @@ class OpticalFlowNode(BaseNode):
 
 		self._body_rect = self.canvas.create_rectangle(
 			x, y, x + w, y + h,
-			fill="#e8f3ea", outline="#4b8d62", width=2,
+			fill="#f3ecff", outline="#9a7acb", width=2,
 			tags=(self.node_id, "node_body"),
 		)
 		self._title_item = self.canvas.create_text(
 			x + w / 2, y + 13,
 			text=self.DISPLAY_NAME,
-			font=("Arial", 9, "bold"), fill="#2e6d43",
+			font=("Arial", 9, "bold"), fill="#6f4ea3",
 			tags=(self.node_id,),
 		)
 
 		hint = tk.Label(
 			self.canvas,
 			text="prev,next,pts + trig pulse",
-			font=("Arial", 8), bg="#eef8f0", fg="#356a49",
+			font=("Arial", 8), bg="#f6f0ff", fg="#6f4ea3",
 		)
 		self.canvas.create_window(
 			x + w / 2, y + 40, window=hint,
@@ -138,7 +138,7 @@ class OpticalFlowNode(BaseNode):
 		status_lbl = tk.Label(
 			self.canvas,
 			textvariable=self._status_var,
-			font=("Arial", 7), bg="#eef8f0", fg="#356a49",
+			font=("Arial", 7), bg="#f6f0ff", fg="#6f4ea3",
 		)
 		self.canvas.create_window(
 			x + w / 2, y + h - 12, window=status_lbl,

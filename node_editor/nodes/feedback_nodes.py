@@ -66,6 +66,8 @@ class ArrayFeedbackNode(BaseNode):
         if hasattr(self, "_status_var"):
             return
         self._status_var = tk.StringVar(value="reset -> init")
+        self._count = 0
+        self._count_var = tk.StringVar(value=f"Feedback count: {self._count}")
         self._next_source = "init"
         self._reset_requested = True
         self._reset_latched_high = False
@@ -102,14 +104,14 @@ class ArrayFeedbackNode(BaseNode):
             tags=(self.node_id,),
         )
 
-        hint_lbl = tk.Label(
+        count_lbl = tk.Label(
             self.canvas,
-            text="init first, then delayed current",
-            font=("Arial", 7), bg="#f3efe4", fg="#7a6330",
+            textvariable=self._count_var,
+            font=("Arial", 8), bg="#f3efe4", fg="#7a6330",
         )
         self.canvas.create_window(
             x + w / 2, y + 72,
-            window=hint_lbl,
+            window=count_lbl,
             tags=(self.node_id,),
         )
 
@@ -160,6 +162,8 @@ class ArrayFeedbackNode(BaseNode):
         self._next_source = "init"
         self._status_var.set("reset requested -> init")
         self.set_status("reset", "#8d6f32")
+        self._count = 0
+        self._count_var.set(f"Feedback count: {self._count}")
 
     def on_upstream_changed(self) -> None:
         self._request_reset()
@@ -251,6 +255,8 @@ class ArrayFeedbackNode(BaseNode):
         shape_text = self._shape_text(out)
         self._status_var.set(f"{source}: ({shape_text}) {out.dtype}")
         self.set_status(source, "#4c8a4c" if source != "init" else "#8d6f32")
+        self._count += 1
+        self._count_var.set(f"Feedback count: {self._count}")
         return {"next": out}
 
     def get_params(self) -> dict:
@@ -265,3 +271,6 @@ class ArrayFeedbackNode(BaseNode):
         self._reset_latched_high = False
         self._next_source = "init" if self._reset_requested else "current"
         self._status_var.set("reset -> init" if self._reset_requested else "ready")
+        if self._reset_requested:
+            self._count = 0
+            self._count_var.set(f"Feedback count: {self._count}")
