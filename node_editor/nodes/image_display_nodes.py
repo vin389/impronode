@@ -57,6 +57,7 @@ class ImageDisplayNode(BaseNode):
         self._photo = None
         self._frame_times = []
         self._last_frame = None
+        self._last_transformed = None
         self._points = np.empty((0, 2), dtype=np.float32)
         self._point_items = []
         self._first_frame_received = False
@@ -336,6 +337,7 @@ class ImageDisplayNode(BaseNode):
         self._photo:         ImageTk.PhotoImage | None = None
         self._frame_times:   list[float]               = []
         self._last_frame:    np.ndarray | None         = None
+        self._last_transformed: np.ndarray | None      = None
         self._first_frame_received = False
 
         self._img_hover = False
@@ -432,6 +434,7 @@ class ImageDisplayNode(BaseNode):
         )
 
         img_pil = Image.fromarray(transformed)
+        self._last_transformed = transformed
 
         # ── update canvas image ───────────────────────────────────
         self._photo = ImageTk.PhotoImage(img_pil)
@@ -447,6 +450,12 @@ class ImageDisplayNode(BaseNode):
 
         # Draw markers after the image and pixel grid so they remain visible.
         self._draw_point_overlay(aw, ah, scale)
+
+        # Background pixels under the coords label can change every frame
+        # (e.g. live video) even while the mouse stays still, so refresh
+        # its contrast color here too, not just when the text itself changes.
+        if self._coords_overlay_text:
+            self._apply_coords_contrast_color()
 
     def _current_interpolation_flag(self) -> int:
         return self._INTERPOLATIONS.get(self._interp_var.get(), cv2.INTER_NEAREST)
@@ -638,14 +647,22 @@ class ImageDisplayNode(BaseNode):
         img_h, img_w = self._last_frame.shape[:2]
         self._ensure_view_center(img_w, img_h)
 
+        # canvas_x/canvas_y are viewport-relative (as reported by Tk mouse
+        # events), but _image_area_rect() is in the canvas's own (scrolled)
+        # coordinate space — must convert or the overlay drifts by the
+        # scroll offset (mainly visible in y, since the editor scrolls
+        # vertically far more often than horizontally).
+        abs_x = float(self.canvas.canvasx(canvas_x))
+        abs_y = float(self.canvas.canvasy(canvas_y))
+
         x1, y1, x2, y2 = self._image_area_rect()
         aw = max(1.0, x2 - x1)
         ah = max(1.0, y2 - y1)
         fit_scale = min(aw / max(1.0, img_w), ah / max(1.0, img_h))
         scale = max(1e-6, fit_scale * self._zoom)
 
-        local_x = canvas_x - x1
-        local_y = canvas_y - y1
+        local_x = abs_x - x1
+        local_y = abs_y - y1
 
         img_x = self._view_cx + (local_x - aw / 2.0) / scale
         img_y = self._view_cy + (local_y - ah / 2.0) / scale
@@ -693,6 +710,61 @@ class ImageDisplayNode(BaseNode):
             return
         self._coords_overlay_text = text
         self.canvas.itemconfigure(self._coords_text, text=text)
+        if text:
+            self._apply_coords_contrast_color()
+
+    def _apply_coords_contrast_color(self) -> None:
+        """Sample the pixels under the coords label and pick a legible fill color."""
+        if self._last_transformed is None:
+            return
+        bbox = self.canvas.bbox(self._coords_text)
+        if bbox is None:
+            return
+
+        x1, y1, _, _ = self._image_area_rect()
+        th, tw = self._last_transformed.shape[:2]
+
+        px1 = int(np.clip(bbox[0] - x1, 0, tw))
+        py1 = int(np.clip(bbox[1] - y1, 0, th))
+        px2 = int(np.clip(bbox[2] - x1, 0, tw))
+        py2 = int(np.clip(bbox[3] - y1, 0, th))
+        if px2 <= px1 or py2 <= py1:
+            return
+
+        region = self._last_transformed[py1:py2, px1:px2]
+        if region.size == 0:
+            return
+        mean_rgb = region.reshape(-1, region.shape[-1])[:, :3].mean(axis=0)
+        color = self._best_contrast_color(mean_rgb)
+        self.canvas.itemconfigure(self._coords_text, fill=color)
+
+    # Small high-visibility palette. A pure black/white luminance-ratio pick
+    # nearly always just returns black or white for every background (they
+    # sit at the extremes of possible luminance), so instead this ranks
+    # candidates by RGB distance from the background: a saturated background
+    # (e.g. blue) then prefers a hue-distinct bright color (e.g. yellow)
+    # over plain white/black, while neutral/extreme backgrounds still land
+    # on black or white as usual.
+    _CONTRAST_PALETTE = (
+        "#ffffff", "#000000", "#ffe066", "#00e5ff",
+        "#ff4dd2", "#7cfc00", "#ff5555", "#3399ff",
+    )
+
+    @classmethod
+    def _best_contrast_color(cls, bg_rgb) -> str:
+        """Pick the palette color with the largest RGB distance from bg_rgb."""
+        best_color = cls._CONTRAST_PALETTE[0]
+        best_dist = -1.0
+        for hex_color in cls._CONTRAST_PALETTE:
+            candidate_rgb = tuple(
+                int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+            dist = sum(
+                (float(a) - float(b)) ** 2
+                for a, b in zip(bg_rgb, candidate_rgb))
+            if dist > best_dist:
+                best_dist = dist
+                best_color = hex_color
+        return best_color
 
     def _schedule_coords_overlay_update(self, canvas_x: float | None,
                                         canvas_y: float | None) -> None:
@@ -806,6 +878,13 @@ class ImageDisplayNode(BaseNode):
         if self._last_frame is None:
             return
 
+        # Keep the raw viewport-relative coords for the overlay update
+        # below — _update_coords_overlay/_canvas_to_image_coords expect
+        # viewport-relative input and do their own canvasx/canvasy
+        # conversion, so passing the already-converted values would
+        # double-apply the scroll offset.
+        raw_x, raw_y = canvas_x, canvas_y
+
         # Canvas mouse events report viewport-relative coordinates.
         # Convert them to the scrolled canvas coordinate space so the
         # image point under the cursor remains fixed while zooming.
@@ -844,7 +923,7 @@ class ImageDisplayNode(BaseNode):
         )
 
         self._display_frame(self._last_frame)
-        self._update_coords_overlay(canvas_x, canvas_y)
+        self._update_coords_overlay(raw_x, raw_y)
 
     def _on_img_enter(self, event) -> str:
         self.canvas.focus_set()

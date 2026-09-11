@@ -63,7 +63,11 @@ class OpticalFlowNode(BaseNode):
 		"- flags [SCALAR, optional]: cv2 calcOpticalFlowPyrLK flags, default 0.\n"
 		"- minEigThreshold [SCALAR, optional]: default 1e-4.\n"
 		"- trig [TRIGGER, optional]: while false, inputs are buffered\n"
-		"  without computing; on each truthy pulse, compute exactly once.\n\n"
+		"  without computing; on each truthy pulse OR each new value while\n"
+		"  already truthy (so an ever-incrementing counter works too), compute\n"
+		"  exactly once. If required inputs are still missing when the pulse\n"
+		"  arrives, the pulse stays queued and fires automatically as soon as\n"
+		"  they become available -- no need to re-trigger.\n\n"
 		"Output Pins:\n"
 		"- nextPts [ARRAY float32 Nx2]: tracked output points.\n"
 		"- status [ARRAY uint8 N]: 1 means tracked successfully, 0 means failed.\n"
@@ -83,9 +87,22 @@ class OpticalFlowNode(BaseNode):
 		self._flags_var = tk.StringVar(value=str(self._DEFAULT_FLAGS))
 		self._min_eig_var = tk.StringVar(value=str(self._DEFAULT_MIN_EIG_THRESHOLD))
 		self._buffered_inputs: dict[str, object] = {}
-		self._enable_latched_high = False
+		# --- trigger edge-detection state ------------------------------
+		# _last_trig_value / _trig_was_truthy record what the trig pin
+		# looked like on the PREVIOUS compute() call (any call, whether or
+		# not it actually fired), so the next call can tell "did this
+		# change" apart from "is this simply still the same value being
+		# re-delivered because some unrelated upstream node recomputed".
+		#
+		# _trigger_pending is set the moment a new pulse is detected and
+		# only cleared once a compute actually runs successfully. This is
+		# what lets a pulse that arrives before its required inputs are
+		# ready stay "queued" and fire automatically once they show up,
+		# instead of being silently dropped.
+		self._last_trig_value = None
+		self._trig_was_truthy = False
 		self._trigger_pending = False
-		self._suppress_next_low_status = False
+		self._has_computed_once = False
 		self._last_warn_key: str | None = None
 
 	def get_pin_schema(self) -> PinSchema:
@@ -247,17 +264,37 @@ class OpticalFlowNode(BaseNode):
 
 	def on_upstream_changed(self) -> None:
 		self._buffered_inputs.clear()
-		self._enable_latched_high = False
+		self._last_trig_value = None
+		self._trig_was_truthy = False
 		self._trigger_pending = False
-		self._suppress_next_low_status = False
+		self._has_computed_once = False
 		self._last_warn_key = None
 		self._status_var.set("upstream changed")
 		self.set_status("waiting", "#666666")
 
 	def _sync_buffer(self, inputs: dict) -> None:
+		persistent_pins = {"prevPts", "nextPts"}
 		for pin_name in self._FLOW_INPUT_PINS:
-			if pin_name in inputs:
-				self._buffered_inputs[pin_name] = inputs[pin_name]
+			has_value = pin_name in inputs and inputs[pin_name] is not None
+			if has_value:
+				value = inputs[pin_name]
+				if isinstance(value, np.ndarray):
+					# Buffered values are held across multiple compute()
+					# calls -- from whenever they arrive until the next
+					# trigger pulse actually consumes them. Without a copy
+					# here, self._buffered_inputs would merely alias
+					# whatever array object the upstream node handed us;
+					# if that same array object is later mutated in place
+					# by anything (a node reusing a preallocated buffer, a
+					# cv2 call with dst=...), the buffered snapshot would
+					# silently change too, well after the fact.
+					value = value.copy()
+				self._buffered_inputs[pin_name] = value
+			elif pin_name in persistent_pins and pin_name in self._buffered_inputs:
+				# Tracking inputs such as prevPts need to remain valid across
+				# trigger pulses even when upstream is linked but hasn't resent
+				# a value this pass (present in inputs as None).
+				continue
 			else:
 				self._buffered_inputs.pop(pin_name, None)
 
@@ -414,42 +451,51 @@ class OpticalFlowNode(BaseNode):
 		self._init_state()
 		self._sync_buffer(inputs)
 
-		raw_enable = inputs.get("trig")
-		if raw_enable is None:
-			# Backward compatibility for older saved projects.
-			raw_enable = inputs.get("enableOnce")
-		enable_now = False if raw_enable is None else self._coerce_bool_like(raw_enable)
-		missing_required = self._missing_required_inputs()
+		raw_trig = inputs.get("trig")
+		if raw_trig is None:
+			# Backward compatibility for older saved projects that used
+			# a differently-named pin.
+			raw_trig = inputs.get("enableOnce")
 
-		# Rising edge arms one pending compute request.
-		if enable_now and not self._enable_latched_high:
+		is_truthy_now = raw_trig is not None and self._coerce_bool_like(raw_trig)
+		was_truthy_before = self._trig_was_truthy
+		value_changed = raw_trig is not None and raw_trig != self._last_trig_value
+
+		# A new pulse is either a classic rising edge (falsy -> truthy, for
+		# boolean pulse-style trigger sources), OR the value simply changed
+		# while already truthy (for an ever-incrementing counter-style
+		# trigger source, which never returns to a falsy value and so would
+		# never show a "rising edge" under the old bool()-only check -- this
+		# was the actual bug: once latched high by the first truthy value,
+		# every later truthy value, no matter how different, was treated as
+		# "still the same held-high signal" and silently ignored).
+		if is_truthy_now and (not was_truthy_before or value_changed):
 			self._trigger_pending = True
-			self._enable_latched_high = True
-			self._suppress_next_low_status = True
-		elif not enable_now:
-			self._enable_latched_high = False
+
+		# Record what we observed this call for the NEXT call's comparison,
+		# regardless of whether a pulse fired, whether inputs were missing,
+		# or whether anything downstream actually ran.
+		self._trig_was_truthy = is_truthy_now
+		self._last_trig_value = raw_trig
 
 		if not self._trigger_pending:
 			self._last_warn_key = None
-			if raw_enable is not None and not enable_now:
-				# Trigger sources emit a short high->low pulse. The low/reset edge
-				# is a transport detail and should not overwrite the last meaningful
-				# status (for example "ok" from the high edge compute).
-				self._suppress_next_low_status = False
-				return {
-					"_skip_downstream": True,
-					"_preserve_cache": True,
-				}
-			if raw_enable is None:
+			if raw_trig is None:
 				self._status_var.set("frozen: trig not connected/pulsed")
-			else:
-				self._status_var.set("frozen: trig high held (waiting for new pulse)")
-			self.set_status("frozen", "#666666")
+				self.set_status("frozen", "#666666")
+			elif not self._has_computed_once:
+				self._status_var.set("frozen: waiting for first trigger pulse")
+				self.set_status("frozen", "#666666")
+			# else: this is just an idle in-between call -- the falling
+			# half of a boolean pulse, or an unrelated recompute where the
+			# trig value hasn't actually changed. Leave the last "ok"/
+			# "error" status exactly as it was instead of overwriting it.
 			return {
 				"_skip_downstream": True,
 				"_preserve_cache": True,
 			}
 
+		missing_required = self._missing_required_inputs()
 		if missing_required:
 			missing_csv = ", ".join(missing_required)
 			self._warn_once(
@@ -462,13 +508,16 @@ class OpticalFlowNode(BaseNode):
 				"trigger pending: waiting for " + missing_csv
 			)
 			self.set_status("waiting inputs", "#cc6666")
+			# _trigger_pending intentionally stays True here so the queued
+			# pulse fires automatically as soon as the missing inputs
+			# arrive on a later call, without requiring the user to send
+			# another trigger pulse.
 			return {
 				"_skip_downstream": True,
 				"_preserve_cache": True,
 			}
 
 		self._trigger_pending = False
-		self._suppress_next_low_status = False
 		self._last_warn_key = None
 
 		try:
@@ -477,10 +526,12 @@ class OpticalFlowNode(BaseNode):
 			# Update status to show how many points were successfully tracked and a time(clock) tag.
 			self._status_var.set(f"ok: tracked {tracked}/{result['status'].size} (time: {self._time_tag()})")
 			self.set_status("ok", "#55aa55")
+			self._has_computed_once = True
 			return result
 		except Exception as e:
 			self._status_var.set(f"error: {e} (time: {self._time_tag()})")
 			self.set_status("error", "#cc0000")
+			self._has_computed_once = True
 			return {
 				"_skip_downstream": True,
 				"_preserve_cache": True,

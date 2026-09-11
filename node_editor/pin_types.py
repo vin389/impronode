@@ -16,10 +16,10 @@ class PinType(Enum):
 # Compatibility table: dst_type → set of accepted src_types
 PIN_COMPATIBILITY: dict[PinType, set[PinType]] = {
     PinType.SCALAR: {PinType.SCALAR},
-    PinType.ARRAY:  {PinType.ARRAY},
-    PinType.IMAGE:  {PinType.IMAGE, PinType.ARRAY},  # IMAGE is a special array
-    PinType.STRING: {PinType.STRING},
-    PinType.TRIGGER: {PinType.TRIGGER},
+    PinType.ARRAY:  {PinType.SCALAR, PinType.ARRAY, PinType.TRIGGER, PinType.ANY},
+    PinType.IMAGE:  {PinType.IMAGE, PinType.ARRAY, PinType.ANY},  # IMAGE is a special array
+    PinType.STRING: {PinType.STRING, PinType.ANY},
+    PinType.TRIGGER: {PinType.TRIGGER, PinType.ANY},
     PinType.ANY:    {PinType.SCALAR, PinType.ARRAY,
                      PinType.IMAGE,  PinType.STRING, PinType.TRIGGER, PinType.ANY},
 }

@@ -1,5 +1,6 @@
 import json
 import ast
+import re
 from pathlib import Path
 from typing import Any
 
@@ -61,29 +62,30 @@ def _compact_text(value: Any, limit: int = 120) -> str:
     return text[: max(0, limit - 3)] + "..."
 
 
-def _parse_params_object(raw_params: str) -> tuple[dict[str, Any] | None, str | None]:
+def _parse_params_object(raw_params: str) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """
     Parse params_json into a dict.
 
     Returns:
-      (dict, None) on success
-      (None, error_message) on failure
+      (dict, None, None) on a clean parse
+      (dict, None, warning) on a best-effort salvage that dropped a truncated field
+      (None, error_message, None) on failure
     """
     text = str(raw_params).strip()
     if not text:
-        return {}, None
+        return {}, None, None
 
     # 1) Canonical JSON object format.
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
-            return parsed, None
+            return parsed, None, None
         if isinstance(parsed, str):
             # Some legacy files may contain a JSON-encoded JSON string.
             nested = json.loads(parsed)
             if isinstance(nested, dict):
-                return nested, None
-        return None, f"params_json must be a JSON object/dict; got {type(parsed).__name__}"
+                return nested, None, None
+        return None, f"params_json must be a JSON object/dict; got {type(parsed).__name__}", None
     except Exception as e_json:
         json_error = str(e_json)
 
@@ -93,7 +95,7 @@ def _parse_params_object(raw_params: str) -> tuple[dict[str, Any] | None, str | 
         try:
             parsed = json.loads(inner)
             if isinstance(parsed, dict):
-                return parsed, None
+                return parsed, None, None
         except Exception:
             pass
 
@@ -108,15 +110,32 @@ def _parse_params_object(raw_params: str) -> tuple[dict[str, Any] | None, str | 
             try:
                 parsed = json.loads(trimmed)
                 if isinstance(parsed, dict):
-                    return parsed, None
+                    return parsed, None, None
             except Exception:
                 pass
+
+    # 2.6) Generic recovery for a trailing field truncated at Excel's
+    #      32,767-character cell limit (legacy projects that inlined large
+    #      array data directly in params_json before it moved to sidecar
+    #      files -- see ArrayViewerNode/ArrayAccumulatorNode). Cut the text
+    #      at the last complete top-level field boundary before the reported
+    #      error position, dropping only the corrupted trailing field so
+    #      every other setting on the node is still restored.
+    if text.startswith("{"):
+        salvaged = _salvage_truncated_params(text, json_error)
+        if salvaged is not None:
+            return salvaged, None, (
+                "params_json was truncated (likely Excel's 32,767-character "
+                "cell limit); the oversized trailing field was dropped, "
+                "other settings were restored. Re-saving the project will "
+                "store large array data in a separate file to prevent this."
+            )
 
     # 3) Legacy Python-literal dict representation.
     try:
         lit = ast.literal_eval(text)
         if isinstance(lit, dict):
-            return lit, None
+            return lit, None, None
     except Exception:
         pass
 
@@ -127,17 +146,44 @@ def _parse_params_object(raw_params: str) -> tuple[dict[str, Any] | None, str | 
         try:
             parsed = json.loads(escaped_text)
             if isinstance(parsed, dict):
-                return parsed, None
+                return parsed, None, None
         except Exception:
             pass
         try:
             lit = ast.literal_eval(escaped_text)
             if isinstance(lit, dict):
-                return lit, None
+                return lit, None, None
         except Exception:
             pass
 
-    return None, f"invalid params_json ({json_error})"
+    return None, f"invalid params_json ({json_error})", None
+
+
+def _salvage_truncated_params(text: str, json_error: str) -> dict[str, Any] | None:
+    """Best-effort recovery for params_json cut short mid-value.
+
+    Uses the character position json reported the parse failure at to find
+    the last complete top-level "key": "value" boundary before that point,
+    then closes the object there. Only safe because a top-level string
+    value's closing quote followed by a comma+space (", ) cannot legally
+    appear inside a JSON string/number without being escaped/quoted itself,
+    so this boundary is unambiguous for the oversized-numeric-array case
+    that triggers this (a params_json ending mid-array of floats).
+    """
+    match = re.search(r"char (\d+)", json_error)
+    if not match:
+        return None
+    error_pos = int(match.group(1))
+    prefix = text[:error_pos]
+    boundary = prefix.rfind('", ')
+    if boundary == -1:
+        return None
+    candidate = prefix[: boundary + 1] + "}"
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def save_project(
@@ -278,9 +324,15 @@ def load_project(file_path: str | Path) -> tuple[list[dict[str, Any]], list[dict
         params: dict[str, Any] = {}
         raw_params = row[col_idx["params_json"]]
         if isinstance(raw_params, str) and raw_params.strip():
-            parsed_params, parse_error = _parse_params_object(raw_params)
+            parsed_params, parse_error, salvage_warning = _parse_params_object(raw_params)
             if parsed_params is not None:
                 params.update(parsed_params)
+                if salvage_warning:
+                    issues.append(
+                        "Nodes row "
+                        f"{row_no} (node_id='{node_id_str}', node_type='{node_type}'): "
+                        f"{salvage_warning}"
+                    )
             else:
                 issues.append(
                     "Nodes row "

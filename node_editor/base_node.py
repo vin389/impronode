@@ -1,5 +1,6 @@
 # base_node.py
 
+import time
 import tkinter as tk
 from abc import ABC, abstractmethod
 from typing import Optional, Callable, Any
@@ -38,6 +39,26 @@ class BaseNode(ABC):
     MIN_HEIGHT:  int = 60
     BODY_COLOR:  str = "#e1e1e1"
     TITLE_COLOR: str = "#333333"
+    TITLE_EXTRA_HEIGHT: int = 20
+
+    NODE_COLOR_STYLES: dict[str, tuple[str, str]] = {
+        "red": ("#f7d7d7", "#6d1f1f"),
+        "orange": ("#f7e2bf", "#7a4f16"),
+        "yellow": ("#f7efb0", "#5e4e09"),
+        "green": ("#d9f1d8", "#214d2d"),
+        "blue": ("#dfeafc", "#234a7a"),
+        "indigo": ("#e4e1ff", "#2d2c66"),
+        "violet": ("#f0e0ff", "#553a72"),
+        "gray": ("#e7e7ea", "#303642"),
+        "dark_red": ("#8b2f2f", "#f8dfe0"),
+        "dark_orange": ("#9b5b2a", "#fff2db"),
+        "dark_yellow": ("#8f7a16", "#fff9d1"),
+        "dark_green": ("#2f6b3b", "#eaf9ee"),
+        "dark_blue": ("#1f4e8c", "#edf5ff"),
+        "dark_indigo": ("#3a3d7a", "#eef0ff"),
+        "dark_violet": ("#5c3e7e", "#f6edff"),
+        "darker_gray": ("#3a3d42", "#f2f5f8"),
+    }
 
     # ─────────────────────────────────────────────────────────────
     def __init__(self, node_id: str, canvas: tk.Canvas):
@@ -69,6 +90,9 @@ class BaseNode(ABC):
         # Optional non-modal inspector window (Phase 1 infrastructure).
         self._inspector_win: Optional[tk.Toplevel] = None
         self._inspector_body: Optional[tk.Frame] = None
+
+        self.node_style: str = "blue"
+        self._last_compute_time: Optional[float] = None
 
     # ══ 1. Abstract methods subclasses must implement ═════════════
 
@@ -109,20 +133,40 @@ class BaseNode(ABC):
             return node_name.strip()
         return self.DISPLAY_NAME
 
+    def get_canvas_title(self) -> str:
+        node_name = getattr(self, "node_name", "")
+        if isinstance(node_name, str) and node_name.strip():
+            return f"{self.DISPLAY_NAME}\n{node_name.strip()}"
+        return self.DISPLAY_NAME
+
+    def get_title_reserve_height(self) -> int:
+        """Extra headroom reserved for the two-line node title.
+
+        This keeps the title above pin labels and other body content even when a
+        node is resized smaller than its default dimensions.
+        """
+        return max(0, int(getattr(self, "TITLE_EXTRA_HEIGHT", 20)))
+
+    def get_min_resizable_height(self) -> int:
+        """Minimum height that still leaves room for the node header region."""
+        return max(self.MIN_HEIGHT, self.MIN_HEIGHT + self.get_title_reserve_height())
+
     def get_default_height(self) -> int:
-        """Return a pin-aware default height so nodes start tall enough for their pin layout."""
+        """Return a pin-aware default height so nodes start tall enough for their pin layout.
+
+        The node title may render as two lines when both the node type and custom
+        node name are shown, so reserve a little extra room at the top.
+        """
         base_height = int(getattr(self, "NODE_HEIGHT", self.MIN_HEIGHT))
+        title_extra = self.get_title_reserve_height()
         try:
             schema = self.get_pin_schema()
         except Exception:
-            return max(self.MIN_HEIGHT, base_height)
+            return max(self.MIN_HEIGHT, base_height + title_extra)
 
         pin_count = max(len(schema.inputs), len(schema.outputs), 0)
-        if pin_count <= 4:
-            return max(self.MIN_HEIGHT, base_height)
-
         extra = max(0, pin_count - 4) * 20
-        return max(self.MIN_HEIGHT, base_height + extra)
+        return max(self.MIN_HEIGHT, base_height + title_extra + extra)
 
     def get_help_text(self) -> str:
         """Return Ctrl-H help, with a useful fallback for every node type."""
@@ -188,11 +232,7 @@ class BaseNode(ABC):
         win = tk.Toplevel(top)
         win.title(f"{self.get_inspector_title()} - Inspector")
         win.resizable(True, True)
-        try:
-            # Keep inspector above the main editor window without forcing global topmost.
-            win.transient(top)
-        except Exception:
-            pass
+        win.minsize(240, 120)
 
         try:
             px, py = self.canvas.winfo_pointerxy()
@@ -271,6 +311,59 @@ class BaseNode(ABC):
 
     # ══ 4. UI status display (subclasses may override) ════════════
 
+    @staticmethod
+    def _contrast_text_color(bg_hex: str) -> str:
+        try:
+            bg_hex = bg_hex.strip().lstrip("#")
+            if len(bg_hex) != 6:
+                return "#1d2430"
+            r = int(bg_hex[0:2], 16) / 255
+            g = int(bg_hex[2:4], 16) / 255
+            b = int(bg_hex[4:6], 16) / 255
+            luminance = (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+            return "#f4f7fb" if luminance < 0.5 else "#1d2430"
+        except Exception:
+            return "#1d2430"
+
+    @staticmethod
+    def format_time_ago(timestamp: Optional[float]) -> str:
+        if timestamp is None:
+            return "never"
+        elapsed = max(0.0, time.time() - timestamp)
+        if elapsed < 1.0:
+            return "now"
+        if elapsed < 60:
+            return f"{elapsed:.0f}s ago"
+        if elapsed < 3600:
+            return f"{elapsed / 60:.0f}m ago"
+        if elapsed < 86400:
+            return f"{elapsed / 3600:.0f}h ago"
+        return f"{elapsed / 86400:.0f}d ago"
+
+    def set_style(self, style_name: str) -> None:
+        style_name = style_name.lower()
+        palette = self.NODE_COLOR_STYLES.get(style_name)
+        if palette is None:
+            style_name = "blue"
+            palette = self.NODE_COLOR_STYLES[style_name]
+
+        self.node_style = style_name
+        self.BODY_COLOR, title_color = palette
+        self.TITLE_COLOR = title_color if title_color is not None else self._contrast_text_color(self.BODY_COLOR)
+        if getattr(self, "_body_rect", None) is not None:
+            try:
+                self.canvas.itemconfig(self._body_rect, fill=self.BODY_COLOR)
+            except Exception:
+                pass
+        if getattr(self, "_title_item", None) is not None:
+            try:
+                self.canvas.itemconfig(self._title_item, fill=self.TITLE_COLOR)
+            except Exception:
+                pass
+
+    def record_compute_time(self) -> None:
+        self._last_compute_time = time.time()
+
     def set_status(self, status: str, color: str = "#666666") -> None:
         """
         Display status text in the node body (for example "running" or "error: ...").
@@ -318,7 +411,7 @@ class BaseNode(ABC):
 
     def set_size(self, width: int, height: int) -> None:
         self.width = max(self.MIN_WIDTH, int(width))
-        self.height = max(self.MIN_HEIGHT, int(height))
+        self.height = max(self.get_min_resizable_height(), int(height))
 
     def on_resize(self, old_width: int, old_height: int,
                   new_width: int, new_height: int) -> None:

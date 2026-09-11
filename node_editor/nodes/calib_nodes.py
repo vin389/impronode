@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
 import os
+import re
 from pathlib import Path
 
 import cv2
@@ -42,6 +43,64 @@ def _array_to_text(arr: np.ndarray, fmt: str = "%.6g") -> str:
     for row in flat:
         rows.append("  ".join(fmt % v for v in row))
     return "\n".join(rows)
+
+
+def _parse_sequence_text(text: str) -> np.ndarray | None:
+    """Parse numeric sequences with whitespace/comma separators or MATLAB-style colon notation."""
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw or raw.lower() in {"none", "null"}:
+        return None
+
+    # Treat the ghost-text placeholder as empty so it cannot be mistaken for real input.
+    if raw.startswith("e.g.,"):
+        return None
+
+    tokens = [p for p in re.split(r"[\s,]+", raw) if p.strip()]
+    if not tokens:
+        return None
+
+    values: list[float] = []
+    for token in tokens:
+        if ":" not in token:
+            try:
+                values.append(float(token))
+            except ValueError:
+                return None
+            continue
+
+        colon_parts = [part.strip() for part in token.split(":") if part.strip()]
+        if not colon_parts:
+            continue
+        if len(colon_parts) == 1:
+            try:
+                values.append(float(colon_parts[0]))
+            except ValueError:
+                return None
+            continue
+
+        try:
+            start = float(colon_parts[0])
+            stop = float(colon_parts[-1])
+            if len(colon_parts) == 2:
+                step = 1.0 if stop >= start else -1.0
+            else:
+                step = float(colon_parts[1])
+                if step == 0:
+                    return None
+        except ValueError:
+            return None
+
+        if step > 0:
+            arr = np.arange(start, stop + step, step, dtype=np.float64)
+        else:
+            arr = np.arange(start, stop + step, step, dtype=np.float64)
+        values.extend(float(v) for v in arr)
+
+    if not values:
+        return None
+    return np.asarray(values, dtype=np.float64)
 
 
 _DISTORTION_COEFFICIENT_NAMES = (
@@ -107,6 +166,26 @@ def _undistort_points_to_pixels(
     ).reshape(-1, 2)
 
 
+def _undistorted_output_size(
+    image_size: tuple[int, int],
+    scale: float = 1.0,
+) -> tuple[int, int]:
+    """Return the new image size for an undistorted view based on a scale factor."""
+    width, height = image_size
+    scale = max(1e-6, float(scale))
+    return (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+
+
+def _clamp_undistort_scale(scale: float | None) -> float:
+    if scale is None:
+        return 1.0
+    value = float(scale)
+    return max(1e-6, value)
+
+
 def _draw_calib_result(
     bg_img: np.ndarray,
     image_points: np.ndarray | None,
@@ -120,17 +199,31 @@ def _draw_calib_result(
     grid_zs: np.ndarray | None,
     undistort: bool = False,
     new_cmat: np.ndarray | None = None,
+    image_size_scale: float = 1.0,
+    alpha: float | None = None,
 ) -> np.ndarray:
-    """Draw image points, projected points, and 3D grid onto bg_img."""
+    """Draw image points, projected points, and 3D grid onto bg_img.
+
+    The newer UI uses image_size_scale; the alpha parameter is retained only for
+    backward compatibility with older callers/tests.
+    """
     img = bg_img.copy()
+    image_size_scale = _clamp_undistort_scale(image_size_scale)
 
     if undistort and cmat is not None and dvec is not None:
         h, w = img.shape[:2]
+        if new_cmat is not None and alpha is None and image_size_scale == 1.0:
+            output_size = (w, h)
+        elif new_cmat is not None and alpha is not None:
+            output_size = (w, h)
+        else:
+            output_size = _undistorted_output_size((w, h), scale=image_size_scale)
         if new_cmat is None:
             new_cmat, _ = cv2.getOptimalNewCameraMatrix(
-                cmat, dvec, (w, h), 1, (w, h)
-            )
-        img = cv2.undistort(img, cmat, dvec, None, new_cmat)
+                cmat, dvec, (w, h), alpha=0.0, newImgSize=output_size)
+        map1, map2 = cv2.initUndistortRectifyMap(
+            cmat, dvec, None, new_cmat, output_size, cv2.CV_16SC2)
+        img = cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
         image_points = _undistort_points_to_pixels(image_points, cmat, dvec, new_cmat)
         proj_points = _undistort_points_to_pixels(proj_points, cmat, dvec, new_cmat)
 
@@ -176,17 +269,12 @@ def _draw_calib_result(
                         pts3, rvec, tvec, cmat, dvec)
                     proj = proj.reshape(-1, 2)
                     if undistort and cmat is not None and dvec is not None:
-                        h, w = img.shape[:2]
-                        if new_cmat is None:
-                            new_cmat, _ = cv2.getOptimalNewCameraMatrix(
-                                cmat, dvec, (w, h), 1, (w, h)
-                            )
                         proj = _undistort_points_to_pixels(proj, cmat, dvec, new_cmat)
                     proj = proj.astype(int)
                     for k in range(len(proj) - 1):
                         cv2.line(img, tuple(proj[k]),
                                  tuple(proj[k + 1]),
-                                 (0, 255, 255), th)
+                                 (255, 255, 0), th)
             # draw grid lines along y
             for x_val in xs:
                 for z_val in zs:
@@ -199,17 +287,31 @@ def _draw_calib_result(
                         pts3, rvec, tvec, cmat, dvec)
                     proj = proj.reshape(-1, 2)
                     if undistort and cmat is not None and dvec is not None:
-                        h, w = img.shape[:2]
-                        if new_cmat is None:
-                            new_cmat, _ = cv2.getOptimalNewCameraMatrix(
-                                cmat, dvec, (w, h), 1, (w, h)
-                            )
                         proj = _undistort_points_to_pixels(proj, cmat, dvec, new_cmat)
                     proj = proj.astype(int)
                     for k in range(len(proj) - 1):
                         cv2.line(img, tuple(proj[k]),
                                  tuple(proj[k + 1]),
-                                 (0, 255, 255), th)
+                                 (255, 255, 0), th)
+
+            # draw grid lines along z
+            for x_val in xs:
+                for y_val in ys:
+                    pts3 = np.array([[x_val, y_val, z]
+                                     for z in zs],
+                                    dtype=np.float32)
+                    if len(pts3) < 2:
+                        continue
+                    proj, _ = cv2.projectPoints(
+                        pts3, rvec, tvec, cmat, dvec)
+                    proj = proj.reshape(-1, 2)
+                    if undistort and cmat is not None and dvec is not None:
+                        proj = _undistort_points_to_pixels(proj, cmat, dvec, new_cmat)
+                    proj = proj.astype(int)
+                    for k in range(len(proj) - 1):
+                        cv2.line(img, tuple(proj[k]),
+                                 tuple(proj[k + 1]),
+                                 (255, 255, 0), th)
         except Exception as e:
             pass
 
@@ -362,7 +464,9 @@ class CameraCalibNode(BaseNode):
         self._grid_xs_text = ""
         self._grid_ys_text = ""
         self._grid_zs_text = "0"
+        self._grid_placeholder = "e.g., -30 -20 -10 0 10 20 30 or -30:10:30"
         self._undistort_var = tk.BooleanVar(value=False)
+        self._undistort_scale_var = tk.DoubleVar(value=1.0)
 
         # which image to visualize / output rvec+tvec (1-based)
         self._vis_idx_var = tk.IntVar(value=1)
@@ -381,6 +485,7 @@ class CameraCalibNode(BaseNode):
         # fire counter for done trigger
         self._done_counter = 0
         self._last_trigger = None
+        self._trigger_latched_high = False
 
         # status
         self._status_var = tk.StringVar(value="not calibrated")
@@ -389,15 +494,24 @@ class CameraCalibNode(BaseNode):
         self._calib_running = False
 
         # inspector widget references
-        self._nb:               ttk.Notebook | None = None
-        self._file_listbox:     tk.Listbox   | None = None
-        self._pts3d_text_widget: tk.Text | None = None
-        self._pts2d_text_widget: tk.Text | None = None
-        self._cmat_guess_widget: tk.Text | None = None
-        self._dvec_guess_widget: tk.Text | None = None
-        self._result_text:       tk.Text | None = None
-        self._flag_sum_var       = tk.StringVar(value="flags: 0")
-        self._vis_idx_sb:        tk.Spinbox | None = None
+        self._nb:                 ttk.Notebook | None = None
+        self._file_listbox:       tk.Listbox   | None = None
+        self._pts3d_text_widget:  tk.Text | None = None
+        self._pts2d_text_widget:  tk.Text | None = None
+        self._cmat_guess_widget:  tk.Text | None = None
+        self._dvec_guess_widget:  tk.Text | None = None
+        self._result_text:        tk.Text | None = None
+        self._result_rvec_widget: tk.Entry | None = None
+        self._result_tvec_widget: tk.Entry | None = None
+        self._result_cmat_widget: tk.Text | None = None
+        self._result_dvec_widget: tk.Text | None = None
+        self._result_update_btn:  tk.Button | None = None
+        self._flag_sum_var        = tk.StringVar(value="flags: 0")
+        self._vis_idx_sb:         tk.Spinbox | None = None
+        # Only ever created inside build_inspector(); must exist here too so a
+        # trigger-pin-driven calibration works even if the inspector was never
+        # opened (_run_calibration_bg reads this before checking winfo_exists()).
+        self._calib_btn:          tk.Button | None = None
 
     # ── build_body ────────────────────────────────────────────────
 
@@ -434,6 +548,17 @@ class CameraCalibNode(BaseNode):
 
     # ── build_inspector ───────────────────────────────────────────
 
+    def open_inspector(self) -> None:
+        super().open_inspector()
+        if self._inspector_win is None or not self._inspector_win.winfo_exists():
+            return
+
+        self._inspector_win.update_idletasks()
+        req_w = max(640, self._inspector_win.winfo_reqwidth())
+        req_h = max(480, self._inspector_win.winfo_reqheight())
+        self._inspector_win.geometry(f"{req_w * 2}x{req_h * 2}")
+        self._inspector_win.update_idletasks()
+
     def build_inspector(self, parent: tk.Frame) -> None:
         self._init_state()
 
@@ -441,20 +566,21 @@ class CameraCalibNode(BaseNode):
         self._nb.pack(fill="both", expand=True)
 
         tab_input = tk.Frame(self._nb)
-        tab_flags = tk.Frame(self._nb)
         self._nb.add(tab_input, text="Input & Calibrate")
-        self._nb.add(tab_flags, text="Flags")
 
         self._build_tab_input(tab_input)
-        self._build_tab_flags(tab_flags)
 
     def _build_tab_input(self, parent: tk.Frame) -> None:
         # scrollable container
         canvas = tk.Canvas(parent, highlightthickness=0)
         vsb = ttk.Scrollbar(parent, orient="vertical",
                              command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
+        hsb = ttk.Scrollbar(parent, orient="horizontal",
+                            command=canvas.xview)
+        canvas.configure(yscrollcommand=vsb.set,
+                         xscrollcommand=hsb.set)
         vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
         canvas.pack(side="left", fill="both", expand=True)
 
         inner = tk.Frame(canvas)
@@ -465,49 +591,80 @@ class CameraCalibNode(BaseNode):
                        scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfigure(
-                        win_id, width=e.width))
+                        win_id, width=max(e.width, inner.winfo_reqwidth())))
 
         self._build_input_content(inner)
 
     def _build_input_content(self, parent: tk.Frame) -> None:
         pad = {"padx": 6, "pady": 3}
 
-        # ── mode selector ─────────────────────────────────────────
-        mode_frame = tk.LabelFrame(
-            parent, text="Calibration mode",
-            font=("Arial", 9), **pad)
-        mode_frame.pack(fill="x", **pad)
+        layout = tk.Frame(parent)
+        layout.pack(fill="both", expand=True)
 
-        tk.Radiobutton(
-            mode_frame, text="Chessboard (multiple images)",
-            variable=self._mode_var, value="chessboard",
-            font=("Arial", 9),
-            command=self._on_mode_change).pack(anchor="w")
-        tk.Radiobutton(
-            mode_frame, text="Single-image (manual points)",
-            variable=self._mode_var, value="single",
-            font=("Arial", 9),
-            command=self._on_mode_change).pack(anchor="w")
+        left_w = 360
+        middle_w = 360
+        right_w = 360
 
-        # ── chessboard section ────────────────────────────────────
-        self._cb_section = tk.LabelFrame(
-            parent, text="Chessboard settings",
-            font=("Arial", 9), **pad)
-        self._cb_section.pack(fill="x", **pad)
+        layout.grid_columnconfigure(0, minsize=left_w, weight=0)
+        layout.grid_columnconfigure(2, minsize=middle_w, weight=0)
+        layout.grid_columnconfigure(4, minsize=right_w, weight=0)
 
-        self._build_chessboard_section(self._cb_section)
+        left = tk.Frame(layout, width=left_w, bg="#f8f8ff")
+        middle = tk.Frame(layout, width=middle_w, bg="#f3f7ff")
+        right = tk.Frame(layout, width=right_w, bg="#f9f9f9")
 
-        # ── single-image section ──────────────────────────────────
-        self._single_section = tk.LabelFrame(
-            parent, text="Manual point coordinates",
-            font=("Arial", 9), **pad)
-        self._single_section.pack(fill="x", **pad)
+        sep1 = tk.Frame(layout, width=8, cursor="sb_h_double_arrow", bg="#c8c8d0")
+        sep2 = tk.Frame(layout, width=8, cursor="sb_h_double_arrow", bg="#c8c8d0")
 
-        self._build_single_section(self._single_section)
+        def _bind_drag_separator(sep, left_panel, right_panel, axis):
+            drag_state = {"active": False, "start_x": 0, "left_start": 0, "right_start": 0}
+
+            def _on_press(event):
+                drag_state["active"] = True
+                drag_state["start_x"] = event.x_root
+                drag_state["left_start"] = left_panel.winfo_width()
+                drag_state["right_start"] = right_panel.winfo_width()
+
+            def _on_release(event):
+                drag_state["active"] = False
+
+            def _on_drag(event):
+                if not drag_state["active"]:
+                    return
+                delta = event.x_root - drag_state["start_x"]
+                if axis == "left_middle":
+                    new_left = max(220, drag_state["left_start"] + delta)
+                    new_mid = max(220, drag_state["right_start"] - delta)
+                    left_panel.configure(width=new_left)
+                    right_panel.configure(width=new_mid)
+                    layout.grid_columnconfigure(0, minsize=new_left)
+                    layout.grid_columnconfigure(2, minsize=new_mid)
+                else:
+                    new_mid = max(220, drag_state["left_start"] + delta)
+                    new_right = max(220, drag_state["right_start"] - delta)
+                    middle_panel = left_panel
+                    right_panel.configure(width=new_right)
+                    middle_panel.configure(width=new_mid)
+                    layout.grid_columnconfigure(2, minsize=new_mid)
+                    layout.grid_columnconfigure(4, minsize=new_right)
+                    layout.update_idletasks()
+
+            sep.bind("<ButtonPress-1>", _on_press)
+            sep.bind("<B1-Motion>", _on_drag)
+            sep.bind("<ButtonRelease-1>", _on_release)
+
+        _bind_drag_separator(sep1, left, middle, "left_middle")
+        _bind_drag_separator(sep2, middle, right, "middle_right")
+
+        left.grid(row=0, column=0, sticky="nsew")
+        sep1.grid(row=0, column=1, sticky="ns")
+        middle.grid(row=0, column=2, sticky="nsew")
+        sep2.grid(row=0, column=3, sticky="ns")
+        right.grid(row=0, column=4, sticky="nsew")
 
         # ── image size ────────────────────────────────────────────
         sz_frame = tk.LabelFrame(
-            parent, text="Image size (width x height)",
+            left, text="Image size (width x height)",
             font=("Arial", 9), **pad)
         sz_frame.pack(fill="x", **pad)
 
@@ -524,9 +681,42 @@ class CameraCalibNode(BaseNode):
                    textvariable=self._img_h_var,
                    width=7, font=("Arial", 9)).pack(side="left")
 
+        # ── mode selector ─────────────────────────────────────────
+        mode_frame = tk.LabelFrame(
+            left, text="Calibration mode",
+            font=("Arial", 9), **pad)
+        mode_frame.pack(fill="x", **pad)
+
+        tk.Radiobutton(
+            mode_frame, text="Chessboard (multiple images)",
+            variable=self._mode_var, value="chessboard",
+            font=("Arial", 9),
+            command=self._on_mode_change).pack(anchor="w")
+        tk.Radiobutton(
+            mode_frame, text="Single-image (manual points)",
+            variable=self._mode_var, value="single",
+            font=("Arial", 9),
+            command=self._on_mode_change).pack(anchor="w")
+
+        # ── chessboard section ────────────────────────────────────
+        self._cb_section = tk.LabelFrame(
+            left, text="Chessboard settings",
+            font=("Arial", 9), **pad)
+        self._cb_section.pack(fill="x", **pad)
+
+        self._build_chessboard_section(self._cb_section)
+
+        # ── single-image section ──────────────────────────────────
+        self._single_section = tk.LabelFrame(
+            left, text="Manual point coordinates",
+            font=("Arial", 9), **pad)
+        self._single_section.pack(fill="x", **pad)
+
+        self._build_single_section(self._single_section)
+
         # ── initial guess ─────────────────────────────────────────
         guess_frame = tk.LabelFrame(
-            parent, text="Initial guess",
+            left, text="Initial guess",
             font=("Arial", 9), **pad)
         guess_frame.pack(fill="x", **pad)
 
@@ -541,8 +731,8 @@ class CameraCalibNode(BaseNode):
             "1.0", self._cmat_guess_text)
 
         tk.Label(guess_frame,
-                 text=("Distortion coefficients (OpenCV order: k1 k2 p1 p2 k3 "
-                       "k4 k5 k6 s1 s2 s3 s4 tau_x tau_y):"),
+                 text=("Distortion coeff. (k1 k2 p1 p2)(k3 "
+                       "k4 k5 k6 s1 s2 s3 s4 taux tauy):"),
                  font=("Arial", 8)).pack(anchor="w")
         self._dvec_guess_widget = tk.Text(
             guess_frame, width=40, height=2,
@@ -553,7 +743,7 @@ class CameraCalibNode(BaseNode):
 
         # ── subpixel refinement ───────────────────────────────────
         subpix_frame = tk.LabelFrame(
-            parent, text="Subpixel refinement (cornerSubPix)",
+            left, text="Subpixel refinement (cornerSubPix)",
             font=("Arial", 9), **pad)
         subpix_frame.pack(fill="x", **pad)
 
@@ -591,12 +781,12 @@ class CameraCalibNode(BaseNode):
                  width=8, font=("Arial", 8)).pack(side="left")
 
         # ── flags summary ─────────────────────────────────────────
-        tk.Label(parent, textvariable=self._flag_sum_var,
+        tk.Label(left, textvariable=self._flag_sum_var,
                  font=("Arial", 8), fg="#446688",
                  anchor="w").pack(fill="x", **pad)
 
         # ── calibrate button ──────────────────────────────────────
-        calib_row = tk.Frame(parent)
+        calib_row = tk.Frame(left)
         calib_row.pack(fill="x", **pad)
 
         self._calib_btn = tk.Button(
@@ -615,26 +805,51 @@ class CameraCalibNode(BaseNode):
                  anchor="w", justify="left").pack(
             side="left", padx=8)
 
+        # ── flags panel ───────────────────────────────────────────
+        flags_frame = tk.LabelFrame(
+            middle, text="Flags",
+            font=("Arial", 9), **pad)
+        flags_frame.pack(fill="both", expand=True, **pad)
+        self._build_tab_flags(flags_frame)
+
         # ── results summary ───────────────────────────────────────
         res_frame = tk.LabelFrame(
-            parent, text="Calibration results",
+            right, text="Calibration results",
             font=("Arial", 9), **pad)
-        res_frame.pack(fill="x", **pad)
+        res_frame.pack(fill="both", expand=True, **pad)
 
-        self._result_text = tk.Text(
-            res_frame, width=50, height=10,
-            font=("Courier", 8), state="disabled",
-            bg="#f8f8f8")
-        rsb = ttk.Scrollbar(res_frame, orient="vertical",
-                             command=self._result_text.yview)
-        self._result_text.configure(
-            yscrollcommand=rsb.set)
-        rsb.pack(side="right", fill="y")
-        self._result_text.pack(fill="x")
+        self._result_rvec_widget = tk.Entry(
+            res_frame, width=32, font=("Courier", 9))
+        self._result_rvec_widget.pack(fill="x", pady=(4, 2))
+        tk.Label(res_frame, text="rvec (3):", font=("Arial", 8)).pack(anchor="w")
+
+        self._result_tvec_widget = tk.Entry(
+            res_frame, width=32, font=("Courier", 9))
+        self._result_tvec_widget.pack(fill="x", pady=(4, 2))
+        tk.Label(res_frame, text="tvec (3):", font=("Arial", 8)).pack(anchor="w")
+
+        self._result_cmat_widget = tk.Text(
+            res_frame, width=46, height=5, font=("Courier", 8), wrap="none")
+        self._result_cmat_widget.pack(fill="both", expand=True, pady=(4, 2))
+        tk.Label(res_frame, text="camera matrix (3x3):", font=("Arial", 8)).pack(anchor="w")
+
+        self._result_dvec_widget = tk.Text(
+            res_frame, width=46, height=6, font=("Courier", 8), wrap="none")
+        self._result_dvec_widget.pack(fill="both", expand=True, pady=(4, 2))
+        tk.Label(res_frame, text="distortion coeffs (4..14):", font=("Arial", 8)).pack(anchor="w")
+
+        btn_row = tk.Frame(res_frame)
+        btn_row.pack(fill="x", pady=(6, 0))
+        self._result_update_btn = tk.Button(
+            btn_row,
+            text="Update",
+            font=("Arial", 9, "bold"),
+            command=self._on_update_calibration_results)
+        self._result_update_btn.pack(side="left")
 
         # ── visualization ─────────────────────────────────────────
         vis_frame = tk.LabelFrame(
-            parent, text="Visualization",
+            right, text="Visualization",
             font=("Arial", 9), **pad)
         vis_frame.pack(fill="x", **pad)
 
@@ -658,6 +873,18 @@ class CameraCalibNode(BaseNode):
             font=("Arial", 9),
             command=self._on_vis_update).pack(anchor="w")
 
+        scale_row = tk.Frame(vis_frame)
+        scale_row.pack(fill="x", pady=2)
+        tk.Label(scale_row, text="Image size scale:", font=("Arial", 9)).pack(side="left")
+        tk.Entry(
+            scale_row,
+            textvariable=self._undistort_scale_var,
+            width=8,
+            font=("Arial", 9)).pack(side="left", padx=4)
+        tk.Label(scale_row,
+                 text="(1.0 = original size, 2.0 = 2x larger)",
+                 font=("Arial", 8), fg="#666666").pack(side="left")
+
         grid_frame = tk.Frame(vis_frame)
         grid_frame.pack(fill="x")
 
@@ -666,11 +893,29 @@ class CameraCalibNode(BaseNode):
             r.pack(fill="x", pady=1)
             tk.Label(r, text=label, font=("Arial", 8),
                      width=8, anchor="w").pack(side="left")
-            var = tk.StringVar(
-                value=getattr(self, attr))
+            var = tk.StringVar(value=getattr(self, attr))
             ent = tk.Entry(r, textvariable=var,
-                           font=("Courier", 8), width=36)
+                           font=("Courier", 8), width=36,
+                           fg="#0f0f0f")
             ent.pack(side="left", fill="x", expand=True)
+
+            def _show_placeholder(event=None, entry=ent, value=var):
+                if not value.get().strip():
+                    entry.configure(fg="#7a7a7a")
+                    entry.delete(0, tk.END)
+                    entry.insert(0, self._grid_placeholder)
+
+            def _clear_placeholder(event=None, entry=ent, value=var):
+                current = value.get().strip()
+                if current == self._grid_placeholder:
+                    entry.delete(0, tk.END)
+                    value.set("")
+                    entry.configure(fg="#1d1d1d")
+
+            if not getattr(self, attr, "").strip():
+                ent.insert(0, self._grid_placeholder)
+            ent.bind("<FocusIn>", _clear_placeholder)
+            ent.bind("<FocusOut>", _show_placeholder)
             return var, ent
 
         self._grid_xs_var, _ = _grid_row(
@@ -918,6 +1163,166 @@ class CameraCalibNode(BaseNode):
         arr = _parse_matrix_text(text, 1)
         return None if arr is None else _as_full_distortion_vector(arr)
 
+    def _result_widget_is_valid(self, widget: tk.Entry | tk.Text | None) -> bool:
+        if widget is None:
+            return False
+        color = widget.cget("fg")
+        return color != "red" and color != "#b31d1d"
+
+    def _set_result_widget_validity(self, widget: tk.Entry | tk.Text | None, valid: bool) -> None:
+        if widget is None:
+            return
+        widget.configure(fg="#1d1d1d" if valid else "red")
+        if hasattr(widget, "configure"):
+            widget.configure(bg="#ffffff" if valid else "#fff0f0")
+
+    def _format_result_vector_text(self, arr: np.ndarray | None, count: int | None = None) -> str:
+        if arr is None:
+            return ""
+        v = np.asarray(arr, dtype=np.float64).reshape(-1)
+        if count is not None and v.size != count:
+            v = v[:count]
+            if v.size < count:
+                v = np.pad(v, (0, count - v.size), constant_values=0.0)
+        return "  ".join(f"{float(x):.15g}" for x in v)
+
+    def _format_result_matrix_text(self, arr: np.ndarray | None) -> str:
+        if arr is None:
+            return ""
+        m = np.asarray(arr, dtype=np.float64)
+        if m.shape == (9,):
+            m = m.reshape(3, 3)
+        elif m.size == 9:
+            m = m.reshape(3, 3)
+        return _array_to_text(m, fmt="%.15g")
+
+    def _format_result_dvec_text(self, arr: np.ndarray | None) -> str:
+        if arr is None:
+            return ""
+        values = np.asarray(arr, dtype=np.float64).reshape(-1)
+        if values.size < 4:
+            values = np.pad(values, (0, 4 - values.size), constant_values=0.0)
+        if values.size > 14:
+            values = values[:14]
+        values = np.pad(values, (0, 14 - values.size), constant_values=0.0)
+        return "  ".join(f"{float(v):.15g}" for v in values)
+
+    def _parse_result_rvec_text(self, text: str) -> np.ndarray | None:
+        arr = _parse_matrix_text(text, 1)
+        if arr is None or arr.size != 3:
+            return None
+        return arr.reshape(-1).astype(np.float64)
+
+    def _parse_result_tvec_text(self, text: str) -> np.ndarray | None:
+        arr = _parse_matrix_text(text, 1)
+        if arr is None or arr.size != 3:
+            return None
+        return arr.reshape(-1).astype(np.float64)
+
+    def _parse_result_cmat_text(self, text: str) -> np.ndarray | None:
+        arr = _parse_matrix_text(text, 3)
+        if arr is None or arr.size != 9:
+            return None
+        return arr.astype(np.float64)
+
+    def _parse_result_dvec_text(self, text: str) -> np.ndarray | None:
+        nums = [float(t) for t in text.replace(",", " ").replace("\t", " ").split() if t.strip()]
+        if not nums or len(nums) < 4 or len(nums) > 14:
+            return None
+        vals = np.asarray(nums, dtype=np.float64).reshape(-1)
+        vals = np.pad(vals, (0, 14 - vals.size), constant_values=0.0)
+        return vals[:14]
+
+    def _populate_result_edit_widgets(self) -> None:
+        if self._result_rvec_widget is None or self._result_tvec_widget is None:
+            return
+        vis_idx = max(0, min(self._vis_idx_var.get() - 1, len(self._result_rvecs or []) - 1)) if self._result_rvecs else 0
+        if self._result_rvecs and vis_idx < len(self._result_rvecs):
+            self._result_rvec_widget.delete(0, tk.END)
+            self._result_rvec_widget.insert(0, self._format_result_vector_text(self._result_rvecs[vis_idx], 3))
+            self._set_result_widget_validity(self._result_rvec_widget, True)
+        else:
+            self._result_rvec_widget.delete(0, tk.END)
+            self._result_rvec_widget.insert(0, "")
+            self._set_result_widget_validity(self._result_rvec_widget, False)
+
+        if self._result_tvecs and vis_idx < len(self._result_tvecs):
+            self._result_tvec_widget.delete(0, tk.END)
+            self._result_tvec_widget.insert(0, self._format_result_vector_text(self._result_tvecs[vis_idx], 3))
+            self._set_result_widget_validity(self._result_tvec_widget, True)
+        else:
+            self._result_tvec_widget.delete(0, tk.END)
+            self._result_tvec_widget.insert(0, "")
+            self._set_result_widget_validity(self._result_tvec_widget, False)
+
+        if self._result_cmat is not None:
+            if self._result_cmat_widget is not None:
+                self._result_cmat_widget.delete("1.0", tk.END)
+                self._result_cmat_widget.insert("1.0", self._format_result_matrix_text(self._result_cmat))
+                self._set_result_widget_validity(self._result_cmat_widget, True)
+        elif self._result_cmat_widget is not None:
+            self._result_cmat_widget.delete("1.0", tk.END)
+            self._result_cmat_widget.insert("1.0", "")
+            self._set_result_widget_validity(self._result_cmat_widget, False)
+
+        if self._result_dvec is not None:
+            if self._result_dvec_widget is not None:
+                self._result_dvec_widget.delete("1.0", tk.END)
+                self._result_dvec_widget.insert("1.0", self._format_result_dvec_text(self._result_dvec))
+                self._set_result_widget_validity(self._result_dvec_widget, True)
+        elif self._result_dvec_widget is not None:
+            self._result_dvec_widget.delete("1.0", tk.END)
+            self._result_dvec_widget.insert("1.0", "")
+            self._set_result_widget_validity(self._result_dvec_widget, False)
+
+    def _on_update_calibration_results(self) -> None:
+        if self._result_rvec_widget is None or self._result_tvec_widget is None:
+            return
+        if self._result_cmat_widget is None or self._result_dvec_widget is None:
+            return
+        if not self._result_rvecs or not self._result_tvecs:
+            return
+        vis_idx = max(0, min(self._vis_idx_var.get() - 1, len(self._result_rvecs) - 1))
+
+        rvec_txt = self._result_rvec_widget.get()
+        tvec_txt = self._result_tvec_widget.get()
+        cmat_txt = self._result_cmat_widget.get("1.0", tk.END)
+        dvec_txt = self._result_dvec_widget.get("1.0", tk.END)
+
+        new_rvec = self._parse_result_rvec_text(rvec_txt)
+        new_tvec = self._parse_result_tvec_text(tvec_txt)
+        new_cmat = self._parse_result_cmat_text(cmat_txt)
+        new_dvec = self._parse_result_dvec_text(dvec_txt)
+
+        valid = all(v is not None for v in (new_rvec, new_tvec, new_cmat, new_dvec))
+        self._set_result_widget_validity(self._result_rvec_widget, new_rvec is not None)
+        self._set_result_widget_validity(self._result_tvec_widget, new_tvec is not None)
+        self._set_result_widget_validity(self._result_cmat_widget, new_cmat is not None)
+        self._set_result_widget_validity(self._result_dvec_widget, new_dvec is not None)
+
+        if not valid:
+            return
+
+        self._result_rvecs[vis_idx] = new_rvec.reshape(3, 1)
+        self._result_tvecs[vis_idx] = new_tvec.reshape(3, 1)
+        self._result_cmat = new_cmat.reshape(3, 3)
+        self._result_dvec = _as_full_distortion_vector(new_dvec.reshape(1, -1))
+
+        self._result_proj_pts = []
+        self._result_proj_errs = []
+        for i in range(len(self._result_rvecs)):
+            pp, _ = cv2.projectPoints(
+                self._result_objpts[i].reshape(-1, 3),
+                self._result_rvecs[i], self._result_tvecs[i], self._result_cmat, self._result_dvec)
+            pp = pp.reshape(-1, 2)
+            img_pts = self._result_imgpts[i].reshape(-1, 2)
+            err = pp - img_pts
+            self._result_proj_pts.append(pp)
+            self._result_proj_errs.append(err)
+
+        self._on_vis_update()
+        self._push_outputs()
+
     def _on_browse_cb(self) -> None:
         base = get_project_directory()
         initial = str(base) if base else "."
@@ -1106,6 +1511,19 @@ class CameraCalibNode(BaseNode):
 
     # ── calibration ───────────────────────────────────────────────
 
+    @staticmethod
+    def _coerce_bool_like(value) -> bool:
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("1", "true", "yes", "y", "on"):
+                return True
+            if text in ("0", "false", "no", "n", "off", ""):
+                return False
+        try:
+            return bool(int(float(value)))
+        except Exception:
+            return bool(value)
+
     def _on_calibrate(self) -> None:
         if self._calib_running:
             return
@@ -1150,13 +1568,16 @@ class CameraCalibNode(BaseNode):
             cmat_g, dvec_g, flags)
 
     def _calibrate_single(self) -> None:
-        if (self._pts3d_text_widget is None
-                or self._pts2d_text_widget is None):
-            return
-        t3 = self._pts3d_text_widget.get(
-            "1.0", tk.END)
-        t2 = self._pts2d_text_widget.get(
-            "1.0", tk.END)
+        if (self._pts3d_text_widget is not None
+                and self._pts3d_text_widget.winfo_exists()):
+            t3 = self._pts3d_text_widget.get("1.0", tk.END)
+        else:
+            t3 = self._pts3d_text
+        if (self._pts2d_text_widget is not None
+                and self._pts2d_text_widget.winfo_exists()):
+            t2 = self._pts2d_text_widget.get("1.0", tk.END)
+        else:
+            t2 = self._pts2d_text
         p3 = _parse_matrix_text(t3, 3)
         p2 = _parse_matrix_text(t2, 2)
         if p3 is None or p2 is None:
@@ -1269,15 +1690,15 @@ class CameraCalibNode(BaseNode):
                 and self._calib_btn.winfo_exists()):
             self._calib_btn.configure(state="normal")
 
-        self._result_cmat  = cmat
-        self._result_dvec  = _as_full_distortion_vector(dvec)
-        self._result_rvecs = [r for r in rvecs]
-        self._result_tvecs = [t for t in tvecs]
-        self._result_rms   = rms
+        self._result_cmat  = np.asarray(cmat, dtype=np.float64).copy()
+        self._result_dvec  = _as_full_distortion_vector(dvec).copy()
+        self._result_rvecs = [np.asarray(r, dtype=np.float64).copy() for r in rvecs]
+        self._result_tvecs = [np.asarray(t, dtype=np.float64).copy() for t in tvecs]
+        self._result_rms   = float(rms)
         self._result_objpts = [
-            o.reshape(-1, 3) for o in obj_pts]
+            np.asarray(o, dtype=np.float64).reshape(-1, 3).copy() for o in obj_pts]
         self._result_imgpts = [
-            i.reshape(-1, 2) for i in img_pts]
+            np.asarray(i, dtype=np.float64).reshape(-1, 2).copy() for i in img_pts]
 
         # compute per-image reprojection
         self._result_proj_pts  = []
@@ -1286,8 +1707,8 @@ class CameraCalibNode(BaseNode):
             pp, _ = cv2.projectPoints(
                 obj_pts[i].reshape(-1, 3),
                 rvecs[i], tvecs[i], cmat, self._result_dvec)
-            pp = pp.reshape(-1, 2)
-            ip = img_pts[i].reshape(-1, 2)
+            pp = np.asarray(pp, dtype=np.float64).reshape(-1, 2).copy()
+            ip = np.asarray(img_pts[i], dtype=np.float64).reshape(-1, 2).copy()
             err = pp - ip
             self._result_proj_pts.append(pp)
             self._result_proj_errs.append(err)
@@ -1301,6 +1722,7 @@ class CameraCalibNode(BaseNode):
         self._push_outputs()
 
     def _refresh_result_text(self) -> None:
+        self._populate_result_edit_widgets()
         if self._result_text is None:
             return
         lines = []
@@ -1405,11 +1827,14 @@ class CameraCalibNode(BaseNode):
         def _parse_1d(text_attr, var_attr):
             text = ""
             if hasattr(self, var_attr):
-                text = getattr(
-                    self, var_attr).get()
+                text = getattr(self, var_attr).get()
             elif hasattr(self, text_attr):
                 text = getattr(self, text_attr)
-            arr = _parse_matrix_text(text, 1)
+            if not isinstance(text, str):
+                text = str(text or "")
+            if text.strip() == self._grid_placeholder:
+                return None
+            arr = _parse_sequence_text(text)
             if arr is None:
                 return None
             return arr.ravel()
@@ -1422,12 +1847,7 @@ class CameraCalibNode(BaseNode):
             "_grid_zs_text", "_grid_zs_var")
 
         undist = self._undistort_var.get()
-        h, w = bg.shape[:2]
-        new_cmat = None
-        if undist and self._result_cmat is not None and self._result_dvec is not None:
-            new_cmat, _ = cv2.getOptimalNewCameraMatrix(
-                self._result_cmat, self._result_dvec, (w, h), 1, (w, h)
-            )
+        scale = _clamp_undistort_scale(self._undistort_scale_var.get())
 
         def _draw_worker():
             return _draw_calib_result(
@@ -1437,7 +1857,8 @@ class CameraCalibNode(BaseNode):
                 rvec, tvec,
                 gx, gy, gz,
                 undistort=undist,
-                new_cmat=new_cmat)
+                new_cmat=None,
+                image_size_scale=scale)
 
         def _draw_done(future):
             try:
@@ -1533,13 +1954,16 @@ class CameraCalibNode(BaseNode):
             self._collected_images.append(
                 frame.copy())
 
-        # handle trigger pin
+        # handle trigger pin: fire once per rising edge only, same as
+        # clicking the Calibrate button once (a pulse also resets back to
+        # 0/low afterwards, which must not re-trigger a second calibration).
         trigger = inputs.get("trigger")
-        if trigger is not None and \
-                trigger != self._last_trigger:
-            self._last_trigger = trigger
+        trigger_high = trigger is not None and self._coerce_bool_like(trigger)
+        if trigger_high and not self._trigger_latched_high:
             self.canvas.after(
                 0, self._on_calibrate)
+        self._trigger_latched_high = trigger_high
+        self._last_trigger = trigger
 
         # return last results if available
         if self._result_cmat is None:
@@ -1552,19 +1976,25 @@ class CameraCalibNode(BaseNode):
                 n - 1)) if n > 0 else 0
 
         result: dict = {
-            "cmat": self._result_cmat,
-            "dvec": self._result_dvec,
+            "cmat": self._result_cmat.copy(),
+            "dvec": self._result_dvec.copy(),
             "rms":  float(
                 self._result_rms or 0.0),
             "done": self._done_counter,
         }
         if self._result_rvecs:
-            result["rvec"] = \
-                self._result_rvecs[
-                    vis_idx].ravel()
-            result["tvec"] = \
-                self._result_tvecs[
-                    vis_idx].ravel()
+            result["rvec"] = self._result_rvecs[vis_idx].ravel().copy()
+            result["tvec"] = self._result_tvecs[vis_idx].ravel().copy()
+        if self._result_imgpts and vis_idx < len(self._result_imgpts):
+            result["image_pts"] = self._result_imgpts[vis_idx].copy()
+        if self._result_objpts and vis_idx < len(self._result_objpts):
+            result["object_pts"] = self._result_objpts[vis_idx].copy()
+        if self._result_proj_pts and vis_idx < len(self._result_proj_pts):
+            result["proj_pts"] = self._result_proj_pts[vis_idx].copy()
+        if self._result_proj_errs and vis_idx < len(self._result_proj_errs):
+            result["proj_err"] = self._result_proj_errs[vis_idx].copy()
+        if hasattr(self, "_last_vis_image") and self._last_vis_image is not None:
+            result["vis_image"] = np.asarray(self._last_vis_image).copy()
         return result
 
     # ── serialization ─────────────────────────────────────────────
@@ -1625,6 +2055,7 @@ class CameraCalibNode(BaseNode):
             "grid_ys":        self._grid_ys_text,
             "grid_zs":        self._grid_zs_text,
             "undistort":      self._undistort_var.get(),
+            "undistort_scale": float(self._undistort_scale_var.get()),
             "vis_idx":        self._vis_idx_var.get(),
         }
 
@@ -1678,6 +2109,11 @@ class CameraCalibNode(BaseNode):
             params.get("grid_zs", "0"))
         self._undistort_var.set(
             bool(params.get("undistort", False)))
+        scale_value = params.get("undistort_scale")
+        if scale_value is None:
+            scale_value = params.get("undistort_alpha", 1.0)
+        self._undistort_scale_var.set(
+            float(scale_value))
         self._vis_idx_var.set(
             int(params.get("vis_idx", 1)))
         # restore file list

@@ -1,8 +1,10 @@
 # node_editor/nodes/image_sequence_node.py
 
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+import time
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -46,13 +48,21 @@ class ImageSequenceNode(BaseNode):
     HELP_TEXT = (
         "Image Sequence\n\n"
         "Load images with Pattern or Folder mode, then use the Batch sequence "
-        "section to choose an inclusive, 1-based Start, End, and Step. "
+        "section to choose an inclusive, 1-based Start/End/Step. (e.g., 2/5/1 --> [2 3 4 5])"
         "Positive and negative steps are supported. Set Frame 1 and Frame 2 "
         "with i, i+N, i-N, or a fixed frame number; they are checked across every loop iteration. "
         "A black value is valid; red text must be corrected before a batch can run.\n\n"
+        "Pattern mode substitutes the Batch sequence Start/End numbers directly into the "
+        "printf-style pattern (position i -> pattern % i), so it no longer has its own "
+        "Start/End fields. Click Edit File List... to generate/review the resulting paths. "
+        "Files do not need to exist yet: if a path is missing when read, this node waits "
+        "'Wait for file (s)' seconds and retries until the file appears and can be fully "
+        "decoded -- useful when another process is still generating the sequence.\n\n"
         "Play: with no link on the next input, one frame pair is emitted at "
         "each FPS interval. Connect a TRIGGER output to next to advance one "
-        "frame for each trigger pulse instead.\n\n"
+        "frame for each trigger pulse instead. Connect a TRIGGER output to "
+        "current to re-emit the current frame pair (same as clicking the "
+        "Current button) for each pulse, without advancing.\n\n"
         "Batch outputs:\n"
         "- trigger pulses on every emitted batch step.\n"
         "- batch_start pulses only on the first emitted step of a batch run.\n\n"
@@ -69,20 +79,52 @@ class ImageSequenceNode(BaseNode):
         ".tif", ".tiff", ".webp", ".ppm", ".pgm",
     }
 
+    def __init__(self, node_id: str, canvas: tk.Canvas):
+        super().__init__(node_id, canvas)
+
+        self._file_paths: list[str] = []
+        self._current_index: int = 0
+        self._playing: bool = False
+        self._after_id: str | None = None
+        self._last_frame: np.ndarray | None = None
+        self._last_frame_index: int = -1
+        self._last_frame_1: np.ndarray | None = None
+        self._last_frame_1_index: int = -1
+        self._last_frame_2: np.ndarray | None = None
+        self._last_frame_2_index: int = -1
+
+        self._decode_lock = threading.Lock()
+        self._decode_future = None
+        self._decode_pending_req: tuple[int, str, int] | None = None
+        self._decode_request_id: int = 0
+        self._destroyed: bool = False
+        self._batch_fetch_token: int = 0
+        self._slider_dragging: bool = False
+
+        self._frame_index_input_connected: bool = False
+        self._trigger_linked: bool = False
+        self._batch_running: bool = False
+        self._trigger_pulse_counter: int = 0
+
+        self._init_ui_state()
+
     def get_pin_schema(self) -> PinSchema:
         return PinSchema(
             inputs=[
-                PinDef("frame_index", PinType.SCALAR, "index", optional=True),
+                PinDef("frame_index_1", PinType.SCALAR, "index 1", optional=True),
                 PinDef("frame_index_2", PinType.SCALAR, "index 2", optional=True),
+                PinDef("current_trigger", PinType.TRIGGER, "current", optional=True),
                 PinDef("trigger", PinType.TRIGGER, "next", optional=True),
             ],
             outputs=[
-                PinDef("image",       PinType.IMAGE,  "frame"),
-                PinDef("image_2",     PinType.IMAGE,  "frame 2"),
-                PinDef("frame_index", PinType.SCALAR, "index"),
-                PinDef("frame_count", PinType.SCALAR, "count"),
-                PinDef("trigger",     PinType.TRIGGER, "trig"),
-                PinDef("batch_start", PinType.TRIGGER, "start"),
+                PinDef("image_1",        PinType.IMAGE,  "frame 1"),
+                PinDef("image_2",        PinType.IMAGE,  "frame 2"),
+                PinDef("frame_index_1",    PinType.SCALAR, "index 1"),
+                PinDef("frame_index_2",  PinType.SCALAR, "index 2"),
+                PinDef("files",          PinType.STRING, "files"),
+                PinDef("frame_count",    PinType.SCALAR, "count"),
+                PinDef("trigger",        PinType.TRIGGER, "trig"),
+                PinDef("batch_start",    PinType.TRIGGER, "start"),
             ]
         )
 
@@ -94,11 +136,12 @@ class ImageSequenceNode(BaseNode):
         self._pattern_var = tk.StringVar(value="/images/DCIM%04d.JPG")
         self._start_var = tk.StringVar(value="0")
         self._end_var = tk.StringVar(value="100")
+        self._pattern_wait_var = tk.DoubleVar(value=0.5)
         self._folder_var = tk.StringVar(value="(no folder)")
 
         self._info_var = tk.StringVar(value="no files loaded")
         self._play_btn_var = tk.StringVar(value="Play")
-        self._fps_var = tk.IntVar(value=5)
+        self._fps_var = tk.StringVar(value="5")
         self._slider_var = tk.IntVar(value=0)
         self._idx_var = tk.StringVar(value="1")
         self._count_var = tk.StringVar(value="/ 0")
@@ -137,8 +180,7 @@ class ImageSequenceNode(BaseNode):
 
         # Inspector-only widgets (exist only while popup is open).
         self._pat_entry = None
-        self._start_entry = None
-        self._end_entry = None
+        self._pattern_wait_entry = None
         self._folder_label = None
         self._slider = None
         self._idx_entry = None
@@ -180,8 +222,8 @@ class ImageSequenceNode(BaseNode):
             self._current_index:  int = 0
             self._playing:        bool = False
             self._after_id:       str | None = None
-            self._last_frame:     np.ndarray | None = None
-            self._last_frame_index: int = -1
+            self._last_frame_1:     np.ndarray | None = None
+            self._last_frame_1_index: int = -1
             self._last_frame_2:   np.ndarray | None = None
             self._last_frame_2_index: int = -1
 
@@ -190,6 +232,9 @@ class ImageSequenceNode(BaseNode):
             self._decode_pending_req: tuple[int, str, int] | None = None
             self._decode_request_id: int = 0
             self._destroyed: bool = False
+            # Bumped to cancel superseded/in-flight background frame fetches
+            # (including a pattern-mode wait-for-file retry loop).
+            self._batch_fetch_token: int = 0
 
             self._slider_dragging: bool = False
 
@@ -220,17 +265,25 @@ class ImageSequenceNode(BaseNode):
         tk.Label(self._pat_frame, text="Pattern:", font=("Arial", 8)).grid(row=0, column=0, sticky="w")
         self._pat_entry = tk.Entry(self._pat_frame, textvariable=self._pattern_var, width=34, font=("Arial", 8))
         self._pat_entry.grid(row=0, column=1, columnspan=3, padx=2, pady=1, sticky="ew")
+        tk.Label(
+            self._pat_frame,
+            text="Uses Batch sequence's Start/End below as the substituted numbers.",
+            font=("Arial", 8), fg="#555555",
+        ).grid(row=1, column=0, columnspan=4, sticky="w")
 
-        tk.Label(self._pat_frame, text="Start:", font=("Arial", 8)).grid(row=1, column=0, sticky="w")
-        self._start_entry = tk.Entry(self._pat_frame, textvariable=self._start_var, width=8, font=("Arial", 8))
-        self._start_entry.grid(row=1, column=1, padx=2, pady=1, sticky="w")
+        tk.Label(self._pat_frame, text="Wait for file (s):", font=("Arial", 8)).grid(
+            row=2, column=0, sticky="w", pady=(4, 0))
+        self._pattern_wait_entry = tk.Entry(
+            self._pat_frame, textvariable=self._pattern_wait_var, width=8, font=("Arial", 8))
+        self._pattern_wait_entry.grid(row=2, column=1, sticky="w", pady=(4, 0))
+        tk.Label(
+            self._pat_frame,
+            text="retry interval while a file has not finished writing yet",
+            font=("Arial", 8), fg="#555555",
+        ).grid(row=2, column=2, columnspan=2, sticky="w", pady=(4, 0))
 
-        tk.Label(self._pat_frame, text="End:", font=("Arial", 8)).grid(row=1, column=2, sticky="w", padx=(8, 0))
-        self._end_entry = tk.Entry(self._pat_frame, textvariable=self._end_var, width=8, font=("Arial", 8))
-        self._end_entry.grid(row=1, column=3, padx=2, pady=1, sticky="w")
-
-        tk.Button(self._pat_frame, text="Load Pattern", font=("Arial", 8), command=self._load_pattern).grid(
-            row=2, column=0, columnspan=4, pady=3, sticky="ew"
+        tk.Button(self._pat_frame, text="Edit File List...", font=("Arial", 8), command=self._edit_pattern_file_list).grid(
+            row=3, column=0, columnspan=4, pady=3, sticky="ew"
         )
 
         self._fld_frame = tk.LabelFrame(top, text="Folder Mode", padx=6, pady=4)
@@ -328,7 +381,10 @@ class ImageSequenceNode(BaseNode):
         )
         self._batch_play_btn.pack(side="left", padx=(4, 1))
         tk.Label(nav_frame, text="FPS:", font=("Arial", 8)).pack(side="right", padx=(8, 0))
-        tk.Spinbox(nav_frame, from_=1, to=60, textvariable=self._fps_var, width=4, font=("Arial", 8)).pack(side="right", padx=2)
+        tk.Spinbox(
+            nav_frame, from_=0.0001, to=1000.0, increment=0.1,
+            textvariable=self._fps_var, width=8, font=("Arial", 8),
+        ).pack(side="right", padx=2)
 
         tk.Label(self._batch_frame, text="Frame 1:", font=("Arial", 8)).grid(
             row=4, column=0, sticky="w", pady=(5, 0),
@@ -356,7 +412,10 @@ class ImageSequenceNode(BaseNode):
             font=("Arial", 8), fg="#356a49",
         ).grid(row=5, column=0, columnspan=6, sticky="w", pady=(5, 0))
 
-        tk.Label(top, textvariable=self._fname_var, font=("Arial", 8), anchor="w", justify="left").pack(fill="x")
+        tk.Label(
+            top, textvariable=self._fname_var, font=("Arial", 8),
+            height=2, anchor="nw", justify="left",
+        ).pack(fill="x")
         tk.Label(top, textvariable=self._size_var, font=("Arial", 8), anchor="w", justify="left").pack(fill="x")
 
         self._on_method_change()
@@ -553,6 +612,8 @@ class ImageSequenceNode(BaseNode):
         self._batch_running = False
         self._batch_indices = []
         self._batch_position = 0
+        # Cancel any in-flight pattern-mode file wait so it stops retrying.
+        self._batch_fetch_token += 1
         self._play_btn_var.set("Play")
         self._cancel_batch_timer()
         self._status_var.set(status)
@@ -570,8 +631,23 @@ class ImageSequenceNode(BaseNode):
             return
         self._cancel_batch_timer()
         if delay_ms is None:
-            delay_ms = max(1, int(1000 / max(1, self._fps_var.get())))
+            try:
+                delay_ms = self._fps_interval_ms(self._fps_var.get())
+            except ValueError as exc:
+                self._stop_batch(str(exc))
+                self.set_status("invalid FPS", "#cc0000")
+                return
         self._batch_after_id = self.canvas.after(delay_ms, self._advance_batch)
+
+    @staticmethod
+    def _fps_interval_ms(value) -> int:
+        try:
+            fps = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("FPS must be a positive number") from exc
+        if not np.isfinite(fps) or fps <= 0.0:
+            raise ValueError("FPS must be a positive number")
+        return max(1, int(round(1000.0 / fps)))
 
     def _advance_batch(self) -> None:
         self._batch_after_id = None
@@ -585,17 +661,20 @@ class ImageSequenceNode(BaseNode):
         self._batch_position += 1
         self._batch_current_var.set(str(loop_index))
         is_first_step = self._batch_position == 1
+        self._status_var.set(
+            f"batch {self._batch_position}/{len(self._batch_indices)}"
+        )
         self._emit_batch_frames(
             loop_index,
             emit_trigger=True,
             emit_batch_start=is_first_step,
-        )
-        if not self._batch_running:
-            return
-        self._status_var.set(
-            f"batch {self._batch_position}/{len(self._batch_indices)}"
+            on_complete=self._on_batch_step_complete,
         )
 
+    def _on_batch_step_complete(self) -> None:
+        """Continue only after the requested frame pair was emitted."""
+        if not self._batch_running:
+            return
         if self._batch_position >= len(self._batch_indices):
             self._stop_batch("batch complete")
         elif not self._trigger_linked:
@@ -603,8 +682,15 @@ class ImageSequenceNode(BaseNode):
 
     def _emit_batch_frames(self, loop_index: int,
                            emit_trigger: bool = False,
-                           emit_batch_start: bool = False) -> None:
-        """Decode and publish the two frame expressions for one batch index."""
+                           emit_batch_start: bool = False,
+                           on_complete=None) -> None:
+        """Decode and publish the two frame expressions for one batch index.
+
+        Frame reads happen through _fetch_frame_async() on a background
+        thread, so a Pattern-mode file that an external process has not
+        finished writing yet can be waited on / retried without freezing
+        the UI. Both frames are pushed together once both are ready.
+        """
         frame_1_expression = self._parse_batch_expression(self._batch_frame_1_var.get())
         frame_2_expression = self._parse_batch_expression(self._batch_frame_2_var.get())
         if frame_1_expression is None or frame_2_expression is None:
@@ -617,42 +703,87 @@ class ImageSequenceNode(BaseNode):
                 and 0 <= frame_2_index < len(self._file_paths)):
             self._stop_batch("frame expression out of range")
             return
-        frame_1 = self._frame_for_index(
-            frame_1_index, self._last_frame, self._last_frame_index)
-        if frame_2_index == frame_1_index:
-            frame_2 = frame_1
-        else:
-            frame_2 = self._frame_for_index(
-                frame_2_index, self._last_frame_2, self._last_frame_2_index)
-        if frame_1 is None or frame_2 is None:
-            self._stop_batch("cannot read batch frame")
-            return
 
-        self._current_index = frame_1_index
-        self._last_frame = frame_1
-        self._last_frame_index = frame_1_index
-        self._last_frame_2 = frame_2
-        self._last_frame_2_index = frame_2_index
-        self._slider_var.set(frame_1_index)
-        self._idx_var.set(str(frame_1_index + 1))
-        self._fname_var.set(Path(self._file_paths[frame_1_index]).name)
-        height, width = frame_1.shape[:2]
-        self._size_var.set(f"{width} x {height}")
-        outputs = {
-            "image": frame_1,
-            "image_2": frame_2,
-            "frame_index": float(frame_1_index + 1),
-            "frame_count": float(len(self._file_paths)),
-        }
-        self.push_output(outputs)
-        if emit_trigger:
-            self._emit_trigger_pulse(outputs, emit_batch_start=emit_batch_start)
+        self._batch_fetch_token += 1
+        token = self._batch_fetch_token
+        pending: dict[str, np.ndarray | None] = {}
+
+        def _finish() -> None:
+            if token != self._batch_fetch_token:
+                return   # superseded by a newer request
+            if "frame_1" not in pending or "frame_2" not in pending:
+                return
+
+            frame_1 = pending["frame_1"]
+            frame_2 = pending["frame_2"]
+            if frame_1 is None or frame_2 is None:
+                self._stop_batch("cannot read batch frame")
+                return
+
+            self._current_index = frame_1_index
+            self._last_frame_1 = frame_1
+            self._last_frame_1_index = frame_1_index
+            self._last_frame_2 = frame_2
+            self._last_frame_2_index = frame_2_index
+            self._slider_var.set(frame_1_index)
+            self._idx_var.set(str(frame_1_index + 1))
+            self._current_index = frame_1_index
+            self._refresh_current_file_display()
+            outputs = {
+                "image_1": frame_1,
+                "image_2": frame_2,
+                "frame_index_1": float(frame_1_index + 1),
+                "frame_index_2": float(frame_2_index + 1),
+                "files": self._absolute_file_paths(),
+                "frame_count": float(len(self._file_paths)),
+            }
+            if emit_trigger:
+                # _emit_trigger_pulse() delivers `outputs` on its high edge, so a
+                # separate plain push_output() here would recompute downstream twice.
+                self._emit_trigger_pulse(outputs, emit_batch_start=emit_batch_start)
+            else:
+                self.push_output(outputs)
+            if on_complete is not None:
+                on_complete()
+
+        def _resolve(key: str, index: int) -> None:
+            if self._last_frame_1 is not None and self._last_frame_1_index == index:
+                pending[key] = self._last_frame_1
+                _finish()
+                return
+            if self._last_frame_2 is not None and self._last_frame_2_index == index:
+                pending[key] = self._last_frame_2
+                _finish()
+                return
+            if self._method_var.get() == "pattern":
+                self._status_var.set(f"waiting for frame {index + 1}...")
+
+            def _on_ready(frame, key=key):
+                pending[key] = frame
+                _finish()
+
+            self._fetch_frame_async(index, _on_ready)
+
+        if frame_2_index == frame_1_index:
+            def _on_ready_shared(frame):
+                pending["frame_1"] = frame
+                pending["frame_2"] = frame
+                _finish()
+
+            if self._last_frame_1 is not None and self._last_frame_1_index == frame_1_index:
+                _on_ready_shared(self._last_frame_1)
+            else:
+                if self._method_var.get() == "pattern":
+                    self._status_var.set(f"waiting for frame {frame_1_index + 1}...")
+                self._fetch_frame_async(frame_1_index, _on_ready_shared)
+        else:
+            _resolve("frame_1", frame_1_index)
+            _resolve("frame_2", frame_2_index)
 
     def close_inspector(self) -> None:
         super().close_inspector()
         self._pat_entry = None
-        self._start_entry = None
-        self._end_entry = None
+        self._pattern_wait_entry = None
         self._folder_label = None
         self._slider = None
         self._idx_entry = None
@@ -700,62 +831,35 @@ class ImageSequenceNode(BaseNode):
 
     # ── method A: pattern ─────────────────────────────────────────
 
-    def _load_pattern(self) -> None:
+    def _edit_pattern_file_list(self) -> None:
+        """Build the pattern-substituted path list from the Batch sequence's
+        Start/End numbers, then open the shared file-list editor for review.
+
+        Unlike Folder mode, paths are not required to exist yet -- an
+        external process may still be generating them (see 'Wait for file').
+        """
+        if not self._validate_loop_fields():
+            messagebox.showwarning(
+                "Edit File List",
+                "Fix the red Batch sequence fields (Start/End/Step) first -- "
+                "they define which numbers get substituted into the pattern.")
+            return
+
         pattern = self._pattern_var.get().strip()
-        base = self._get_project_base()
-        try:
-            start = int(self._start_var.get())
-            end   = int(self._end_var.get())
-        except ValueError:
-            messagebox.showerror(
-                "Invalid Input",
-                "Start and End must be integers.")
-            return
-
-        if start > end:
-            messagebox.showerror(
-                "Invalid Input",
-                "Start must be less than or equal to End.")
-            return
-
+        end = int(self._batch_end_var.get())
         paths = []
-        missing = []
-        for i in range(start, end + 1):
+        for i in range(1, end + 1):
             try:
-                p = pattern % i
-            except TypeError:
+                paths.append(pattern % i)
+            except (TypeError, ValueError):
                 messagebox.showerror(
                     "Invalid Pattern",
                     "Pattern must contain a printf-style "
                     "integer format specifier such as %04d.")
                 return
-            abs_p = self._to_absolute(p, base)
-            if Path(abs_p).exists():
-                paths.append(abs_p)
-            else:
-                missing.append(abs_p)
-
-        if not paths:
-            self._show_warning_with_terminal_log(
-                "No Files Found",
-                f"No files found for pattern:\n{pattern}\n"
-                f"start={start}  end={end}")
-            return
-
-        if missing:
-            # warn but continue with found files
-            sample = "\n".join(missing[:5])
-            more   = f"\n... and {len(missing)-5} more" \
-                     if len(missing) > 5 else ""
-            self._show_warning_with_terminal_log(
-                "Missing Files",
-                f"{len(missing)} files not found "
-                f"(skipped):\n{sample}{more}")
-
-            rel_pattern = self._to_relative(self._to_absolute(pattern, base), base)
-            self._pattern_var.set(rel_pattern)
 
         self._set_file_paths(paths)
+        self._edit_file_list()
 
     # ── method B: folder ─────────────────────────────────────────
 
@@ -819,18 +923,22 @@ class ImageSequenceNode(BaseNode):
             lines = [l.strip()
                      for l in txt.get("1.0", tk.END).splitlines()
                      if l.strip()]
-            bad = [l for l in lines
-                   if not Path(self._to_absolute(l, base)).exists()]
-            if bad:
-                sample = "\n".join(bad[:5])
-                more   = f"\n... and {len(bad)-5} more" \
-                         if len(bad) > 5 else ""
-                if not messagebox.askyesno(
-                        "Missing Files",
-                        f"{len(bad)} paths do not exist:\n"
-                        f"{sample}{more}\n\n"
-                        f"Apply anyway?"):
-                    return
+            # Pattern-mode paths are allowed to not exist yet (an external
+            # process may still be generating them), so only Folder mode
+            # warns about missing files here.
+            if self._method_var.get() != "pattern":
+                bad = [l for l in lines
+                       if not Path(self._to_absolute(l, base)).exists()]
+                if bad:
+                    sample = "\n".join(bad[:5])
+                    more   = f"\n... and {len(bad)-5} more" \
+                             if len(bad) > 5 else ""
+                    if not messagebox.askyesno(
+                            "Missing Files",
+                            f"{len(bad)} paths do not exist:\n"
+                            f"{sample}{more}\n\n"
+                            f"Apply anyway?"):
+                        return
             self._set_file_paths(lines)
             win.destroy()
 
@@ -846,6 +954,8 @@ class ImageSequenceNode(BaseNode):
     # ── file list management ──────────────────────────────────────
 
     def _set_file_paths(self, paths: list[str]) -> None:
+        # Cancel any in-flight background frame fetch/wait tied to the old list.
+        self._batch_fetch_token += 1
         base = self._get_project_base()
         # Keep canonical stored paths project-relative when possible.
         normalized = [
@@ -962,18 +1072,16 @@ class ImageSequenceNode(BaseNode):
         self._last_frame = frame_rgb
         self._last_frame_index = index
 
-        h, w = frame_rgb.shape[:2]
-        self._fname_var.set(Path(abs_path).name)
-        self._size_var.set(f"{w} x {h}")
-
         # update slider and entry without triggering callbacks
         self._slider_var.set(index)
         self._idx_var.set(str(index + 1))
+        self._refresh_current_file_display()
 
         # push to downstream
         self.push_output({
-            "image":       frame_rgb,
-            "frame_index": float(index + 1),
+            "image_1":       frame_rgb,
+            "frame_index_1": float(index + 1),
+            "files": self._absolute_file_paths(),
             "frame_count": float(len(self._file_paths)),
         })
 
@@ -984,6 +1092,30 @@ class ImageSequenceNode(BaseNode):
 
     # ── slider callbacks ──────────────────────────────────────────
 
+    def _refresh_current_file_display(self) -> None:
+        """Keep the inspector's filename/size text aligned with the active frame pair."""
+        if not self._file_paths:
+            self._fname_var.set("frame 1: \nframe2: ")
+            self._size_var.set("")
+            return
+
+        idx = max(0, min(self._current_index, len(self._file_paths) - 1))
+        name_1 = Path(self._file_paths[idx]).name
+        name_2 = ""
+        if (0 <= self._last_frame_2_index < len(self._file_paths)
+                and self._last_frame_2 is not None):
+            name_2 = Path(self._file_paths[self._last_frame_2_index]).name
+        self._fname_var.set(f"frame 1: {name_1}\nframe 2: {name_2}")
+
+        frame = self._last_frame if self._last_frame_index == idx else None
+        if frame is None and self._last_frame_2 is not None and self._last_frame_2_index == idx:
+            frame = self._last_frame_2
+        if frame is None:
+            self._size_var.set("")
+            return
+        h, w = frame.shape[:2]
+        self._size_var.set(f"{w} x {h}")
+
     def _on_slider_move(self, val) -> None:
         """Called continuously while dragging — update entry only."""
         if self._frame_index_input_connected:
@@ -991,9 +1123,8 @@ class ImageSequenceNode(BaseNode):
             return
         idx = int(float(val))
         self._idx_var.set(str(idx + 1))
-        self._fname_var.set(
-            Path(self._file_paths[idx]).name
-            if self._file_paths else "")
+        self._current_index = idx
+        self._refresh_current_file_display()
         self._slider_dragging = True
 
     def _on_slider_release(self, event) -> None:
@@ -1095,7 +1226,13 @@ class ImageSequenceNode(BaseNode):
 
         self._load_and_push(next_idx)
 
-        interval_ms = max(1, int(1000 / self._fps_var.get()))
+        try:
+            interval_ms = self._fps_interval_ms(self._fps_var.get())
+        except ValueError as exc:
+            self._stop_play()
+            self._status_var.set(str(exc))
+            self.set_status("invalid FPS", "#cc0000")
+            return
         self._after_id = self.canvas.after(
             interval_ms, self._play_tick)
 
@@ -1103,11 +1240,28 @@ class ImageSequenceNode(BaseNode):
 
     def _emit_trigger_pulse(self, base_outputs: dict | None = None,
                             emit_batch_start: bool = False) -> None:
-        """Emit a high->low trigger pulse, optionally with a first-step pulse."""
+        """Emit a high->low trigger pulse, optionally with a first-step pulse.
+
+        Only the high edge drives a full downstream recompute; the low/reset
+        edge is delivered as a cache-only update so trigger-consumers still see
+        a correct 1->0 transition without re-running downstream nodes a second
+        time (which would double their expensive compute() work, e.g. an
+        Undistortion node or an Image Save node in Continuous mode).
+
+        Because the low/reset edge never reaches a downstream node's compute(),
+        edge-detecting trigger consumers (Template Match, Optical Flow, Image
+        Save's Triggered mode, ...) never observe a real 1->0 transition
+        between two pulses. A fixed 1.0 high value would then look like "no
+        change" on the second and later pulses and get silently ignored, so
+        each high pulse instead carries a monotonically increasing counter --
+        the same "ever-incrementing counter-style trigger" value those nodes
+        already special-case in their edge detection.
+        """
         if not self._on_output_ready:
             return
+        self._trigger_pulse_counter += 1
         pulse_outputs = dict(base_outputs or {})
-        pulse_outputs["trigger"] = 1.0
+        pulse_outputs["trigger"] = float(self._trigger_pulse_counter)
         if emit_batch_start:
             pulse_outputs["batch_start"] = 1.0
         self._on_output_ready(self.node_id, pulse_outputs)
@@ -1116,6 +1270,7 @@ class ImageSequenceNode(BaseNode):
         reset_outputs["trigger"] = 0.0
         if emit_batch_start:
             reset_outputs["batch_start"] = 0.0
+        reset_outputs["_cache_only"] = True
         self._on_output_ready(self.node_id, reset_outputs)
 
     def push_output(self, outputs: dict) -> None:
@@ -1138,12 +1293,13 @@ class ImageSequenceNode(BaseNode):
         This handles the case where a downstream node is added
         after a frame is already loaded.
         """
-        raw_frame_index = inputs.get("frame_index")
+        raw_frame_index_1 = inputs.get("frame_index_1")
         raw_frame_index_2 = inputs.get("frame_index_2")
         trigger_is_linked = "trigger" in inputs
+        current_trigger_is_linked = "current_trigger" in inputs
         if trigger_is_linked != self._trigger_linked:
             self.on_input_link_changed("trigger", trigger_is_linked)
-        has_external_index = raw_frame_index is not None
+        has_external_index = raw_frame_index_1 is not None
         has_external_index_2 = raw_frame_index_2 is not None
         self._set_external_index_connected(
             has_external_index or has_external_index_2)
@@ -1157,7 +1313,7 @@ class ImageSequenceNode(BaseNode):
         # it coalesces requests and would drop one of the two frame requests.
         if has_external_index or has_external_index_2:
             requested_index = self._parse_frame_index(
-                raw_frame_index, "frame_index",
+                raw_frame_index_1, "frame_index_1",
                 self._current_index)
             requested_index_2 = self._parse_frame_index(
                 raw_frame_index_2, "frame_index_2",
@@ -1177,28 +1333,28 @@ class ImageSequenceNode(BaseNode):
                     requested_index_2, self._last_frame_2,
                     self._last_frame_2_index)
             self._last_frame_2_index = requested_index_2
+            self._refresh_current_file_display()
 
             if self._last_frame is None or self._last_frame_2 is None:
                 return {}
             return {
-                "image": self._last_frame,
+                "image_1": self._last_frame,
                 "image_2": self._last_frame_2,
-                "frame_index": float(requested_index + 1),
+                "frame_index_1": float(requested_index + 1),
+                "frame_index_2": float(requested_index_2 + 1),
+                "files": self._absolute_file_paths(),
                 "frame_count": float(len(self._file_paths)),
             }
 
-        if trigger_is_linked:
-            if self._truthy_trigger(inputs.get("trigger")):
+        if trigger_is_linked or current_trigger_is_linked:
+            if trigger_is_linked and self._truthy_trigger(inputs.get("trigger")):
                 self._move_batch_current("next")
-                # The next-step action already pushed frame output and the
-                # trigger pulse through push_output(). Avoid emitting a second
-                # sync-path payload that could race with trigger propagation.
-                return {
-                    "_skip_downstream": True,
-                    "_preserve_cache": True,
-                }
-
-            # Low/reset edge from trigger source: suppress downstream recompute.
+            if current_trigger_is_linked and self._truthy_trigger(inputs.get("current_trigger")):
+                self._move_batch_current("current")
+            # A truthy pulse already pushed frame output and the trigger pulse
+            # through push_output(). Avoid emitting a second sync-path payload
+            # that could race with trigger propagation (also applies to the
+            # low/reset edge, which must suppress downstream recompute).
             return {
                 "_skip_downstream": True,
                 "_preserve_cache": True,
@@ -1207,12 +1363,14 @@ class ImageSequenceNode(BaseNode):
         if self._last_frame is None or self._last_frame_index != self._current_index:
             return {}
         outputs = {
-            "image": self._last_frame,
-            "frame_index": float(self._current_index + 1),
+            "image_1": self._last_frame,
+            "frame_index_1": float(self._current_index + 1),
+            "files": self._absolute_file_paths(),
             "frame_count": float(len(self._file_paths)),
         }
         if self._last_frame_2 is not None:
             outputs["image_2"] = self._last_frame_2
+            outputs["frame_index_2"] = float(self._last_frame_2_index + 1)
         return outputs
 
     @staticmethod
@@ -1248,17 +1406,83 @@ class ImageSequenceNode(BaseNode):
             self._status_var.set(f"cannot read: {Path(abs_path).name}")
         return frame
 
+    @staticmethod
+    def _read_frame_blocking(abs_path: str, wait_s: float, cancelled) -> np.ndarray | None:
+        """Poll for a file an external process may still be writing (Pattern
+        mode), then decode it once its size looks stable and cv2 can read it.
+
+        Runs on a background thread only -- must not touch any Tk widget/var.
+        Returns None once `cancelled()` reports True (batch stopped/node
+        destroyed/superseded by a newer request).
+        """
+        path_obj = Path(abs_path)
+        wait_s = max(0.05, wait_s)
+        last_size = -1
+        while not cancelled():
+            if path_obj.exists():
+                try:
+                    size = path_obj.stat().st_size
+                except OSError:
+                    size = -1
+                # Only pay for a real cv2.imread() once size has held steady
+                # across two polls -- cuts down on attempts against a file
+                # that is still mid-write and would just decode as garbage/None.
+                if size > 0 and size == last_size:
+                    frame = cv2.imread(abs_path)
+                    if frame is not None:
+                        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                last_size = size
+            time.sleep(wait_s)
+        return None
+
+    def _fetch_frame_async(self, index: int, on_ready) -> None:
+        """Resolve file_paths[index] to a decoded frame on a background
+        thread, then hand the result to on_ready(frame_or_None) on the main
+        thread. In Pattern mode this waits for/retries a file that has not
+        finished being generated yet; in Folder mode it is a one-shot decode.
+        """
+        abs_path = self._to_absolute(self._file_paths[index], self._get_project_base())
+        is_pattern = self._method_var.get() == "pattern"
+        wait_s = float(self._pattern_wait_var.get())
+        token = self._batch_fetch_token
+
+        def _cancelled() -> bool:
+            return self._destroyed or self._batch_fetch_token != token
+
+        def _task():
+            if is_pattern:
+                return self._read_frame_blocking(abs_path, wait_s, _cancelled)
+            return self._decode_frame(abs_path)
+
+        future = self._DECODE_POOL.submit(_task)
+
+        def _done(fut) -> None:
+            if _cancelled():
+                return
+            try:
+                frame = fut.result()
+            except Exception:
+                frame = None
+            try:
+                self.canvas.after(0, lambda: on_ready(frame))
+            except tk.TclError:
+                pass
+
+        future.add_done_callback(_done)
+
     # ── serialization ─────────────────────────────────────────────
 
     def _to_relative(self, path: str,
                      base: Path | None) -> str:
-        """Convert absolute path to relative if base is known."""
+        """Convert a path to a project-relative path using relpath semantics."""
+        if not path:
+            return path
         if base is None:
             return path
         try:
-            return str(Path(path).relative_to(base))
-        except ValueError:
-            return path   # different drive on Windows — keep absolute
+            return os.path.relpath(str(path), str(base))
+        except Exception:
+            return path
 
     def _to_absolute(self, path: str,
                      base: Path | None) -> str:
@@ -1272,6 +1496,11 @@ class ImageSequenceNode(BaseNode):
 
     def _get_project_base(self) -> Path | None:
         return get_project_directory()
+
+    def _absolute_file_paths(self) -> list[str]:
+        """Return the full file list as absolute paths, same order as the inspector's file list."""
+        base = self._get_project_base()
+        return [self._to_absolute(p, base) for p in self._file_paths]
 
     def get_help_text(self) -> str:
         return self.HELP_TEXT
@@ -1306,6 +1535,7 @@ class ImageSequenceNode(BaseNode):
             "pattern":       pattern,
             "start":         self._start_var.get(),
             "end":           self._end_var.get(),
+            "pattern_wait":  self._pattern_wait_var.get(),
             "folder":        folder_value or "(no folder)",
             "file_list":     file_list_text,
             "current_index": self._current_index,
@@ -1331,14 +1561,20 @@ class ImageSequenceNode(BaseNode):
         )
         self._start_var.set(str(params.get("start", "0")))
         self._end_var.set(str(params.get("end", "0")))
+        try:
+            self._pattern_wait_var.set(float(params.get("pattern_wait", 0.5)))
+        except (TypeError, ValueError):
+            self._pattern_wait_var.set(0.5)
         folder_value = str(params.get("folder", "(no folder)") or "(no folder)")
         if folder_value != "(no folder)":
             folder_value = self._to_relative(self._to_absolute(folder_value, base), base)
         self._folder_var.set(folder_value)
         try:
-            self._fps_var.set(int(params.get("fps", 5)))
-        except Exception:
-            self._fps_var.set(5)
+            fps = float(params.get("fps", 5))
+            self._fps_interval_ms(fps)
+            self._fps_var.set(str(fps))
+        except (TypeError, ValueError):
+            self._fps_var.set("5")
 
         # Restore file list first. This is the most explicit source of truth.
         file_list = params.get("file_list", "")

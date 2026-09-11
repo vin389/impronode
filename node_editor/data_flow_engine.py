@@ -3,6 +3,7 @@
 import tkinter as tk
 import threading
 import queue
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
@@ -43,6 +44,8 @@ class DataFlowEngine:
 
         # Global output cache
         self._node_outputs: dict[str, dict] = {}
+        self.node_compute_callback = None
+        self.execution_complete_callback = None
 
     # ══ Graph structure management ════════════════════════════════
 
@@ -63,7 +66,7 @@ class DataFlowEngine:
         ]
 
     def add_link(self, src_node: str, src_pin: str,
-                dst_node: str, dst_pin: str) -> bool:
+                dst_node: str, dst_pin: str, trigger: bool = True) -> bool:
         link = {"src_node": src_node, "src_pin": src_pin,
                 "dst_node": dst_node, "dst_pin": dst_pin}
         self.links.append(link)
@@ -75,7 +78,12 @@ class DataFlowEngine:
         callback = getattr(destination, "on_input_link_changed", None)
         if callable(callback):
             callback(dst_pin, True)
-        self._trigger_from(src_node, order)   # Use src_node as the trigger root
+        if trigger:
+            # Callers restoring many links at once (e.g. project load) pass
+            # trigger=False to avoid recomputing the downstream subgraph once
+            # per link; they run a single trigger_all() after every link has
+            # been restored instead.
+            self._trigger_from(src_node, order)   # Use src_node as the trigger root
         return True
 
     def remove_link(self, src_node: str, src_pin: str,
@@ -202,6 +210,8 @@ class DataFlowEngine:
 
     def _execute_step(self, order, idx, outputs):
         if idx >= len(order):
+            if self.execution_complete_callback is not None:
+                self.execution_complete_callback()
             return
 
         node_id = order[idx]
@@ -217,15 +227,26 @@ class DataFlowEngine:
         inputs = self._gather_inputs(node_id, outputs)
 
         if node.EXECUTION_MODE == ExecutionMode.SYNC:
+            compute_start = time.perf_counter()
             result = self._safe_compute(node, inputs)
+            if self.node_compute_callback is not None:
+                self.node_compute_callback(node, time.perf_counter() - compute_start)
             self._handle_compute_result(order, idx, outputs, node_id, result)
 
         elif node.EXECUTION_MODE == ExecutionMode.BACKGROUND:
+            compute_start = time.perf_counter()
             def _bg_task():
                 return self._safe_compute(node, inputs)
 
             def _on_done(future):
                 result = future.result()
+                if self.node_compute_callback is not None:
+                    elapsed = time.perf_counter() - compute_start
+                    callback = self.node_compute_callback
+                    self.root.after(
+                        0,
+                        lambda: callback(node, elapsed),
+                    )
                 self.root.after(
                     0,
                     lambda: self._handle_compute_result(
@@ -285,6 +306,7 @@ class DataFlowEngine:
     @staticmethod
     def _safe_compute(node: "BaseNode", inputs: dict) -> dict:
         """Wrap compute() in try/except so a single node error does not break the full data flow."""
+        node.record_compute_time()
         try:
             return node.compute(inputs) or {}
         except Exception as e:
@@ -309,20 +331,26 @@ class DataFlowEngine:
         while not self._stream_queue.empty() and processed < 3:
             node_id, outputs = self._stream_queue.get_nowait()
 
+            # A cache-only push updates the node's cached output (so edge
+            # detection on the next real push stays correct) without paying
+            # for a full downstream recompute -- used for trigger reset pulses.
+            cache_only = bool(outputs.get("_cache_only", False))
+
             # strip internal metadata keys (prefixed with _)
             pin_outputs = {k: v for k, v in outputs.items()
                         if not k.startswith("_")}
+            self._node_outputs[node_id] = pin_outputs
 
-            order = self._topological_sort()
-            if order:
-                downstream = [
-                    nid for nid in order
-                    if nid in self._downstream_set(node_id)
-                    and nid != node_id
-                ]
-                self._node_outputs[node_id] = pin_outputs
-                self._execute_step(
-                    downstream, 0, {node_id: pin_outputs})
+            if not cache_only:
+                order = self._topological_sort()
+                if order:
+                    downstream = [
+                        nid for nid in order
+                        if nid in self._downstream_set(node_id)
+                        and nid != node_id
+                    ]
+                    self._execute_step(
+                        downstream, 0, {node_id: pin_outputs})
             processed += 1
 
         has_streaming = any(
