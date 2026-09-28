@@ -8,6 +8,7 @@ an optical-flow linearisation is comfortable with between two DIC images.
 from __future__ import annotations
 
 import math
+import time
 from typing import TypeAlias
 
 import cv2
@@ -32,6 +33,7 @@ def calcTemplateMatchPyr(
     fine_search_radius: IntPair = 4,
     sidelobe_exclusion_radius: int = 2,
     next_pts_init: np.ndarray | None = None,
+    ctime: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Track points from ``prev_img`` to ``next_img`` by pyramid matching.
 
@@ -85,6 +87,19 @@ def calcTemplateMatchPyr(
         point falls back to zero motion for that point only.  ``search_range``
         at the coarsest level must still be large enough to cover how wrong
         the guess might be.
+    ctime:
+        Optional writable ``float64`` output buffer of shape ``(N, num_levels)``.
+        Filled with per-point, per-level elapsed seconds measured using
+        ``time.perf_counter_ns`` (high-resolution monotonic timer).
+        Column 0 is full resolution; column ``num_levels - 1`` is coarsest
+        (processed first). Includes level setup, subset extraction, matching,
+        subpixel refinement and peak scoring, but excludes shared grayscale
+        conversion and pyramid construction. Attempted failures are timed;
+        unvisited levels and non-finite points are ``NaN``. This is elapsed
+        wall-clock time, including scheduling/waits, not process CPU time.
+        Unlike Windows process CPU accounting, this timer resolves short
+        matches without coarse ~15.625 ms steps.
+        The three-array return value is unchanged.
 
     Returns
     -------
@@ -124,6 +139,12 @@ def calcTemplateMatchPyr(
     if points.ndim != 2 or points.shape[1] != 2:
         raise ValueError("prev_pts must have shape (N, 2) in (x, y) order")
 
+    if ctime is not None:
+        if (ctime.shape != (len(points), num_levels)
+                or ctime.dtype != np.float64 or not ctime.flags.writeable):
+            raise ValueError("ctime must be a writable float64 array of shape (N, num_levels)")
+        ctime.fill(np.nan)
+
     init_points = None
     if next_pts_init is not None:
         init_points = np.asarray(next_pts_init, dtype=np.float64)
@@ -156,6 +177,7 @@ def calcTemplateMatchPyr(
         final_border_limited = False
 
         for level in range(num_levels - 1, -1, -1):
+            started_ns = time.perf_counter_ns() if ctime is not None else 0
             scale = 2 ** level
             source_center = full_point / scale
             if level == num_levels - 1:
@@ -181,6 +203,9 @@ def calcTemplateMatchPyr(
                 subpixel=subpixel,
                 sidelobe_exclusion_radius=sidelobe_exclusion_radius,
             )
+            if ctime is not None:
+                # Subtract integer timestamps before converting to seconds.
+                ctime[point_index, level] = (time.perf_counter_ns() - started_ns) / 1_000_000_000
             if match is None:
                 point_failed = True
                 break

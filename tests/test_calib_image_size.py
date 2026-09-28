@@ -56,6 +56,32 @@ class TestCameraCalibNodeImageSize(unittest.TestCase):
         many_pins = _ManyPinsNode("many", self.canvas)
         self.assertGreater(many_pins.get_default_height(), many_pins.NODE_HEIGHT)
 
+    def test_imgsize_pin_order_and_integer_outputs(self):
+        pins = self.node.get_pin_schema().outputs
+        names = [pin.name for pin in pins]
+        index = names.index("imgsize")
+        self.assertEqual(names[index - 1:index + 2], ["tvec", "imgsize", "image_pts"])
+        self.assertEqual(pins[index].type, PinType.ARRAY)
+        self.assertEqual(pins[index].shape, (2,))
+        self.assertEqual(pins[index].dtype, "int64")
+
+        self.node._result_cmat = np.eye(3)
+        self.node._result_dvec = np.zeros((1, 14))
+        self.node._img_w_var.set(1920)
+        self.node._img_h_var.set(1080)
+        computed = self.node.compute({})["imgsize"]
+        np.testing.assert_array_equal(computed, [1920, 1080])
+        self.assertEqual(computed.dtype, np.int64)
+
+        published = []
+        self.node._on_output_ready = lambda node_id, outputs: published.append(outputs)
+        self.node._push_outputs()
+        np.testing.assert_array_equal(published[-1]["imgsize"], computed)
+        self.assertEqual(published[-1]["imgsize"].dtype, np.int64)
+
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        np.testing.assert_array_equal(self.node.compute({"images": frame})["imgsize"], [320, 240])
+
     def test_vis_background_uses_selected_calibration_frame(self):
         frame = np.zeros((240, 320, 3), dtype=np.uint8)
         frame[10:30, 20:40] = [10, 20, 30]

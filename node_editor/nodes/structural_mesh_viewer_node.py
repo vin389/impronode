@@ -165,12 +165,14 @@ TIME CONTROL BAR
 |<  Prev  Play  Play & Save...  Stop  Next  >|   plus a scrubber.
 
 "Play & Save..." first opens a Video Recording Settings dialog (Quality
-0-100 and Number of parallel encoding stripes, -1 = automatic; sensible
-defaults are pre-filled so you can just click OK), then a save-file
-dialog, then records the FULL sequence (frame 0 through nt-1, once) by
-screenshotting the entire inspector window at every time step and
-encoding at exactly the FPS box's value, regardless of how long capture/
-encoding actually takes in real time. Requires Pillow's ImageGrab.
+0-100, Number of parallel encoding stripes -1 = automatic, and a Start
+frame / End frame range -- defaults to the full sequence, 0 through
+nt-1; sensible defaults are pre-filled so you can just click OK), then
+a save-file dialog, then records frames Start through End inclusive
+(e.g. Start=100, End=200 saves 101 frames) by screenshotting the entire
+inspector window at every time step and encoding at exactly the FPS
+box's value, regardless of how long capture/encoding actually takes in
+real time. Requires Pillow's ImageGrab.
 
 KEYBOARD SHORTCUT
 -----------------
@@ -551,6 +553,8 @@ class StructuralMeshViewerNode(BaseNode):
         self._record_status_var = tk.StringVar(value="")
         self._video_quality_var = tk.IntVar(value=95)
         self._video_nstripes_var = tk.IntVar(value=-1)
+        self._video_start_frame_var = tk.IntVar(value=0)
+        self._video_end_frame_var = tk.IntVar(value=-1)  # -1 = last frame
 
         self._field_label_to_key = {label: k for k, label in _FIELD_OPTIONS}
         self._field_key_to_label = dict(_FIELD_OPTIONS)
@@ -564,6 +568,8 @@ class StructuralMeshViewerNode(BaseNode):
         self._record_writer = None
         self._record_bbox = None
         self._record_frame_idx = 0
+        self._record_start_frame = 0
+        self._record_end_frame = 0
         self._record_win_size = (0, 0)
         self._record_path = ""
         self._ImageGrab = None
@@ -945,6 +951,74 @@ class StructuralMeshViewerNode(BaseNode):
             yc = self._shrink_corners_to_cells(yg)
             return xc, yc, values, "nearest"
         return xg, yg, values, "flat"
+
+    @staticmethod
+    def _nearest_fill_bfs(values: np.ndarray, invalid: np.ndarray) -> np.ndarray:
+        """Pure-numpy fallback for _fill_invalid_mesh_values() (no scipy):
+        multi-source breadth-first nearest-neighbor fill."""
+        from collections import deque
+        filled = values.copy()
+        visited = ~invalid
+        nrows, ncols = values.shape
+        dq = deque(zip(*np.where(visited)))
+        while dq:
+            r, c = dq.popleft()
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < nrows and 0 <= nc < ncols and not visited[nr, nc]:
+                    filled[nr, nc] = filled[r, c]
+                    visited[nr, nc] = True
+                    dq.append((nr, nc))
+        return filled
+
+    @staticmethod
+    def _fill_invalid_mesh_values(values: np.ndarray) -> np.ndarray:
+        """
+        Return a copy of `values` with any non-finite (NaN/Inf) entries
+        replaced by an interpolated estimate from the surrounding valid
+        entries -- index-grid linear interpolation, with nearest-neighbor
+        for entries outside the convex hull of valid data (e.g. mesh
+        edges/corners) -- so pcolormesh() never receives non-finite data.
+        """
+        values = np.asarray(values, dtype=np.float64)
+        invalid = ~np.isfinite(values)
+        if not invalid.any():
+            return values
+        valid = ~invalid
+        if not valid.any():
+            return np.zeros_like(values)
+
+        try:
+            from scipy.interpolate import griddata
+
+            rows, cols = np.indices(values.shape)
+            valid_pts = np.column_stack([rows[valid], cols[valid]])
+            valid_vals = values[valid]
+            query_pts = np.column_stack([rows[invalid], cols[invalid]])
+
+            estimate = griddata(valid_pts, valid_vals, query_pts, method="linear")
+            still_missing = ~np.isfinite(estimate)
+            if still_missing.any():
+                estimate[still_missing] = griddata(
+                    valid_pts, valid_vals, query_pts[still_missing], method="nearest")
+
+            filled = values.copy()
+            filled[invalid] = estimate
+        except Exception:
+            # Degenerate point sets (too few valid points, all collinear,
+            # duplicate coordinates, etc.) can make griddata/Qhull raise
+            # instead of just returning NaN -- fall back to the
+            # dependency-free nearest-neighbor fill rather than propagating.
+            filled = StructuralMeshViewerNode._nearest_fill_bfs(values, invalid)
+
+        # Last-resort safety net: pcolormesh must never see non-finite data,
+        # so if anything is still non-finite (e.g. griddata silently left
+        # NaN behind), replace it with the mean of the valid data.
+        still_invalid = ~np.isfinite(filled)
+        if still_invalid.any():
+            fallback_value = float(np.mean(values[valid])) if valid.any() else 0.0
+            filled[still_invalid] = fallback_value
+        return filled
 
     # ── shared time control bar ──────────────────────────────────
 
@@ -2083,11 +2157,17 @@ class StructuralMeshViewerNode(BaseNode):
         shading_choice = self._field_shading_var.get()
         mesh_x, mesh_y, mesh_vals, shading = self._prepare_mesh_shading(
             values, xg, yg, is_nodal, shading_choice)
-        grid_sig = (mesh_vals.shape, shading)
+        # pcolormesh rejects non-finite X/Y just as strictly as non-finite C
+        # (e.g. NaN mesh points from lost tracking at t=0), so these need
+        # the same interpolated make-up as the color values.
+        mesh_x_makeup = self._fill_invalid_mesh_values(mesh_x)
+        mesh_y_makeup = self._fill_invalid_mesh_values(mesh_y)
+        mesh_vals_makeup = self._fill_invalid_mesh_values(mesh_vals)
+        grid_sig = (mesh_vals_makeup.shape, shading)
 
         cmap = self._cmap_var.get()
         if self._clim_auto_var.get():
-            finite = mesh_vals[np.isfinite(mesh_vals)]
+            finite = mesh_vals_makeup[np.isfinite(mesh_vals_makeup)]
             vmin = float(np.min(finite)) if finite.size else 0.0
             vmax = float(np.max(finite)) if finite.size else 1.0
             if vmin == vmax:
@@ -2101,23 +2181,38 @@ class StructuralMeshViewerNode(BaseNode):
         if need_rebuild:
             ax.clear()
             self._field_cax.clear()
-            mesh = ax.pcolormesh(mesh_x, mesh_y, mesh_vals, cmap=cmap, vmin=vmin, vmax=vmax,
-                                 shading=shading)
-            ax.set_aspect("equal", adjustable="box")
-            ax.set_xlim(float(np.nanmin(mesh_x)), float(np.nanmax(mesh_x)))
-            ax.set_ylim(float(np.nanmin(mesh_y)), float(np.nanmax(mesh_y)))
-            self._field_full_extent = (ax.get_xlim(), ax.get_ylim())
-            self._field_colorbar = self._field_fig.colorbar(mesh, cax=self._field_cax)
-            self._field_mesh = mesh
-            self._field_grid_sig = grid_sig
-            self._field_needs_rebuild = False
+            try:
+                mesh = ax.pcolormesh(mesh_x_makeup, mesh_y_makeup, mesh_vals_makeup,
+                                     cmap=cmap, vmin=vmin, vmax=vmax, shading=shading)
+                ax.set_aspect("equal", adjustable="box")
+                ax.set_xlim(float(np.nanmin(mesh_x_makeup)), float(np.nanmax(mesh_x_makeup)))
+                ax.set_ylim(float(np.nanmin(mesh_y_makeup)), float(np.nanmax(mesh_y_makeup)))
+                self._field_full_extent = (ax.get_xlim(), ax.get_ylim())
+                self._field_colorbar = self._field_fig.colorbar(mesh, cax=self._field_cax)
+                self._field_mesh = mesh
+                self._field_grid_sig = grid_sig
+                self._field_needs_rebuild = False
+            except Exception as e:
+                # Too many/degenerate invalid cells can still defeat the
+                # NaN make-up above (e.g. shading-specific edge cases) --
+                # never let pcolormesh crash the redraw.
+                ax.text(0.5, 0.5, f"overlay error: {e}", ha="center", va="center",
+                        transform=ax.transAxes, color="#aa0000", wrap=True)
+                self._field_mesh = None
+                self._field_colorbar = None
+                self._field_needs_rebuild = True
         else:
             mesh = self._field_mesh
-            mesh.set_array(mesh_vals.ravel())
-            mesh.set_cmap(cmap)
-            mesh.set_clim(vmin, vmax)
-            if self._field_colorbar is not None:
-                self._field_colorbar.update_normal(mesh)
+            try:
+                mesh.set_array(mesh_vals_makeup.ravel())
+                mesh.set_cmap(cmap)
+                mesh.set_clim(vmin, vmax)
+                if self._field_colorbar is not None:
+                    self._field_colorbar.update_normal(mesh)
+            except Exception as e:
+                ax.text(0.5, 0.5, f"overlay error: {e}", ha="center", va="center",
+                        transform=ax.transAxes, color="#aa0000", wrap=True)
+                self._field_needs_rebuild = True
 
         key_label = self._field_key_to_label.get(self._field_var.get(), self._field_key_to_label["vm"])
         res_label = "" if self._field_var.get() in _DISPLACEMENT_FIELD_KEYS else \
@@ -2397,10 +2492,17 @@ class StructuralMeshViewerNode(BaseNode):
         shading_choice = self._img_shading_var.get()
         mesh_x, mesh_y, mesh_vals, shading = self._prepare_mesh_shading(
             values, px, py, is_nodal, shading_choice)
+        # pcolormesh rejects non-finite X/Y just as strictly as non-finite C
+        # (px/py go NaN wherever cv2.projectPoints had no valid 3D point to
+        # project, e.g. lost tracking), so these need the same interpolated
+        # make-up as the color values.
+        mesh_x_makeup = self._fill_invalid_mesh_values(mesh_x)
+        mesh_y_makeup = self._fill_invalid_mesh_values(mesh_y)
+        mesh_vals_makeup = self._fill_invalid_mesh_values(mesh_vals)
 
         cmap = self._img_cmap_var.get()
         if self._img_clim_auto_var.get():
-            finite = mesh_vals[np.isfinite(mesh_vals)]
+            finite = mesh_vals_makeup[np.isfinite(mesh_vals_makeup)]
             vmin = float(np.min(finite)) if finite.size else 0.0
             vmax = float(np.max(finite)) if finite.size else 1.0
             if vmin == vmax:
@@ -2416,8 +2518,8 @@ class StructuralMeshViewerNode(BaseNode):
 
         alpha = float(self._img_alpha_var.get())
         try:
-            mesh = ax.pcolormesh(mesh_x, mesh_y, mesh_vals, cmap=cmap, vmin=vmin, vmax=vmax,
-                                 alpha=alpha, shading=shading)
+            mesh = ax.pcolormesh(mesh_x_makeup, mesh_y_makeup, mesh_vals_makeup,
+                                 cmap=cmap, vmin=vmin, vmax=vmax, alpha=alpha, shading=shading)
             self._img_fig.colorbar(mesh, cax=self._img_cax)
         except Exception as e:
             ax.text(0.5, 0.5, f"overlay error: {e}", ha="center", va="center",
@@ -2519,12 +2621,14 @@ class StructuralMeshViewerNode(BaseNode):
 
     def _show_video_settings_dialog(self) -> bool:
         """
-        Modal dialog collecting Quality (0-100) and Number of parallel
-        encoding stripes (-1 = automatic), mapped directly to
-        cv2.VIDEOWRITER_PROP_QUALITY and cv2.VIDEOWRITER_PROP_NSTRIPES.
-        Pre-filled with sensible defaults; returns True if OK was
-        clicked (values stored on self._video_quality_var /
-        self._video_nstripes_var), False if cancelled.
+        Modal dialog collecting Quality (0-100), Number of parallel encoding
+        stripes (-1 = automatic), and the Start/End frame range to record.
+        Quality/stripes map directly to cv2.VIDEOWRITER_PROP_QUALITY and
+        cv2.VIDEOWRITER_PROP_NSTRIPES. Pre-filled with sensible defaults
+        (start=0, end=last frame); returns True if OK was clicked (values
+        stored on self._video_quality_var / self._video_nstripes_var /
+        self._video_start_frame_var / self._video_end_frame_var), False if
+        cancelled.
         """
         win = self._inspector_win
         if win is None:
@@ -2553,16 +2657,40 @@ class StructuralMeshViewerNode(BaseNode):
         tk.Spinbox(body, from_=-1, to=256, textvariable=nstripes_var, width=8,
                   font=("Arial", 9)).grid(row=1, column=1, sticky="w", padx=(8, 0))
 
+        max_frame = max(0, self._nt - 1)
+        tk.Label(body, text="Start frame:", font=("Arial", 9)).grid(
+            row=2, column=0, sticky="w", pady=4)
+        start_var = tk.IntVar(value=min(max(self._video_start_frame_var.get(), 0), max_frame))
+        tk.Spinbox(body, from_=0, to=max_frame, textvariable=start_var, width=8,
+                  font=("Arial", 9)).grid(row=2, column=1, sticky="w", padx=(8, 0))
+
+        stored_end = self._video_end_frame_var.get()
+        end_default = max_frame if stored_end < 0 or stored_end > max_frame else stored_end
+        tk.Label(body, text="End frame:", font=("Arial", 9)).grid(
+            row=3, column=0, sticky="w", pady=4)
+        end_var = tk.IntVar(value=end_default)
+        tk.Spinbox(body, from_=0, to=max_frame, textvariable=end_var, width=8,
+                  font=("Arial", 9)).grid(row=3, column=1, sticky="w", padx=(8, 0))
+        tk.Label(body, text=f"(0 to {max_frame}; end must be >= start)",
+                font=("Arial", 7), fg="#888888").grid(
+            row=4, column=0, columnspan=2, sticky="w")
+
         tk.Label(body, text="Defaults are fine for most users -- just click OK.",
                 font=("Arial", 8), fg="#666666").grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(4, 8))
+            row=5, column=0, columnspan=2, sticky="w", pady=(4, 8))
 
         btn_row = tk.Frame(body)
-        btn_row.grid(row=3, column=0, columnspan=2, sticky="e")
+        btn_row.grid(row=6, column=0, columnspan=2, sticky="e")
 
         def _on_ok():
+            if end_var.get() < start_var.get():
+                messagebox.showerror(
+                    "Invalid range", "End frame must be >= start frame.", parent=dlg)
+                return
             self._video_quality_var.set(quality_var.get())
             self._video_nstripes_var.set(nstripes_var.get())
+            self._video_start_frame_var.set(start_var.get())
+            self._video_end_frame_var.set(end_var.get())
             result["ok"] = True
             dlg.destroy()
 
@@ -2626,8 +2754,17 @@ class StructuralMeshViewerNode(BaseNode):
             return
         self._ImageGrab = ImageGrab
 
+        max_frame = max(0, self._nt - 1)
+        start_frame = min(max(self._video_start_frame_var.get(), 0), max_frame)
+        end_frame = self._video_end_frame_var.get()
+        if end_frame < 0 or end_frame > max_frame:
+            end_frame = max_frame
+        end_frame = max(end_frame, start_frame)
+        self._record_start_frame = start_frame
+        self._record_end_frame = end_frame
+
         self._stop_animation()
-        self._set_frame(0)
+        self._set_frame(start_frame)
         win.update_idletasks()
         win.lift()
         try:
@@ -2664,7 +2801,7 @@ class StructuralMeshViewerNode(BaseNode):
         self._record_writer = writer
         self._record_bbox = (x, y, x + w, y + h)
         self._record_win_size = (w, h)
-        self._record_frame_idx = 0
+        self._record_frame_idx = start_frame
         self._record_path = path
         if self._record_btn is not None and self._record_btn.winfo_exists():
             self._record_btn.configure(text="Cancel Recording")
@@ -2674,8 +2811,9 @@ class StructuralMeshViewerNode(BaseNode):
                 b.configure(state="disabled")
         if self._scrubber is not None and self._scrubber.winfo_exists():
             self._scrubber.configure(state="disabled")
+        total_frames = end_frame - start_frame + 1
         self._record_status_var.set(
-            f"Recording frame 1/{self._nt} to {path}  "
+            f"Recording frame 1/{total_frames} (t={start_frame}) to {path}  "
             f"(quality={self._video_quality_var.get()}, "
             f"stripes={self._video_nstripes_var.get()}) ...")
         win.after(80, self._record_tick)
@@ -2700,13 +2838,16 @@ class StructuralMeshViewerNode(BaseNode):
             frame_bgr = cv2.resize(frame_bgr, (target_w, target_h))
         self._record_writer.write(frame_bgr)
 
-        self._record_frame_idx += 1
-        if self._record_frame_idx >= self._nt:
+        total_frames = self._record_end_frame - self._record_start_frame + 1
+        if self._record_frame_idx >= self._record_end_frame:
             self._finish_recording(success=True)
             return
+        self._record_frame_idx += 1
         self._set_frame(self._record_frame_idx)
+        done = self._record_frame_idx - self._record_start_frame + 1
         self._record_status_var.set(
-            f"Recording frame {self._record_frame_idx + 1}/{self._nt} to {self._record_path} ...")
+            f"Recording frame {done}/{total_frames} (t={self._record_frame_idx}) "
+            f"to {self._record_path} ...")
         win.after(10, self._record_tick)
 
     def _cancel_recording(self) -> None:

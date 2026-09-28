@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from calcTemplateMatchPyr import calcTemplateMatchPyr
+from calcTemplateMatchPyr_codex import calcTemplateMatchPyr
 
 
 def test_pyramid_template_match_recovers_large_translation():

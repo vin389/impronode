@@ -9,10 +9,7 @@ _REPO_ROOT = _Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
 	sys.path.insert(0, str(_REPO_ROOT))
 
-try:
-	from calcTemplateMatchPyr import calcTemplateMatchPyr  # type: ignore[import-not-found]
-except ImportError:
-	from calcTemplateMatchPyr_codex import calcTemplateMatchPyr
+from calcTemplateMatchPyr_codex import calcTemplateMatchPyr
 
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -100,6 +97,13 @@ class TemplateMatchNode(BaseNode):
 		"- nextPts [ARRAY float64 Nx2]: tracked output points (NaN if failed).\n"
 		"- status [ARRAY uint8 N]: 1 means the peak met min_correlation, else 0.\n"
 		"- confidence [ARRAY float64 N]: match quality/sharpness score in [0, 1].\n"
+		"- ctime [ARRAY float64 Nxnum_levels]: elapsed seconds per point and level.\n"
+		"  Column 0 = full resolution; last column = coarsest (processed first).\n"
+		"  Includes subset extraction, matching, refinement and peak scoring;\n"
+		"  excludes shared image conversion/pyramid building. Failed attempts\n"
+		"  are timed; skipped levels/non-finite points are NaN. Uses the high-\n"
+		"  resolution perf_counter_ns timer, converted to seconds. Measures\n"
+		"  wall-clock time (including scheduling/waits), not process CPU time.\n"
 	)
 
 	def _init_state(self) -> None:
@@ -142,6 +146,7 @@ class TemplateMatchNode(BaseNode):
 				PinDef("nextPts", PinType.ARRAY, "nextPts", shape=(-1, 2), dtype="float64"),
 				PinDef("status", PinType.ARRAY, "status", shape=(-1,), dtype="uint8"),
 				PinDef("confidence", PinType.ARRAY, "conf", shape=(-1,), dtype="float64"),
+				PinDef("ctime", PinType.ARRAY, "ctime", shape=(-1, -1), dtype="float64"),
 			],
 		)
 
@@ -435,6 +440,7 @@ class TemplateMatchNode(BaseNode):
 		if raw_next_pts_init is not None:
 			next_pts_init = self._coerce_points(raw_next_pts_init, "nextPtsInit")
 
+		ctime = np.full((len(prev_pts), settings["num_levels"]), np.nan, dtype=np.float64)
 		next_pts, status, confidence = calcTemplateMatchPyr(
 			prev_img,
 			next_img,
@@ -448,12 +454,14 @@ class TemplateMatchNode(BaseNode):
 			fine_search_radius=settings["fine_search_radius"],
 			sidelobe_exclusion_radius=settings["sidelobe_exclusion_radius"],
 			next_pts_init=next_pts_init,
+			ctime=ctime,
 		)
 
 		return {
 			"nextPts": np.asarray(next_pts, dtype=np.float64).reshape(-1, 2),
 			"status": np.asarray(status, dtype=np.uint8).reshape(-1),
 			"confidence": np.asarray(confidence, dtype=np.float64).reshape(-1),
+			"ctime": ctime,
 		}
 
 	def compute(self, inputs: dict) -> dict:
