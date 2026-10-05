@@ -105,8 +105,12 @@ class TimeSyncNode(BaseNode):
         self._fig: Figure | None = None
         self._ax = None
         self._canvas_widget: FigureCanvasTkAgg | None = None
+#        self._pan_state: dict = {
+#            "active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None,
+#        }
         self._pan_state: dict = {
-            "active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None,
+            "active": False, "x_px": None, "y_px": None,
+            "xlim0": None, "ylim0": None, "x_scale": None, "y_scale": None,
         }
 
         # Extra canvas item for the on-node status line (created in build_body).
@@ -419,25 +423,67 @@ class TimeSyncNode(BaseNode):
             self._ax.set_ylim(new_ylim)
         self._canvas_widget.draw_idle()
 
+    # def _on_plot_press(self, event) -> None:
+    #     if event.button != 1 or event.xdata is None or self._ax is None:
+    #         return
+    #     self._pan_state.update(
+    #         active=True, x0=event.xdata, y0=event.ydata,
+    #         xlim0=self._ax.get_xlim(), ylim0=self._ax.get_ylim(),
+    #     )
     def _on_plot_press(self, event) -> None:
-        if event.button != 1 or event.xdata is None or self._ax is None:
+        if event.button != 1 or event.x is None or self._ax is None:
             return
+        xlim0, ylim0 = self._ax.get_xlim(), self._ax.get_ylim()
+        bbox = self._ax.bbox
+        if bbox.width <= 0 or bbox.height <= 0:
+            return
+        # Scale (data units per pixel) is captured ONCE here and reused for
+        # the whole drag -- see _on_plot_drag's docstring for why this
+        # avoids a feedback loop that re-deriving it from event.xdata/ydata
+        # on every move would create.
         self._pan_state.update(
-            active=True, x0=event.xdata, y0=event.ydata,
-            xlim0=self._ax.get_xlim(), ylim0=self._ax.get_ylim(),
+            active=True, x_px=event.x, y_px=event.y, xlim0=xlim0, ylim0=ylim0,
+            x_scale=(xlim0[1] - xlim0[0]) / bbox.width,
+            y_scale=(ylim0[1] - ylim0[0]) / bbox.height,
         )
 
+    # def _on_plot_drag(self, event) -> None:
+    #     if not self._pan_state["active"] or event.xdata is None or self._ax is None:
+    #         return
+    #     dx = event.xdata - self._pan_state["x0"]
+    #     dy = event.ydata - self._pan_state["y0"]
+    #     x0, x1 = self._pan_state["xlim0"]
+    #     y0, y1 = self._pan_state["ylim0"]
+    #     self._ax.set_xlim(x0 - dx, x1 - dx)
+    #     self._ax.set_ylim(y0 - dy, y1 - dy)
+    #     self._canvas_widget.draw_idle()
     def _on_plot_drag(self, event) -> None:
-        if not self._pan_state["active"] or event.xdata is None or self._ax is None:
+        """Pan by PIXEL displacement, converted to data units with the scale
+        fixed at button-press time -- NOT by re-deriving a delta from
+        event.xdata/event.ydata on every move.
+
+        event.xdata/event.ydata are computed by matplotlib using the axes'
+        CURRENT transform, and this handler itself changes that transform on
+        every call (via set_xlim/set_ylim). Comparing a value computed under
+        the just-changed transform against a reference captured under the
+        ORIGINAL (press-time) transform produces an alternating-sign error
+        series: the applied shift both lags behind the mouse and visibly
+        jitters while dragging, since each step over/under-corrects for the
+        one before it. Pixel coordinates and the data-per-pixel scale stay
+        constant throughout a pure pan (only zooming changes the scale), so
+        converting displacement once with a scale fixed at press time avoids
+        that feedback loop entirely.
+        """
+        if not self._pan_state["active"] or event.x is None or self._ax is None:
             return
-        dx = event.xdata - self._pan_state["x0"]
-        dy = event.ydata - self._pan_state["y0"]
+        dx = (event.x - self._pan_state["x_px"]) * self._pan_state["x_scale"]
+        dy = (event.y - self._pan_state["y_px"]) * self._pan_state["y_scale"]
         x0, x1 = self._pan_state["xlim0"]
         y0, y1 = self._pan_state["ylim0"]
         self._ax.set_xlim(x0 - dx, x1 - dx)
         self._ax.set_ylim(y0 - dy, y1 - dy)
         self._canvas_widget.draw_idle()
-
+        
     def _on_plot_release(self, _event) -> None:
         self._pan_state["active"] = False
 

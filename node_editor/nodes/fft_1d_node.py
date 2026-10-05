@@ -325,8 +325,27 @@ class Fft1DNode(BaseNode):
             dy = event.ydata - state["y0"]
             x0, x1 = state["xlim0"]
             y0, y1 = state["ylim0"]
-            ax.set_xlim(x0 - dx, x1 - dx)
-            ax.set_ylim(y0 - dy, y1 - dy)
+            new_xlim = (x0 - dx, x1 - dx)
+            new_ylim = (y0 - dy, y1 - dy)
+            ax.set_xlim(new_xlim)
+            ax.set_ylim(new_ylim)
+            # state["x0"]/state["y0"] are the DATA-SPACE point grabbed at
+            # button-press; a data coordinate means the same absolute
+            # position no matter what the current view window is, so they
+            # must stay fixed for the whole drag -- they are NOT refreshed
+            # here, on purpose.
+            #
+            # state["xlim0"]/state["ylim0"], however, describe the CURRENT
+            # view window, which changes every time set_xlim/set_ylim is
+            # called above -- so they DO need to be refreshed on every
+            # motion event. That refresh was missing: each event's dx/dy
+            # was still computed correctly (against the fixed grab point),
+            # but was then applied on top of the ORIGINAL button-press
+            # window instead of the current one, so the pan under-shot the
+            # cursor by a different, growing amount every event -- exactly
+            # the "vibrates" + "lags behind the cursor" symptom.
+            state["xlim0"] = new_xlim
+            state["ylim0"] = new_ylim
             self._canvas_widget.draw_idle()
 
     def _on_plot_release(self, _event) -> None:

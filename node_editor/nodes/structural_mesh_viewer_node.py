@@ -862,7 +862,7 @@ class StructuralMeshViewerNode(BaseNode):
     def _pz_on_release(self, _event, state) -> None:
         state["panning"] = False
 
-    def _pz_on_scroll(self, event, ax, canvas) -> None:
+    def _pz_on_scroll(self, event, ax, canvas, axis_lock: bool = True) -> None:
         if event.inaxes != ax or event.xdata is None or event.ydata is None:
             return
         factor = 0.9 if event.button == "up" else (1.0 / 0.9)
@@ -873,11 +873,21 @@ class StructuralMeshViewerNode(BaseNode):
         new_h = (ylim[1] - ylim[0]) * factor
         relx = (xdata - xlim[0]) / (xlim[1] - xlim[0]) if xlim[1] != xlim[0] else 0.5
         rely = (ydata - ylim[0]) / (ylim[1] - ylim[0]) if ylim[1] != ylim[0] else 0.5
-        ax.set_xlim(xdata - new_w * relx, xdata + new_w * (1 - relx))
-        ax.set_ylim(ydata - new_h * rely, ydata + new_h * (1 - rely))
+
+        # Ctrl+wheel: zoom the X axis only. Shift+wheel: zoom the Y axis
+        # only. No modifier: zoom both axes together (the original,
+        # unconditional behavior -- still used as-is when axis_lock=False).
+        key = getattr(event, "key", None) if axis_lock else None
+        if key in ("control", "ctrl"):
+            ax.set_xlim(xdata - new_w * relx, xdata + new_w * (1 - relx))
+        elif key == "shift":
+            ax.set_ylim(ydata - new_h * rely, ydata + new_h * (1 - rely))
+        else:
+            ax.set_xlim(xdata - new_w * relx, xdata + new_w * (1 - relx))
+            ax.set_ylim(ydata - new_h * rely, ydata + new_h * (1 - rely))
         canvas.draw_idle()
 
-    def _install_pan_zoom(self, ax, canvas, state, extent_getter) -> None:
+    def _install_pan_zoom(self, ax, canvas, state, extent_getter, axis_lock: bool = True) -> None:
         canvas.mpl_connect(
             "button_press_event",
             lambda e: self._pz_on_press(e, ax, canvas, state, extent_getter))
@@ -889,7 +899,7 @@ class StructuralMeshViewerNode(BaseNode):
             lambda e: self._pz_on_release(e, state))
         canvas.mpl_connect(
             "scroll_event",
-            lambda e: self._pz_on_scroll(e, ax, canvas))
+            lambda e: self._pz_on_scroll(e, ax, canvas, axis_lock))
 
     def _get_cmap_obj(self, name: str):
         try:
@@ -1240,7 +1250,7 @@ class StructuralMeshViewerNode(BaseNode):
         tk.Button(label_frame, text="Apply", font=("Arial", 8),
                   command=self._redraw_timeseries).pack(anchor="w", pady=(2, 0))
 
-        plot_frame = tk.LabelFrame(right, text="Time series  (drag=pan, wheel=zoom, dbl-click=reset)",
+        plot_frame = tk.LabelFrame(right, text="Time series  (drag=pan, wheel=zoom, ctrl=zoom X, shift=zoom Y, dbl-click=reset)",
                                    font=("Arial", 9), padx=4, pady=4)
         plot_frame.pack(fill="both", expand=True)
         self._ts_fig = plt.Figure(figsize=(5.5, 4.2), dpi=100)
@@ -1901,7 +1911,7 @@ class StructuralMeshViewerNode(BaseNode):
         tk.Button(label_frame, text="Apply", font=("Arial", 8),
                   command=self._redraw_section).pack(anchor="w", pady=(2, 0))
 
-        plot_frame = tk.LabelFrame(right, text="Section curve  (drag=pan, wheel=zoom, dbl-click=reset)",
+        plot_frame = tk.LabelFrame(right, text="Section curve  (drag=pan, wheel=zoom, ctrl=zoom X, shift=zoom Y, dbl-click=reset)",
                                    font=("Arial", 9), padx=4, pady=4)
         plot_frame.pack(fill="both", expand=True)
         self._section_fig = plt.Figure(figsize=(5.5, 4.2), dpi=100)
@@ -2059,7 +2069,7 @@ class StructuralMeshViewerNode(BaseNode):
         tk.Button(label_frame, text="Apply", font=("Arial", 8),
                   command=self._redraw_field).pack(anchor="w", pady=(2, 0))
 
-        plot_frame = tk.LabelFrame(right, text="Field  (drag=pan, wheel=zoom, dbl-click=reset)",
+        plot_frame = tk.LabelFrame(right, text="Field  (drag=pan, wheel=zoom, ctrl=zoom X, shift=zoom Y, dbl-click=reset)",
                                    font=("Arial", 9), padx=4, pady=4)
         plot_frame.pack(fill="both", expand=True)
         self._field_fig = plt.Figure(figsize=(5.5, 4.6), dpi=100)
@@ -2328,7 +2338,7 @@ class StructuralMeshViewerNode(BaseNode):
         self._img_pz_state = {"panning": False}
         self._install_pan_zoom(
             self._img_ax, self._img_canvas_widget, self._img_pz_state,
-            lambda: self._img_full_extent)
+            lambda: self._img_full_extent, axis_lock=False)
 
         self._redraw_field_on_image()
 

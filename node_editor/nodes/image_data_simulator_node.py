@@ -1,7 +1,7 @@
 # node_editor/nodes/image_data_simulator_node.py
 """
 Multi-camera image / data simulator for ONE planar target undergoing a rigid
-rotation.
+rotation or a sinusoidal sway.
 
 WHAT IT PRODUCES
     * Ground-truth data: camera parameters (rvec, tvec, K, distortion), the
@@ -41,6 +41,19 @@ CONVENTIONS
     * Frames are numbered from 1 in file names (matches Image Sequence node's
       Pattern mode, which substitutes 1..N into a printf pattern).
 
+MOTION
+    Two motion types, chosen in the "Motion" tab:
+    * "rotation" -- constant angular velocity (deg/s) about motion["axis"],
+      pivoting at motion["center"]. Unbounded: the angle grows without limit.
+    * "sway" -- a bounded, oscillating rotation:
+          angle(t) = max_angle_deg * sin(2*pi*frequency_hz*t)
+      about its OWN centre/axis (motion["sway_center"] / motion["sway_axis"]),
+      kept as separate fields from rotation's so switching motion types never
+      silently overwrites the other type's centre/axis. "Simulated duration"
+      is shared between both motion types (it governs the overall simulated
+      time span, not the motion itself), so it is shown once regardless of
+      which motion type is selected.
+
 TIME
     Simulated time starts at 0. Camera k samples t = start_k + n / fps_k
     (n = 0, 1, ...) while t <= duration, so cameras may have different frame
@@ -52,9 +65,10 @@ OUTPUT FOLDER
     back on load (set_params). This keeps the folder valid after "Save As".
 
 KNOWN LIMITATIONS
-    Single plane; rigid rotation only; no rolling shutter, motion blur,
-    exposure/vignetting; the four corners are projected onto their best-fit
-    plane (deviation is reported); the quad should be convex.
+    Single plane; rigid rotation or sway (sinusoidal oscillation) only; no
+    rolling shutter, motion blur, exposure/vignetting; the four corners are
+    projected onto their best-fit plane (deviation is reported); the quad
+    should be convex.
 """
 
 from __future__ import annotations
@@ -71,6 +85,7 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
+from PIL import Image, ImageTk
 
 from node_editor.base_node import BaseNode
 from node_editor.execution import ExecutionMode
@@ -88,22 +103,34 @@ SUPERSAMPLE = 8                    # marker supersampling factor
 ARUCO_DICT_CHOICES = ("DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250",
                       "DICT_4X4_1000", "DICT_5X5_250", "DICT_6X6_250")
 MARKER_TYPE_CHOICES = ("none", "corner", "aruco")
-MOTION_TYPE_CHOICES = ("rotation",)          # extend here for new motions
+MOTION_TYPE_CHOICES = ("rotation", "sway")   # extend here for new motions
 IMAGE_FORMAT_CHOICES = ("png", "tif", "bmp", "jpg")
 CAMERA_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b",
                  "#e377c2", "#17becf", "#bcbd22", "#7f7f7f", "#393b79", "#843c39"]
 
+# Camera-image preview pan/zoom tuning (the "Camera view (image)" panel).
+CAM_IMG_MIN_SCALE = 0.02
+CAM_IMG_MAX_SCALE = 40.0
+CAM_IMG_ZOOM_FACTOR = 1.15
+
 _HELP_TEXT = """\
 Image/Data Simulator
 ====================
-Simulates up to 12 pinhole cameras viewing ONE planar target that rotates
-rigidly about an axis. Outputs ground-truth data pins and, optionally, saves
-rendered images.
+Simulates up to 12 pinhole cameras viewing ONE planar target that either
+rotates rigidly about an axis, or sways sinusoidally about one. Outputs
+ground-truth data pins and, optionally, saves rendered images.
 
 Workflow: edit settings (left tabs) -> check wireframe (middle) and 3D
 preview (right) -> press Apply. Apply computes the data immediately (fast),
 updates the output pins, saves <folder>/<data file> and, if "Render images"
 is on, renders images in the background (progress bar + Cancel).
+
+The middle column also has a "Preview this image" button, below the
+wireframe view: it renders (in the background) exactly one frame for the
+SELECTED camera at the CURRENT preview time into the "Camera view (image)"
+panel below it. The button is disabled while rendering. Pan that image by
+dragging, zoom with the wheel (nearest-neighbour interpolation, so pixels
+stay sharp at high zoom).
 
 Cameras : position, view direction (camera +z), roll (0 = camera x parallel to
           the global x-y plane), horizontal FOV, image size, fps, start time
@@ -113,11 +140,14 @@ Mesh    : 4 corners, cells along the two directions, perspective (homography)
           live on the front face (normal = (c2-c1) x (c4-c1)).
 Markers : none / corner (2x2 checker) / aruco, centred on every object point.
 Speckles: up to 4 disc types (diameter, count per unit area, colour).
-Motion  : rotation about a centre point and axis at a given deg/s.
+Motion  : "rotation" (constant angular velocity, deg/s) or "sway" (sinusoidal
+          oscillation, angle(t) = max angle * sin(2*pi*frequency*t)), each
+          about its own centre point and axis. "Simulated duration" is shared
+          between both motion types.
 
 Outputs (C cameras, P points, S = max frames):
   rvecs (C,3) tvecs (C,3) cmats (C,3,3) dvecs (C,8) img_sizes (C,2)
-  t_cam (C,S) n_frames (C,)  object_points (C,P,3,S)  image_points (C,P,2,S)
+  n_frames (C,)  time_arrays (C,S)  object_points (S,C,P,3)  image_points (S,C,P,2)
   image_dir, data_file (strings)
 Arrays are NaN padded after each camera's last frame; use n_frames to trim.
 Image points are NaN when the point is behind the camera, on the back face,
@@ -156,10 +186,22 @@ def default_speckle_type(i: int) -> dict:
 
 
 def default_settings() -> dict:
+    mesh_corners = [[-50.0, 0.0, -30.0], [50.0, 0.0, -30.0],
+                    [50.0, 0.0, 30.0], [-50.0, 0.0, 30.0]]
+    # Initial sway centre/axis: the centroid and the (c2-c1) x (c4-c1)
+    # normal of the DEFAULT mesh above -- the same formula build_mesh()
+    # uses, so the sign/orientation convention matches. This is a fixed
+    # initial value computed once here, not something that re-tracks the
+    # mesh if its corners are edited afterwards.
+    c = np.asarray(mesh_corners, dtype=float)
+    sway_center = c.mean(axis=0).tolist()
+    normal = np.cross(c[1] - c[0], c[3] - c[0])
+    normal_len = np.linalg.norm(normal)
+    sway_axis = (normal / normal_len).tolist() if normal_len > 1e-9 else [0.0, 0.0, 1.0]
+
     return {
         "cameras": [default_camera(0), default_camera(1)],
-        "mesh": {"corners": [[-50.0, 0.0, -30.0], [50.0, 0.0, -30.0],
-                             [50.0, 0.0, 30.0], [-50.0, 0.0, 30.0]],
+        "mesh": {"corners": mesh_corners,
                  "n1": 8, "n2": 5, "perspective": True,
                  "surface_color": "#f2f2f2", "background_color": "#303030",
                  "back_color": "#808080"},
@@ -167,7 +209,9 @@ def default_settings() -> dict:
         "speckles": {"seed": 1, "ppu": 0.0, "max_mp": 16.0,
                      "types": [default_speckle_type(i) for i in range(NUM_SPECKLE_TYPES)]},
         "motion": {"type": "rotation", "center": [0.0, 0.0, 0.0],
-                   "axis": [0.0, 0.0, 1.0], "omega": 8.0, "duration": 5.0},
+                   "axis": [0.0, 0.0, 1.0], "omega": 8.0, "duration": 5.0,
+                   "sway_center": sway_center, "sway_axis": sway_axis,
+                   "max_angle_deg": 5.0, "frequency_hz": 1.0},
         "output": {"folder": "", "data_filename": "sim_data.npz", "image_format": "png",
                    "filename_pattern": "cam{cam:02d}/frame_{frame:05d}",
                    "render_images": False, "grayscale": False, "image_noise": 0.0,
@@ -219,6 +263,23 @@ def _unit(v, fallback=None):
     return v / n
 
 
+def _motion_center_axis(motion: dict):
+    """Return (center, axis) used to transform points and to draw the
+    motion in the 3D preview, picking the fields that belong to the
+    currently selected motion type.
+
+    "rotation" uses motion["center"] / motion["axis"]; "sway" uses
+    motion["sway_center"] / motion["sway_axis"] -- these are kept as
+    separate fields (rather than reusing the rotation ones) so switching
+    between the two motion types never silently overwrites a value the
+    user set for the other type.
+    """
+    if motion.get("type", "rotation") == "sway":
+        return (np.asarray(motion.get("sway_center", [0.0, 0.0, 0.0]), dtype=float),
+                np.asarray(motion.get("sway_axis", [0.0, 0.0, 1.0]), dtype=float))
+    return (np.asarray(motion["center"], dtype=float), np.asarray(motion["axis"], dtype=float))
+
+
 def axis_angle_matrices(axis, angles) -> np.ndarray:
     """Rodrigues rotation matrices, vectorised over angles: (n,3,3)."""
     angles = np.atleast_1d(np.asarray(angles, dtype=float))
@@ -232,10 +293,29 @@ def axis_angle_matrices(axis, angles) -> np.ndarray:
 
 
 def rotation_for_times(motion: dict, times) -> np.ndarray:
+    """Rotation matrices at the given simulated times, for whichever
+    motion type is selected.
+
+    "rotation": constant angular velocity about motion["axis"] (the pivot
+    at motion["center"] is applied by the caller -- this function only
+    returns the rotation MATRIX).
+
+    "sway": angle(t) = max_angle_deg (in radians) * sin(2*pi*frequency_hz*t)
+    about motion["sway_axis"] -- a bounded, oscillating rotation rather
+    than one that grows without bound, built with the exact same
+    axis-angle-to-matrix machinery as "rotation" (axis_angle_matrices),
+    just with a different, time-dependent angle array.
+    """
     times = np.atleast_1d(np.asarray(times, dtype=float))
-    if motion.get("type", "rotation") != "rotation":
-        return np.repeat(np.eye(3)[None], len(times), axis=0)
-    return axis_angle_matrices(motion["axis"], math.radians(float(motion["omega"])) * times)
+    mtype = motion.get("type", "rotation")
+    if mtype == "rotation":
+        return axis_angle_matrices(motion["axis"], math.radians(float(motion["omega"])) * times)
+    if mtype == "sway":
+        max_angle_rad = math.radians(float(motion.get("max_angle_deg", 0.0)))
+        freq = float(motion.get("frequency_hz", 0.0))
+        angles = max_angle_rad * np.sin(2.0 * math.pi * freq * times)
+        return axis_angle_matrices(motion.get("sway_axis", [0.0, 0.0, 1.0]), angles)
+    return np.repeat(np.eye(3)[None], len(times), axis=0)
 
 
 def camera_extrinsics(pos, view_dir, roll_deg):
@@ -372,7 +452,7 @@ def simulate_data(settings: dict) -> dict:
     cams, motion, out = settings["cameras"], settings["motion"], settings["output"]
     mesh = build_mesh(settings["mesh"])
     P = len(mesh["points"])
-    center = np.asarray(motion["center"], dtype=float)
+    center, _axis = _motion_center_axis(motion)
     times = [camera_frame_times(c, float(motion["duration"])) for c in cams]
     C = len(cams)
     S = max((len(t) for t in times), default=0)
@@ -592,7 +672,7 @@ def render_frame(pyr, geo, mesh, ctx, motion, t, job) -> np.ndarray:
     w, h, K, R, tv = ctx["w"], ctx["h"], ctx["K"], ctx["R"], ctx["t"]
     bg = np.array(job["background_bgr"], np.uint8)
     Rm = rotation_for_times(motion, [t])[0]
-    c = np.asarray(motion["center"], dtype=float)
+    c, _axis = _motion_center_axis(motion)
     O_t = c + Rm @ (mesh["origin"] - c)
     e1, e2, n_t = Rm @ mesh["e1"], Rm @ mesh["e2"], Rm @ mesh["normal"]
     q = mesh["q"]
@@ -699,7 +779,7 @@ class ImageDataSimulatorNode(BaseNode):
     DISPLAY_NAME = "Image/Data Simulator"
     CATEGORY = "source"
     SEARCH_KEYWORDS = ("simulator", "synthetic", "camera", "speckle", "aruco", "stereo",
-                       "rotation", "image points", "rvec", "tvec", "test data")
+                       "rotation", "sway", "image points", "rvec", "tvec", "test data")
     NODE_WIDTH = 230
     NODE_HEIGHT = 110
     HELP_TEXT = _HELP_TEXT
@@ -724,6 +804,15 @@ class ImageDataSimulatorNode(BaseNode):
         self._v3_centered = False
         self._mesh_key = None
         self._mesh_cache = None
+        # Single-frame "Preview this image" state: persists across
+        # inspector open/close (unlike the Tk widgets/view state reset in
+        # _reset_inspector_refs), same convention as self._results for the
+        # full simulation.
+        self._cimg_rgb = None
+        self._cimg_cam_index_shown = None
+        self._cimg_time_shown = None
+        self._cimg_busy = False
+        self._cimg_executor = None
         self._reset_inspector_refs()
 
     def _reset_inspector_refs(self) -> None:
@@ -735,14 +824,30 @@ class ImageDataSimulatorNode(BaseNode):
         self._cam_info_var = self._mesh_info_var = self._marker_info_var = None
         self._tex_info_var = self._folder_var = None
         self._help_popup = None
+        self._rotation_frame = self._sway_frame = self._motion_type_var = None
+        # Camera-image preview: Tk widgets and transient view state are
+        # rebuilt with the inspector (the canvas widget itself is recreated,
+        # so a previous absolute-pixel view would no longer make sense).
+        # The generated image and the background executor are NOT reset
+        # here -- see __init__.
+        self._cimg_canvas = None
+        self._preview_img_btn = None
+        self._preview_img_status_var = None
+        self._cimg_photo = None
+        self._cimg_photo_key = None
+        self._cimg_view = None
+        self._cimg_user_view = False
+        self._cimg_last_size = None
+        self._cimg_pan = {"active": False, "x_px": None, "y_px": None, "ox0": None, "oy0": None}
 
     # ── pins ────────────────────────────────────────────────────────────
     def get_pin_schema(self) -> PinSchema:
         return PinSchema(inputs=[], outputs=[
             PinDef("rvecs", PinType.ARRAY, "rvecs"), PinDef("tvecs", PinType.ARRAY, "tvecs"),
             PinDef("cmats", PinType.ARRAY, "cmats"), PinDef("dvecs", PinType.ARRAY, "dvecs"),
-            PinDef("img_sizes", PinType.ARRAY, "imgSizes"), PinDef("t_cam", PinType.ARRAY, "t_cam"),
+            PinDef("img_sizes", PinType.ARRAY, "imgSizes"),
             PinDef("n_frames", PinType.ARRAY, "nFrames"),
+            PinDef("time_arrays", PinType.ARRAY, "time_arrays"),
             PinDef("object_points", PinType.ARRAY, "objPts"),
             PinDef("image_points", PinType.ARRAY, "imgPts"),
             PinDef("image_dir", PinType.STRING, "imgDir"), PinDef("data_file", PinType.STRING, "dataFile"),
@@ -763,9 +868,14 @@ class ImageDataSimulatorNode(BaseNode):
         r = self._results
         folder = self._output_folder_abs(self._applied)
         self._update_node_status()
+        # Internal storage (self._results) keeps the (C,P,3/2,S) layout the
+        # simulation engine, .npz saving, and node-face status text all use;
+        # only the OUTPUT PINS use the reordered axes below.
         return {"rvecs": r["rvecs"], "tvecs": r["tvecs"], "cmats": r["cmats"], "dvecs": r["dvecs"],
-                "img_sizes": r["img_sizes"], "t_cam": r["t_cam"], "n_frames": r["n_frames"],
-                "object_points": r["object_points"], "image_points": r["image_points"],
+                "img_sizes": r["img_sizes"], "n_frames": r["n_frames"],
+                "time_arrays": r["t_cam"],
+                "object_points": np.ascontiguousarray(r["object_points"].transpose(3, 0, 1, 2)),  # (C,P,3,S) -> (S,C,P,3)
+                "image_points": np.ascontiguousarray(r["image_points"].transpose(3, 0, 1, 2)),    # (C,P,2,S) -> (S,C,P,2)
                 "image_dir": folder, "data_file": self._data_path(self._applied) if folder else ""}
 
     # ── serialization (applied settings only; folder stored relative) ───
@@ -887,6 +997,7 @@ class ImageDataSimulatorNode(BaseNode):
         self._cam_info_var, self._mesh_info_var = tk.StringVar(), tk.StringVar()
         self._marker_info_var, self._tex_info_var = tk.StringVar(), tk.StringVar()
         self._folder_var, self._progress_var = tk.StringVar(), tk.StringVar()
+        self._preview_img_status_var = tk.StringVar(value="")
         win = self._inspector_win
         if win is not None:
             sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
@@ -896,13 +1007,13 @@ class ImageDataSimulatorNode(BaseNode):
         panes = tk.PanedWindow(parent, orient=tk.HORIZONTAL, sashwidth=6, sashrelief=tk.RAISED)
         panes.pack(fill="both", expand=True, pady=(4, 0))
         left = tk.Frame(panes)
-        mid = tk.LabelFrame(panes, text="Camera view (wireframe)")
+        mid_container = tk.Frame(panes)
         right = tk.LabelFrame(panes, text="3D preview  (L-drag rotate, R-drag pan, wheel zoom)")
         panes.add(left, width=440, minsize=320)
-        panes.add(mid, width=430, minsize=260)
+        panes.add(mid_container, width=430, minsize=260)
         panes.add(right, minsize=260)
         self._build_notebook(left)
-        self._build_2d(mid)
+        self._build_mid_panel(mid_container)
         self._build_3d(right)
         self._refresh_camera_selector()
         self._refresh_fields()
@@ -912,6 +1023,9 @@ class ImageDataSimulatorNode(BaseNode):
         if st is not None and not st["finished"]:
             self._set_render_widgets_running(True)
             self._update_render_widgets()
+        if self._cimg_rgb is not None:
+            self._update_preview_image_status()
+            self._redraw_camera_image()
 
     def _build_toolbar(self, parent) -> None:
         r1 = tk.Frame(parent)
@@ -1175,12 +1289,59 @@ class ImageDataSimulatorNode(BaseNode):
             self._commit(fld, hexv)
 
     def _tab_motion(self, f) -> None:
-        self._lbl(f, "Motion type", 0); self._combo(f, 0, 1, ("motion", "type"), MOTION_TYPE_CHOICES, span=2)
-        self._vec3(f, 1, "Rotation centre x0, y0, z0", ("motion", "center"))
-        self._vec3(f, 2, "Rotation axis rx0, ry0, rz0", ("motion", "axis"))
-        self._lbl(f, "Angular velocity (deg/s)", 3); self._entry(f, 3, 1, ("motion", "omega"))
-        self._lbl(f, "Simulated duration (s)", 4); self._entry(f, 4, 1, ("motion", "duration"))
-        self._lbl(f, "Rotation is right-handed about the axis; mesh, speckles and\nmarkers rotate together. Time starts at 0.", 5, span=4, fg="#666666")
+        self._lbl(f, "Motion type", 0)
+        # A dedicated combo (not the generic self._combo() helper) so its
+        # callback can also toggle which of the two parameter frames below
+        # is visible.
+        self._motion_type_var = tk.StringVar(value=self._get_value(("motion", "type")))
+        motion_combo = ttk.Combobox(f, textvariable=self._motion_type_var, values=MOTION_TYPE_CHOICES,
+                                    state="readonly", width=14)
+        motion_combo.grid(row=0, column=1, columnspan=2, sticky="w", padx=2, pady=1)
+        motion_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_motion_type_changed())
+
+        # Duration governs the overall simulated time span, not the motion
+        # itself, so it is shown once, regardless of motion type.
+        self._lbl(f, "Simulated duration (s)", 1); self._entry(f, 1, 1, ("motion", "duration"))
+
+        self._rotation_frame = tk.Frame(f)
+        self._rotation_frame.grid(row=2, column=0, columnspan=4, sticky="w")
+        self._vec3(self._rotation_frame, 0, "Rotation centre x0, y0, z0", ("motion", "center"))
+        self._vec3(self._rotation_frame, 1, "Rotation axis rx0, ry0, rz0", ("motion", "axis"))
+        self._lbl(self._rotation_frame, "Angular velocity (deg/s)", 2)
+        self._entry(self._rotation_frame, 2, 1, ("motion", "omega"))
+
+        self._sway_frame = tk.Frame(f)
+        self._sway_frame.grid(row=2, column=0, columnspan=4, sticky="w")
+        self._vec3(self._sway_frame, 0, "Sway centre x0, y0, z0", ("motion", "sway_center"))
+        self._vec3(self._sway_frame, 1, "Sway axis rx0, ry0, rz0", ("motion", "sway_axis"))
+        self._lbl(self._sway_frame, "Max sway angle (deg)", 2)
+        self._entry(self._sway_frame, 2, 1, ("motion", "max_angle_deg"))
+        self._lbl(self._sway_frame, "Sway frequency (Hz)", 3)
+        self._entry(self._sway_frame, 3, 1, ("motion", "frequency_hz"))
+
+        self._lbl(f, "Rotation turns at a constant angular velocity about its axis.\n"
+                     "Sway oscillates sinusoidally about its own axis:\n"
+                     "angle(t) = max angle * sin(2*pi*frequency*t). Mesh, speckles and\n"
+                     "markers move together either way. Time starts at 0.", 3, span=4, fg="#666666")
+
+        self._update_motion_type_visibility()
+
+    def _on_motion_type_changed(self) -> None:
+        value = self._motion_type_var.get()
+        if value != self._get_value(("motion", "type")):
+            self._set_value(("motion", "type"), value)
+            self._update_motion_type_visibility()
+            self._on_settings_changed()
+
+    def _update_motion_type_visibility(self) -> None:
+        if self._rotation_frame is None or self._sway_frame is None:
+            return
+        if self._get_value(("motion", "type")) == "sway":
+            self._rotation_frame.grid_remove()
+            self._sway_frame.grid()
+        else:
+            self._sway_frame.grid_remove()
+            self._rotation_frame.grid()
 
     def _tab_output(self, f) -> None:
         self._lbl(f, "Output folder", 0)
@@ -1362,7 +1523,7 @@ class ImageDataSimulatorNode(BaseNode):
             cam = self._trial["cameras"][self._cam_idx]
             model, mesh, motion = camera_model(cam), self._mesh(), self._trial["motion"]
             Rm = rotation_for_times(motion, [self._preview_time])[0]
-            center = np.asarray(motion["center"], dtype=float)
+            center, _axis_vec = _motion_center_axis(motion)
             xf = lambda p: center + (np.asarray(p, dtype=float) - center) @ Rm.T
             w, h = model["w"], model["h"]
             s = min((cw - 52) / w, (ch - 52) / h)
@@ -1471,6 +1632,44 @@ class ImageDataSimulatorNode(BaseNode):
         cy, sy, cp, sp = np.cos(yaw), np.sin(yaw), np.cos(pitch), np.sin(pitch)
         return np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]]) @ np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
 
+    # Small cube drawn at the origin of the lower-left axes icon; it rotates with the view.
+    _CUBE_VERTS = np.array([
+        [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0],
+    ], dtype=np.float64)
+
+    _CUBE_FACES = [
+        {"normal": np.array([1.0, 0.0, 0.0]),  "verts": [1, 2, 6, 5], "color": "#ff9999"},
+        {"normal": np.array([-1.0, 0.0, 0.0]), "verts": [0, 3, 7, 4], "color": "#ffcccc"},
+        {"normal": np.array([0.0, 1.0, 0.0]),  "verts": [3, 2, 6, 7], "color": "#99dd99"},
+        {"normal": np.array([0.0, -1.0, 0.0]), "verts": [0, 1, 5, 4], "color": "#cceecc"},
+        {"normal": np.array([0.0, 0.0, 1.0]),  "verts": [4, 5, 6, 7], "color": "#9999ff"},
+        {"normal": np.array([0.0, 0.0, -1.0]), "verts": [0, 1, 2, 3], "color": "#ccccff"},
+    ]
+
+    def _draw_axes_icon(self, c: tk.Canvas, ch: float) -> None:
+        """Lower-left X/Y/Z axes icon with a small view-aligned cube at its origin."""
+        R = self._v3_rot()
+        corner = np.array([32.0, float(ch) - 32.0])
+        axis_len = 22.0
+
+        for ax_v, col, lab in ((np.array([1.0, 0.0, 0.0]), "#cc0000", "X"),
+                               (np.array([0.0, 1.0, 0.0]), "#00aa00", "Y"),
+                               (np.array([0.0, 0.0, 1.0]), "#0000cc", "Z")):
+            rv = R @ ax_v
+            e = corner + np.array([rv[0], -rv[2]]) * axis_len
+            c.create_line(corner[0], corner[1], e[0], e[1], fill=col, width=2)
+            c.create_text(e[0] + (e[0] - corner[0]) * 0.25, e[1] + (e[1] - corner[1]) * 0.25,
+                          text=lab, fill=col, font=("Arial", 8, "bold"))
+
+        # Cube: draw only the 3 faces nearest the viewer (smallest depth = rotated y),
+        # so the hidden faces never show through.
+        verts = (self._CUBE_VERTS * (axis_len * 0.32)) @ R.T
+        faces_by_depth = sorted(self._CUBE_FACES, key=lambda f: float((R @ f["normal"])[1]))
+        for face in faces_by_depth[:3]:
+            pts = [(corner[0] + verts[vi][0], corner[1] - verts[vi][2]) for vi in face["verts"]]
+            c.create_polygon(pts, fill=face["color"], outline="#333333", width=1.3)
+
     def _v3_project(self, pts, scale, radius) -> np.ndarray:
         c = self._c3d
         rot = (self._v3_rot() @ (np.asarray(pts, dtype=float).reshape(-1, 3) - np.asarray(self._v3["target"])).T).T
@@ -1497,7 +1696,7 @@ class ImageDataSimulatorNode(BaseNode):
         try:
             mesh, motion = self._mesh(), self._trial["motion"]
             models = [camera_model(cam) for cam in self._trial["cameras"]]
-            center = np.asarray(motion["center"], dtype=float)
+            center, axis_vec = _motion_center_axis(motion)
             allp = np.vstack([mesh["corners"], center[None, :]] + [m["C"][None, :] for m in models])
             centre = allp.mean(axis=0)
             radius = max(float(np.linalg.norm(allp - centre, axis=1).max()), 1e-6)
@@ -1524,7 +1723,7 @@ class ImageDataSimulatorNode(BaseNode):
             cen_t = center + (mesh["corners"].mean(axis=0) - center) @ Rm.T
             nrm = Rm @ mesh["normal"]
             line(np.vstack([cen_t, cen_t + nrm * radius * 0.18]), "#2ca02c", 2)      # front-face normal
-            axis = _unit(motion["axis"])
+            axis = _unit(axis_vec)
             if axis is not None:
                 line(np.vstack([center - axis * radius, center + axis * radius]), "#ff7f0e", 1, (6, 3))
             cxy = proj(center.reshape(1, 3))[0]
@@ -1541,17 +1740,262 @@ class ImageDataSimulatorNode(BaseNode):
                     line(np.vstack([base[i], base[(i + 1) % 4]]), col, wd)
                 a = proj(m["C"].reshape(1, 3))[0]
                 c.create_text(a[0], a[1] - 10, text=str(k + 1), fill=col, font=("Arial", 9, "bold"))
-            r = self._v3_rot()                                                        # axes icon
-            o = np.array([32.0, ch - 32.0])
-            for ax_v, col, lab in ((np.array([1.0, 0, 0]), "#cc0000", "X"), (np.array([0, 1.0, 0]), "#00aa00", "Y"),
-                                   (np.array([0, 0, 1.0]), "#0000cc", "Z")):
-                rv = r @ ax_v
-                e = o + np.array([rv[0], -rv[2]]) * 22
-                c.create_line(o[0], o[1], e[0], e[1], fill=col, width=2)
-                c.create_text(e[0] + (e[0] - o[0]) * 0.25, e[1] + (e[1] - o[1]) * 0.25, text=lab, fill=col,
-                              font=("Arial", 8, "bold"))
+            self._draw_axes_icon(c, ch)                                               # axes icon + cube
         except Exception as e:
             c.create_text(cw / 2, ch / 2, text=f"Preview unavailable:\n{e}", fill="#c62828", width=cw - 40)
+
+    # ══ Middle column layout: wireframe view + "Preview this image" + image view ══
+    def _build_mid_panel(self, parent: tk.Frame) -> None:
+        """Wireframe view on top, a 'Preview this image' button, and a
+        rendered-image view (pan/zoom, nearest-neighbour) below it, all
+        stacked in the same middle column of the inspector via a vertical
+        PanedWindow so the split between the two views is resizable.
+        """
+        mid_panes = tk.PanedWindow(parent, orient=tk.VERTICAL, sashwidth=6, sashrelief=tk.RAISED)
+        mid_panes.pack(fill="both", expand=True)
+
+        wire_frame = tk.LabelFrame(mid_panes, text="Camera view (wireframe)")
+        mid_panes.add(wire_frame, minsize=140, stretch="always")
+        self._build_2d(wire_frame)
+
+        img_frame = tk.LabelFrame(mid_panes, text="Camera view (image)")
+        mid_panes.add(img_frame, minsize=160, stretch="always")
+
+        btn_row = tk.Frame(img_frame)
+        btn_row.pack(fill="x")
+        self._preview_img_btn = tk.Button(btn_row, text="Preview this image", font=("Arial", 8),
+                                          command=self._on_preview_image_clicked)
+        self._preview_img_btn.pack(side="left", padx=2, pady=2)
+        tk.Button(btn_row, text="Reset view", font=("Arial", 8),
+                  command=self._on_reset_cimg_view).pack(side="left", padx=(4, 2))
+        tk.Label(btn_row, textvariable=self._preview_img_status_var, font=("Arial", 8),
+                 fg="#666666").pack(side="left", padx=(8, 0))
+
+        self._build_camera_image_view(img_frame)
+
+    @staticmethod
+    def _set_state(widget, state) -> None:
+        if widget is not None:
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _update_preview_image_status(self) -> None:
+        if self._preview_img_status_var is None:
+            return
+        if self._cimg_rgb is None:
+            self._preview_img_status_var.set("")
+            return
+        self._preview_img_status_var.set(
+            f"Camera {self._cimg_cam_index_shown + 1}, t = {self._cimg_time_shown:.3f} s"
+        )
+
+    def _on_preview_image_clicked(self) -> None:
+        """Render exactly ONE frame -- the selected camera, at the current
+        preview time -- on a background thread, using the current TRIAL
+        settings (so it previews unsaved edits, consistent with the
+        wireframe/3D previews). The button stays disabled until the
+        background render finishes.
+        """
+        if self._cimg_busy:
+            return
+        s = copy.deepcopy(self._trial)
+        errs = self._validate(s)
+        if errs:
+            shown = "\n".join("- " + e for e in errs[:8])
+            messagebox.showerror("Preview this image",
+                                 "Fix these settings before previewing:\n\n" + shown,
+                                 parent=self._inspector_win)
+            return
+        cam_idx = self._cam_idx
+        if cam_idx >= len(s["cameras"]):
+            return
+
+        job = {
+            "settings": s, "cam_idx": cam_idx, "time": float(self._preview_time),
+            # Tk colour lookups must happen here, never on the worker thread.
+            "surface_bgr": self._color_bgr(s["mesh"]["surface_color"]),
+            "background_bgr": self._color_bgr(s["mesh"]["background_color"]),
+            "back_bgr": self._color_bgr(s["mesh"]["back_color"]),
+            "speckle_bgr": [self._color_bgr(t["color"]) for t in s["speckles"]["types"]],
+        }
+        state = {"result": None, "error": None, "done": False}
+        self._cimg_busy = True
+        self._set_state(self._preview_img_btn, tk.DISABLED)
+        if self._preview_img_status_var is not None:
+            self._preview_img_status_var.set("Rendering...")
+        if self._cimg_executor is None:
+            self._cimg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sim-preview-img")
+        self._cimg_executor.submit(self._render_single_preview_worker, job, state)
+        self.canvas.after(120, lambda: self._poll_preview_image(state))
+
+    @staticmethod
+    def _render_single_preview_worker(job: dict, state: dict) -> None:
+        """Background thread: build the texture and render exactly one
+        frame for one camera at one simulated time. Never touches Tk.
+        """
+        try:
+            s = job["settings"]
+            mesh = build_mesh(s["mesh"])
+            geo = texture_geometry(mesh, s)
+            # A fresh, never-set Event: no cancellation is needed for a
+            # single preview frame (unlike the multi-image render job).
+            pyr = build_pyramid(build_texture(mesh, job, geo, threading.Event()))
+            cam = s["cameras"][job["cam_idx"]]
+            ctx = make_camera_context(cam)
+            bgr = render_frame(pyr, geo, mesh, ctx, s["motion"], job["time"], job)
+            state["result"] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            state["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            state["done"] = True
+
+    def _poll_preview_image(self, state: dict) -> None:
+        if self._destroyed:
+            return
+        if not state["done"]:
+            self.canvas.after(120, lambda: self._poll_preview_image(state))
+            return
+        self._cimg_busy = False
+        self._set_state(self._preview_img_btn, tk.NORMAL)
+        if state["error"]:
+            if self._preview_img_status_var is not None:
+                self._preview_img_status_var.set("Error: " + state["error"][:60])
+            if self.is_inspector_open():
+                messagebox.showerror("Preview this image", state["error"], parent=self._inspector_win)
+            return
+        self._cimg_rgb = state["result"]
+        self._cimg_cam_index_shown = self._cam_idx
+        self._cimg_time_shown = self._preview_time
+        h, w = self._cimg_rgb.shape[:2]
+        if self._cimg_last_size != (w, h):
+            # A different image size invalidates any previous manual
+            # pan/zoom (it was framed for a differently-sized image).
+            self._cimg_user_view = False
+            self._cimg_last_size = (w, h)
+        self._update_preview_image_status()
+        self._redraw_camera_image()
+
+    def _build_camera_image_view(self, parent) -> None:
+        self._cimg_canvas = tk.Canvas(parent, bg="#202020", highlightthickness=0)
+        self._cimg_canvas.pack(fill="both", expand=True)
+        self._cimg_canvas.bind("<Configure>", lambda _e: self._redraw_camera_image())
+        self._cimg_canvas.bind("<ButtonPress-1>", self._on_cimg_press)
+        self._cimg_canvas.bind("<B1-Motion>", self._on_cimg_drag)
+        self._cimg_canvas.bind("<ButtonRelease-1>", self._on_cimg_release)
+        self._cimg_canvas.bind("<MouseWheel>", self._on_cimg_wheel)
+        self._cimg_canvas.bind("<Button-4>", self._on_cimg_wheel)
+        self._cimg_canvas.bind("<Button-5>", self._on_cimg_wheel)
+
+    def _redraw_camera_image(self) -> None:
+        c = self._cimg_canvas
+        if c is None:
+            return
+        try:
+            cw, ch = c.winfo_width(), c.winfo_height()
+        except tk.TclError:
+            return
+        if cw < 20 or ch < 20:
+            return
+        rgb = self._cimg_rgb
+        if rgb is None:
+            c.delete("all")
+            self._cimg_photo, self._cimg_photo_key, self._cimg_view = None, None, None
+            c.create_text(cw / 2, ch / 2, fill="#999999", justify="center", width=cw - 40,
+                          text="No preview yet.\nPress 'Preview this image'.")
+            return
+
+        H, W = rgb.shape[:2]
+        if self._cimg_user_view and self._cimg_view is not None:
+            ox, oy, s = self._cimg_view
+        else:
+            margin = 6
+            s = min((cw - 2 * margin) / W, (ch - 2 * margin) / H)
+            dw0, dh0 = max(1, int(round(W * s))), max(1, int(round(H * s)))
+            ox, oy = (cw - dw0) / 2.0, (ch - dh0) / 2.0
+            self._cimg_view = (ox, oy, s)
+
+        # Render only the visible crop of the source image, then resize
+        # just that crop -- resizing the WHOLE image at an arbitrary zoom
+        # scale would blow up memory/time at high zoom (e.g. a 10x zoom on
+        # a 1280 px image would need an ~12800 px wide intermediate image).
+        col0 = max(0, int(math.floor((0 - ox) / s)))
+        col1 = min(W, int(math.ceil((cw - ox) / s)))
+        row0 = max(0, int(math.floor((0 - oy) / s)))
+        row1 = min(H, int(math.ceil((ch - oy) / s)))
+        if col1 <= col0 or row1 <= row0:
+            c.delete("all")
+            self._cimg_photo, self._cimg_photo_key = None, None
+            return
+
+        dw = max(1, int(round((col1 - col0) * s)))
+        dh = max(1, int(round((row1 - row0) * s)))
+        key = (id(rgb), col0, row0, col1, row1, dw, dh)
+        px, py = ox + col0 * s, oy + row0 * s
+
+        if key != self._cimg_photo_key:
+            crop = np.ascontiguousarray(rgb[row0:row1, col0:col1])
+            # Nearest-neighbour, as requested: keeps individual pixels
+            # sharp (no smoothing) when zoomed in on a rendered frame.
+            small = cv2.resize(crop, (dw, dh), interpolation=cv2.INTER_NEAREST)
+            self._cimg_photo = ImageTk.PhotoImage(Image.fromarray(small))
+            self._cimg_photo_key = key
+            c.delete("all")
+            c.create_image(px, py, anchor="nw", image=self._cimg_photo, tags="img")
+        else:
+            c.coords("img", px, py)
+
+    def _on_cimg_press(self, event) -> None:
+        if self._cimg_view is None:
+            return
+        ox, oy, _s = self._cimg_view
+        self._cimg_pan.update(active=True, x_px=event.x, y_px=event.y, ox0=ox, oy0=oy)
+
+    def _on_cimg_drag(self, event) -> None:
+        """Pan by screen-pixel displacement. Unlike the matplotlib-based
+        plots elsewhere in this project, there is no data-coordinate
+        transform here that gets invalidated between events (event.x/y and
+        ox/oy already share the same canvas-pixel space), so this does not
+        need the "fix the scale at press time" workaround those plots use.
+        """
+        pan = self._cimg_pan
+        if not pan["active"] or self._cimg_view is None:
+            return
+        dx = event.x - pan["x_px"]
+        dy = event.y - pan["y_px"]
+        _ox, _oy, s = self._cimg_view
+        self._cimg_view = (pan["ox0"] + dx, pan["oy0"] + dy, s)
+        self._cimg_user_view = True
+        self._redraw_camera_image()
+
+    def _on_cimg_release(self, _event) -> None:
+        self._cimg_pan["active"] = False
+
+    def _on_cimg_wheel(self, event) -> str | None:
+        """Zoom, anchored on the point under the cursor (that image point
+        stays under the cursor across the zoom); scrolling "up" zooms in --
+        same convention as the 3D preview's wheel zoom.
+        """
+        if self._cimg_rgb is None or self._cimg_view is None:
+            return None
+        steps = self._wheel_steps(event)
+        if steps == 0:
+            return None
+        ox, oy, s = self._cimg_view
+        new_s = float(min(max(s * (CAM_IMG_ZOOM_FACTOR ** steps), CAM_IMG_MIN_SCALE), CAM_IMG_MAX_SCALE))
+        applied = new_s / s
+        ex, ey = float(event.x), float(event.y)
+        new_ox = ex - (ex - ox) * applied
+        new_oy = ey - (ey - oy) * applied
+        self._cimg_view = (new_ox, new_oy, new_s)
+        self._cimg_user_view = True
+        self._redraw_camera_image()
+        return "break"
+
+    def _on_reset_cimg_view(self) -> None:
+        self._cimg_user_view = False
+        self._redraw_camera_image()
 
     # ══ Apply and rendering control ═════════════════════════════════════
     def _validate(self, s: dict) -> list:
@@ -1572,13 +2016,26 @@ class ImageDataSimulatorNode(BaseNode):
                 errs.append(f"Mesh: invalid {label} colour '{s['mesh'][key]}'")
 
         mo = s["motion"]
-        if not (finite(mo["center"]) and finite(mo["axis"]) and finite(mo["omega"]) and finite(mo["duration"])):
-            errs.append("Motion: centre, axis, angular velocity and duration must be finite numbers")
+        if not finite(mo["duration"]):
+            errs.append("Motion: duration must be a finite number")
+        elif float(mo["duration"]) <= 0:
+            errs.append("Motion: duration must be > 0")
+
+        if mo.get("type", "rotation") == "sway":
+            if not (finite(mo.get("sway_center", [0.0, 0.0, 0.0])) and finite(mo.get("sway_axis", [0.0, 0.0, 1.0]))
+                    and finite(mo.get("max_angle_deg", 0.0)) and finite(mo.get("frequency_hz", 0.0))):
+                errs.append("Motion: sway centre, axis, max angle and frequency must be finite numbers")
+            else:
+                if float(mo.get("max_angle_deg", 0.0)) != 0 and _unit(mo.get("sway_axis")) is None:
+                    errs.append("Motion: sway axis must be non-zero")
+                if float(mo.get("frequency_hz", 0.0)) < 0:
+                    errs.append("Motion: sway frequency must be >= 0")
         else:
-            if float(mo["duration"]) <= 0:
-                errs.append("Motion: duration must be > 0")
-            if float(mo["omega"]) != 0 and _unit(mo["axis"]) is None:
-                errs.append("Motion: rotation axis must be non-zero")
+            if not (finite(mo["center"]) and finite(mo["axis"]) and finite(mo["omega"])):
+                errs.append("Motion: centre, axis and angular velocity must be finite numbers")
+            else:
+                if float(mo["omega"]) != 0 and _unit(mo["axis"]) is None:
+                    errs.append("Motion: rotation axis must be non-zero")
 
         for i, cam in enumerate(s["cameras"], 1):
             tag = f"Camera {i}: "
@@ -1818,6 +2275,8 @@ class ImageDataSimulatorNode(BaseNode):
                 self.canvas.after_cancel(self._poll_after_id)
             except tk.TclError:
                 pass
+        if self._cimg_executor is not None:
+            self._cimg_executor.shutdown(wait=False)
         super().on_destroy()
 
 

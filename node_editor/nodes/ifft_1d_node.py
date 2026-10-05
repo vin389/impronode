@@ -277,10 +277,15 @@ class Ifft1DNode(BaseNode):
         self._canvas_widget = FigureCanvasTkAgg(self._fig, master=parent)
         self._canvas_widget.get_tk_widget().pack(fill="both", expand=True)
 
+        # for ax in (self._ax_freq, self._ax_time):
+        #     self._pan_state[ax] = {
+        #         "active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None,
+        #     }
         for ax in (self._ax_freq, self._ax_time):
             self._pan_state[ax] = {
-                "active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None,
-            }
+                "active": False, "x_px": None, "y_px": None,
+                "xlim0": None, "ylim0": None, "x_scale": None, "y_scale": None,
+            }        
 
         self._canvas_widget.mpl_connect("scroll_event", self._on_plot_scroll)
         self._canvas_widget.mpl_connect("button_press_event", self._on_plot_press)
@@ -318,32 +323,72 @@ class Ifft1DNode(BaseNode):
 
         self._canvas_widget.draw_idle()
 
+    # def _on_plot_press(self, event) -> None:
+    #     ax = event.inaxes
+    #     if ax is self._ax_phase:
+    #         ax = self._ax_freq
+    #     if ax is None or event.button != 1 or event.xdata is None:
+    #         return
+    #     self._pan_state[ax].update(
+    #         active=True, x0=event.xdata, y0=event.ydata,
+    #         xlim0=ax.get_xlim(), ylim0=ax.get_ylim(),
+    #     )
     def _on_plot_press(self, event) -> None:
         ax = event.inaxes
         if ax is self._ax_phase:
             ax = self._ax_freq
-        if ax is None or event.button != 1 or event.xdata is None:
+        if ax is None or event.button != 1 or event.x is None:
+            return
+        xlim0, ylim0 = ax.get_xlim(), ax.get_ylim()
+        bbox = ax.bbox
+        if bbox.width <= 0 or bbox.height <= 0:
             return
         self._pan_state[ax].update(
-            active=True, x0=event.xdata, y0=event.ydata,
-            xlim0=ax.get_xlim(), ylim0=ax.get_ylim(),
+            active=True, x_px=event.x, y_px=event.y, xlim0=xlim0, ylim0=ylim0,
+            x_scale=(xlim0[1] - xlim0[0]) / bbox.width,
+            y_scale=(ylim0[1] - ylim0[0]) / bbox.height,
         )
 
+    # def _on_plot_drag(self, event) -> None:
+    #     event_ax = self._ax_freq if event.inaxes is self._ax_phase else event.inaxes
+    #     for ax, state in self._pan_state.items():
+    #         if not state["active"]:
+    #             continue
+    #         if event.xdata is None or event_ax is not ax:
+    #             continue
+    #         dx = event.xdata - state["x0"]
+    #         dy = event.ydata - state["y0"]
+    #         x0, x1 = state["xlim0"]
+    #         y0, y1 = state["ylim0"]
+    #         ax.set_xlim(x0 - dx, x1 - dx)
+    #         ax.set_ylim(y0 - dy, y1 - dy)
+    #         self._canvas_widget.draw_idle()
     def _on_plot_drag(self, event) -> None:
-        event_ax = self._ax_freq if event.inaxes is self._ax_phase else event.inaxes
+        """Pan by PIXEL displacement, converted to data units with the
+        scale fixed at button-press time -- see time_sync_node.py's
+        _on_plot_drag for the full rationale (using a transform that
+        changes between calls produces jitter and lag).
+
+        Unlike the previous version, this no longer needs to remap the
+        phase twin-axis to _ax_freq here: pixel coordinates are the same
+        across the whole figure regardless of which axes matplotlib
+        currently associates the event with, so simply updating whatever
+        axis's state is active is enough -- that axis was already
+        resolved once, correctly, in _on_plot_press.
+        """
+        if event.x is None or event.y is None:
+            return
         for ax, state in self._pan_state.items():
             if not state["active"]:
                 continue
-            if event.xdata is None or event_ax is not ax:
-                continue
-            dx = event.xdata - state["x0"]
-            dy = event.ydata - state["y0"]
+            dx = (event.x - state["x_px"]) * state["x_scale"]
+            dy = (event.y - state["y_px"]) * state["y_scale"]
             x0, x1 = state["xlim0"]
             y0, y1 = state["ylim0"]
             ax.set_xlim(x0 - dx, x1 - dx)
             ax.set_ylim(y0 - dy, y1 - dy)
             self._canvas_widget.draw_idle()
-
+            
     def _on_plot_release(self, _event) -> None:
         for state in self._pan_state.values():
             state["active"] = False
@@ -374,8 +419,12 @@ class Ifft1DNode(BaseNode):
             self._ax_phase.plot(self._freq, self._phase, color="#1f77b4", linewidth=0.8,
                                  linestyle="--", label="phase")
             self._ax_phase.set_ylabel("phase (rad)", color="#1f77b4")
+            # self._pan_state.setdefault(self._ax_phase, {
+            #     "active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None,
+            # })
             self._pan_state.setdefault(self._ax_phase, {
-                "active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None,
+                "active": False, "x_px": None, "y_px": None,
+                "xlim0": None, "ylim0": None, "x_scale": None, "y_scale": None,
             })
 
         if self._t is not None and self._signal is not None:

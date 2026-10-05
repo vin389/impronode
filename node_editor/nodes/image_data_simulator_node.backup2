@@ -1,0 +1,1868 @@
+# node_editor/nodes/image_data_simulator_node.py
+"""
+Multi-camera image / data simulator for ONE planar target undergoing a rigid
+rotation.
+
+WHAT IT PRODUCES
+    * Ground-truth data: camera parameters (rvec, tvec, K, distortion), the
+      3D object-point history and the image-point history of every camera.
+    * Optionally, rendered images (speckles + markers) written to disk.
+
+RENDERING MODEL (why it is both exact and fast)
+    The target is a single plane, so no hidden-surface computation is needed.
+    Everything painted on the plane (surface colour, speckles, markers) is
+    drawn ONCE into a plane-aligned texture. For a rigid plane, the image seen
+    by a pinhole camera at time t is exactly the texture warped by one 3x3
+    homography H_t = K [R*dx | R*dy | R*P0 + t] (dx, dy = texel axes in world
+    units, P0 = world position of texel (0,0), all rotated to time t). One
+    cv2.warpPerspective per frame therefore replaces per-pixel ray casting. To
+    limit aliasing, the texture is stored as a mipmap pyramid and the level is
+    chosen per frame from the local texel-to-pixel scale (measured at the
+    texture center, so strongly oblique views may be slightly soft or aliased
+    at the near/far ends). With lens distortion the frame is instead produced
+    by cv2.remap through a cached "distorted pixel -> ideal pixel" map. Frames
+    are rendered by a thread pool (OpenCV releases the GIL) so the Tk UI stays
+    responsive.
+
+CONVENTIONS
+    * Camera frame: x right, y down, z forward (OpenCV). X_cam = R X_world + t.
+    * View direction = camera +z. Roll = 0 means camera x is parallel to the
+      global x-y plane (camera "up" is the projection of global +z; if the view
+      direction is parallel to z, global +y is used instead). Positive roll is
+      a right-hand rotation about the view direction.
+    * Intrinsics: fx = fy = (width/2)/tan(hfov/2), cx = (w-1)/2, cy = (h-1)/2.
+      Pixel coordinates use OpenCV's pixel-center convention everywhere
+      (rendered image, image points, texture warp), so tracked positions in
+      the images agree with the exported image points to sub-pixel accuracy.
+    * Mesh corners 1..4 go around the quad. Direction 1 = corner1 -> corner2,
+      direction 2 = corner1 -> corner4. Normal = (c2-c1) x (c4-c1); cameras must
+      be on the normal side to see the patterned (front) face. Object point
+      index = j*(n1+1) + i (i along direction 1).
+    * Frames are numbered from 1 in file names (matches Image Sequence node's
+      Pattern mode, which substitutes 1..N into a printf pattern).
+
+TIME
+    Simulated time starts at 0. Camera k samples t = start_k + n / fps_k
+    (n = 0, 1, ...) while t <= duration, so cameras may have different frame
+    counts and offsets. Stacked outputs are NaN padded to the longest camera.
+
+OUTPUT FOLDER
+    Held as an ABSOLUTE path while the program runs and converted to a path
+    relative to the project file only when saved (get_params), then converted
+    back on load (set_params). This keeps the folder valid after "Save As".
+
+KNOWN LIMITATIONS
+    Single plane; rigid rotation only; no rolling shutter, motion blur,
+    exposure/vignetting; the four corners are projected onto their best-fit
+    plane (deviation is reported); the quad should be convex.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+import os
+import threading
+import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from tkinter import colorchooser, filedialog, messagebox, ttk
+
+import cv2
+import numpy as np
+
+from node_editor.base_node import BaseNode
+from node_editor.execution import ExecutionMode
+from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.project_context import get_project_directory
+
+
+MAX_CAMERAS = 12
+NUM_SPECKLE_TYPES = 4
+MAX_SPECKLES_PER_TYPE = 1_500_000
+# cameras * points * steps guard. The result arrays hold ~7 float64 values per
+# element (object pts 3, image pts 2, true image pts 2), so 8e6 is ~450 MB.
+MAX_DATA_ELEMENTS = 8_000_000
+SUPERSAMPLE = 8                    # marker supersampling factor
+ARUCO_DICT_CHOICES = ("DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250",
+                      "DICT_4X4_1000", "DICT_5X5_250", "DICT_6X6_250")
+MARKER_TYPE_CHOICES = ("none", "corner", "aruco")
+MOTION_TYPE_CHOICES = ("rotation",)          # extend here for new motions
+IMAGE_FORMAT_CHOICES = ("png", "tif", "bmp", "jpg")
+CAMERA_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b",
+                 "#e377c2", "#17becf", "#bcbd22", "#7f7f7f", "#393b79", "#843c39"]
+
+_HELP_TEXT = """\
+Image/Data Simulator
+====================
+Simulates up to 12 pinhole cameras viewing ONE planar target that rotates
+rigidly about an axis. Outputs ground-truth data pins and, optionally, saves
+rendered images.
+
+Workflow: edit settings (left tabs) -> check wireframe (middle) and 3D
+preview (right) -> press Apply. Apply computes the data immediately (fast),
+updates the output pins, saves <folder>/<data file> and, if "Render images"
+is on, renders images in the background (progress bar + Cancel).
+
+Cameras : position, view direction (camera +z), roll (0 = camera x parallel to
+          the global x-y plane), horizontal FOV, image size, fps, start time
+          (s) and distortion k1 k2 p1 p2 k3 k4 k5 k6.
+Mesh    : 4 corners, cells along the two directions, perspective (homography)
+          or bilinear interpolation of grid points. Points/markers/speckles
+          live on the front face (normal = (c2-c1) x (c4-c1)).
+Markers : none / corner (2x2 checker) / aruco, centerd on every object point.
+Speckles: up to 4 disc types (diameter, count per unit area, colour).
+Motion  : rotation about a center point and axis at a given deg/s.
+
+Outputs (C cameras, P points, S = max frames):
+  rvecs (C,3) tvecs (C,3) cmats (C,3,3) dvecs (C,8) img_sizes (C,2)
+  t_cam (C,S) n_frames (C,)  object_points (C,P,3,S)  image_points (C,P,2,S)
+  image_dir, data_file (strings)
+Arrays are NaN padded after each camera's last frame; use n_frames to trim.
+Image points are NaN when the point is behind the camera, on the back face,
+outside the image (optional) or dropped out (optional random dropout).
+The .npz file additionally holds image_points_true (no noise/dropout) and a
+valid mask (geometric visibility only; it does not include random dropout).
+
+Image files: <folder>/<pattern>.<ext>, pattern fields {cam} and {frame}
+(1-based), e.g. cam{cam:02d}/frame_{frame:05d} -> cam01/frame_00001.png.
+The folder is stored relative to the project file when possible.
+"""
+
+
+# ══ Defaults ═══════════════════════════════════════════════════════════════
+
+def default_camera(index: int) -> dict:
+    if index == 0:
+        pos = [-50, -100, 0]
+    elif index == 1:
+        pos = [50, -100, 0]
+    else:
+        ang = math.radians(45.0 * (index - 2))
+        pos = [200.0 * math.cos(ang), 200.0 * math.sin(ang), 300.0]
+    return {
+        "pos": pos, "view_dir": [-pos[0], -pos[1], -pos[2]], "roll": 0.0,
+        "hfov": 90.0, "width": 1280, "height": 960, "fps": 30.0,
+        "start_time": round(0.1 * index, 6), "dist": [-0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+
+
+def default_speckle_type(i: int) -> dict:
+    presets = [(0.8, 0.4, "#000000", True), (1.5, 0.08, "#000000", True),
+               (0.5, 0.2, "#404040", False), (1.2, 0.05, "#808080", False)]
+    d, rho, col, on = presets[i]
+    return {"enabled": on, "diameter": d, "density": rho, "color": col}
+
+
+def default_settings() -> dict:
+    return {
+        "cameras": [default_camera(0), default_camera(1)],
+        "mesh": {"corners": [[-50.0, 0.0, -30.0], [50.0, 0.0, -30.0],
+                             [50.0, 0.0, 30.0], [-50.0, 0.0, 30.0]],
+                 "n1": 8, "n2": 5, "perspective": True,
+                 "surface_color": "#f2f2f2", "background_color": "#303030",
+                 "back_color": "#808080"},
+        "markers": {"type": "aruco", "size": 6.0, "aruco_dict": "DICT_4X4_250", "first_id": 0},
+        "speckles": {"seed": 1, "ppu": 0.0, "max_mp": 16.0,
+                     "types": [default_speckle_type(i) for i in range(NUM_SPECKLE_TYPES)]},
+        "motion": {"type": "rotation", "center": [0.0, 0.0, 0.0],
+                   "axis": [0.0, 0.0, 1.0], "omega": 8.0, "duration": 5.0},
+        "output": {"folder": "", "data_filename": "sim_data.npz", "image_format": "png",
+                   "filename_pattern": "cam{cam:02d}/frame_{frame:05d}",
+                   "render_images": False, "grayscale": False, "image_noise": 0.0,
+                   "point_noise": 0.0, "dropout_prob": 0.0, "nan_outside": True,
+                   "threads": 4, "seed": 12345},
+    }
+
+
+def normalize_settings(saved) -> dict:
+    """Merge saved settings over defaults so older/partial files still load."""
+    s = default_settings()
+    if not isinstance(saved, dict):
+        return s
+    for section in ("mesh", "markers", "speckles", "motion", "output"):
+        if isinstance(saved.get(section), dict):
+            for k, v in saved[section].items():
+                if k in s[section]:
+                    s[section][k] = v
+    sp_saved = saved.get("speckles")
+    types = sp_saved.get("types") if isinstance(sp_saved, dict) else None
+    if isinstance(types, list):
+        merged = [{**default_speckle_type(i), **t} for i, t in enumerate(types[:NUM_SPECKLE_TYPES])
+                  if isinstance(t, dict)]
+        while len(merged) < NUM_SPECKLE_TYPES:
+            merged.append(default_speckle_type(len(merged)))
+        s["speckles"]["types"] = merged
+    else:
+        s["speckles"]["types"] = [default_speckle_type(i) for i in range(NUM_SPECKLE_TYPES)]
+    cams = saved.get("cameras")
+    if isinstance(cams, list) and cams:
+        merged = [{**default_camera(i), **c} for i, c in enumerate(cams[:MAX_CAMERAS])
+                  if isinstance(c, dict)]
+        for cam in merged:
+            dist = list(cam.get("dist", []))[:8]
+            dist += [0.0] * (8 - len(dist))    # pad older 5-coefficient saves with zeros
+            cam["dist"] = dist
+        if merged:
+            s["cameras"] = merged
+    return s
+
+
+# ══ Geometry helpers (pure functions, no Tk) ═══════════════════════════════
+
+def _unit(v, fallback=None):
+    v = np.asarray(v, dtype=float).ravel()
+    n = np.linalg.norm(v)
+    if not np.isfinite(n) or n < 1e-12:
+        return None if fallback is None else np.asarray(fallback, dtype=float)
+    return v / n
+
+
+def axis_angle_matrices(axis, angles) -> np.ndarray:
+    """Rodrigues rotation matrices, vectorised over angles: (n,3,3)."""
+    angles = np.atleast_1d(np.asarray(angles, dtype=float))
+    k = _unit(axis)
+    if k is None:
+        return np.repeat(np.eye(3)[None], len(angles), axis=0)
+    kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    s = np.sin(angles)[:, None, None]
+    c = np.cos(angles)[:, None, None]
+    return np.eye(3)[None] + s * kx[None] + (1.0 - c) * (kx @ kx)[None]
+
+
+def rotation_for_times(motion: dict, times) -> np.ndarray:
+    times = np.atleast_1d(np.asarray(times, dtype=float))
+    if motion.get("type", "rotation") != "rotation":
+        return np.repeat(np.eye(3)[None], len(times), axis=0)
+    return axis_angle_matrices(motion["axis"], math.radians(float(motion["omega"])) * times)
+
+
+def camera_extrinsics(pos, view_dir, roll_deg):
+    """(rvec(3,), tvec(3,), R(3,3)) for a camera at `pos` looking along
+    `view_dir`. See the module docstring for the roll convention."""
+    d = _unit(view_dir, fallback=(0.0, 0.0, -1.0))
+    up = np.array([0.0, 0.0, 1.0])
+    up_perp = up - (up @ d) * d
+    if np.linalg.norm(up_perp) < 1e-6:          # looking straight along +-z
+        up = np.array([0.0, 1.0, 0.0])
+        up_perp = up - (up @ d) * d
+    y_c = -_unit(up_perp)                        # image "down"
+    x_c = np.cross(y_c, d)                       # image "right" (x = y cross z)
+    r = math.radians(float(roll_deg))
+    x_r = math.cos(r) * x_c + math.sin(r) * y_c
+    y_r = -math.sin(r) * x_c + math.cos(r) * y_c
+    R = np.column_stack([x_r, y_r, d]).T         # world -> camera
+    C = np.asarray(pos, dtype=float)
+    t = -R @ C
+    return cv2.Rodrigues(R)[0].ravel(), t, R
+
+
+def camera_matrix(width, height, hfov_deg) -> np.ndarray:
+    f = (width / 2.0) / math.tan(math.radians(float(hfov_deg)) / 2.0)
+    return np.array([[f, 0.0, (width - 1) / 2.0], [0.0, f, (height - 1) / 2.0], [0.0, 0.0, 1.0]])
+
+
+def camera_model(cam: dict) -> dict:
+    rvec, t, R = camera_extrinsics(cam["pos"], cam["view_dir"], cam["roll"])
+    w, h = int(cam["width"]), int(cam["height"])
+    return {"rvec": rvec, "t": t, "R": R, "K": camera_matrix(w, h, cam["hfov"]),
+            "dvec": np.asarray(cam["dist"], dtype=float).reshape(8),
+            "C": np.asarray(cam["pos"], dtype=float), "w": w, "h": h}
+
+
+def project_points(pts, model):
+    """Project world points; returns (uv (N,2) with NaN where the point is
+    not in front of the camera, front-mask (N,))."""
+    pts = np.asarray(pts, dtype=float).reshape(-1, 3)
+    uv = np.full((len(pts), 2), np.nan)
+    front = (pts @ model["R"][2] + model["t"][2]) > 1e-9
+    if front.any():
+        proj, _ = cv2.projectPoints(pts[front].reshape(-1, 1, 3), model["rvec"].reshape(3, 1),
+                                    model["t"].reshape(3, 1), model["K"], model["dvec"])
+        uv[front] = proj.reshape(-1, 2)
+    return uv, front
+
+
+def camera_frame_times(cam: dict, duration: float) -> np.ndarray:
+    fps, t0 = float(cam["fps"]), float(cam["start_time"])
+    if fps <= 0 or t0 > duration:
+        return np.zeros(0)
+    n = int(math.floor((duration - t0) * fps + 1e-9)) + 1
+    return t0 + np.arange(n) / fps
+
+
+def _unit_square_to_quad(q: np.ndarray) -> np.ndarray:
+    """Projective map (u,v) in the unit square -> quad q (4,2) (Heckbert).
+    Returns coefficients a..h with x=(au+bv+c)/(gu+hv+1), y=(du+ev+f)/(gu+hv+1).
+    This is what makes the interpolation "perspective": equal steps in (u,v)
+    become perspective-foreshortened cells on a trapezoid. For parallelograms
+    g = h = 0 and it reduces to the affine (= bilinear) map."""
+    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = q
+    sx, sy = x0 - x1 + x2 - x3, y0 - y1 + y2 - y3
+    if abs(sx) < 1e-12 and abs(sy) < 1e-12:
+        g = h = 0.0
+    else:
+        dx1, dx2, dy1, dy2 = x1 - x2, x3 - x2, y1 - y2, y3 - y2
+        det = dx1 * dy2 - dx2 * dy1
+        if abs(det) < 1e-12:
+            raise ValueError("degenerate quadrilateral (collinear corners)")
+        g = (sx * dy2 - dx2 * sy) / det
+        h = (dx1 * sy - sx * dy1) / det
+    return np.array([x1 - x0 + g * x1, x3 - x0 + h * x3, x0,
+                     y1 - y0 + g * y1, y3 - y0 + h * y3, y0, g, h])
+
+
+def mesh_uv_to_world(mesh: dict, uv):
+    """Map (u,v) in [0,1]^2 to (world points (M,3), plane coords (M,2))."""
+    uv = np.asarray(uv, dtype=float).reshape(-1, 2)
+    u, v = uv[:, 0], uv[:, 1]
+    if mesh["coef"] is not None:
+        a, b, c, d, e, f, g, h = mesh["coef"]
+        w = g * u + h * v + 1.0
+        x, y = (a * u + b * v + c) / w, (d * u + e * v + f) / w
+    else:
+        q = mesh["q"]
+        wgt = [(1 - u) * (1 - v), u * (1 - v), u * v, (1 - u) * v]
+        x = sum(wk * q[k, 0] for k, wk in enumerate(wgt))
+        y = sum(wk * q[k, 1] for k, wk in enumerate(wgt))
+    pts = mesh["origin"] + x[:, None] * mesh["e1"] + y[:, None] * mesh["e2"]
+    return pts, np.column_stack([x, y])
+
+
+def build_mesh(cfg: dict) -> dict:
+    c = np.asarray(cfg["corners"], dtype=float).reshape(4, 3)
+    n1, n2 = int(cfg["n1"]), int(cfg["n2"])
+    if n1 < 1 or n2 < 1:
+        raise ValueError("cell counts must be >= 1")
+    n_ref = np.cross(c[1] - c[0], c[3] - c[0])
+    if np.linalg.norm(n_ref) < 1e-12:
+        raise ValueError("corners 1, 2 and 4 are collinear")
+    centroid = c.mean(axis=0)
+    normal = np.linalg.svd(c - centroid)[2][2]          # best-fit plane normal
+    if normal @ n_ref < 0:
+        normal = -normal
+    dev = (c - centroid) @ normal                        # out-of-plane deviation
+    cp = c - dev[:, None] * normal                       # corners projected on the plane
+    e1 = _unit(cp[1] - cp[0])
+    if e1 is None:
+        raise ValueError("corners 1 and 2 coincide")
+    e2 = np.cross(normal, e1)
+    origin = cp[0]
+    q = np.column_stack([(cp - origin) @ e1, (cp - origin) @ e2])
+    area = 0.5 * abs(np.dot(q[:, 0], np.roll(q[:, 1], -1)) - np.dot(q[:, 1], np.roll(q[:, 0], -1)))
+    if area < 1e-12:
+        raise ValueError("degenerate quadrilateral (zero area)")
+    mesh = {"corners": cp, "q": q, "origin": origin, "e1": e1, "e2": e2, "normal": normal,
+            "n1": n1, "n2": n2, "dev_max": float(np.abs(dev).max()),
+            "coef": _unit_square_to_quad(q) if cfg["perspective"] else None}
+    UU, VV = np.meshgrid(np.arange(n1 + 1) / n1, np.arange(n2 + 1) / n2)
+    pts, pts2 = mesh_uv_to_world(mesh, np.column_stack([UU.ravel(), VV.ravel()]))
+    grid = pts.reshape(n2 + 1, n1 + 1, 3)
+    spacing = [np.linalg.norm(np.diff(grid, axis=1), axis=2).min(),
+               np.linalg.norm(np.diff(grid, axis=0), axis=2).min()]
+    mesh.update(points=pts, points2d=pts2, spacing_min=float(min(spacing)))
+    return mesh
+
+
+# ══ Data simulation (fast, vectorised) ═════════════════════════════════════
+
+def simulate_data(settings: dict) -> dict:
+    """Compute cameras, object-point history and image-point history."""
+    cams, motion, out = settings["cameras"], settings["motion"], settings["output"]
+    mesh = build_mesh(settings["mesh"])
+    P = len(mesh["points"])
+    center = np.asarray(motion["center"], dtype=float)
+    times = [camera_frame_times(c, float(motion["duration"])) for c in cams]
+    C = len(cams)
+    S = max((len(t) for t in times), default=0)
+    if C * P * max(S, 1) > MAX_DATA_ELEMENTS:
+        raise ValueError(f"data set too large ({C} cameras x {P} points x {S} steps); "
+                         "reduce duration, fps or the number of points")
+    nan = np.nan
+    res = {"rvecs": np.zeros((C, 3)), "tvecs": np.zeros((C, 3)), "cmats": np.zeros((C, 3, 3)),
+           "dvecs": np.zeros((C, 8)), "img_sizes": np.zeros((C, 2)),
+           "t_cam": np.full((C, S), nan), "n_frames": np.zeros(C, dtype=np.int64),
+           "object_points": np.full((C, P, 3, S), nan),
+           "image_points": np.full((C, P, 2, S), nan),
+           "image_points_true": np.full((C, P, 2, S), nan),
+           "valid": np.zeros((C, P, S), dtype=bool),
+           "fps": np.array([c["fps"] for c in cams], dtype=float),
+           "start_times": np.array([c["start_time"] for c in cams], dtype=float),
+           "mesh_cells": np.array([mesh["n1"], mesh["n2"]])}
+    rng = np.random.default_rng(int(out["seed"]))
+    sigma, p_drop = float(out["point_noise"]), float(out["dropout_prob"])
+    for k, cam in enumerate(cams):
+        m = camera_model(cam)
+        res["rvecs"][k], res["tvecs"][k], res["cmats"][k], res["dvecs"][k] = m["rvec"], m["t"], m["K"], m["dvec"]
+        res["img_sizes"][k] = (m["w"], m["h"])
+        t = times[k]
+        n = len(t)
+        res["n_frames"][k] = n
+        if n == 0:
+            continue
+        res["t_cam"][k, :n] = t
+        Rs = rotation_for_times(motion, t)
+        X = center + np.einsum("nij,pj->npi", Rs, mesh["points"] - center)        # (n,P,3)
+        res["object_points"][k, :, :, :n] = X.transpose(1, 2, 0)
+        uv, front = project_points(X.reshape(-1, 3), m)
+        uv, front = uv.reshape(n, P, 2), front.reshape(n, P)
+        n_t = np.einsum("nij,j->ni", Rs, mesh["normal"])
+        o_t = center + np.einsum("nij,j->ni", Rs, mesh["origin"] - center)
+        facing = np.einsum("ni,ni->n", n_t, m["C"][None, :] - o_t) > 0            # front face seen
+        valid = front & facing[:, None]
+        if out["nan_outside"]:
+            with np.errstate(invalid="ignore"):
+                valid &= ((uv[..., 0] >= 0) & (uv[..., 0] <= m["w"] - 1)
+                          & (uv[..., 1] >= 0) & (uv[..., 1] <= m["h"] - 1))
+        uv_true = np.where(valid[..., None], uv, nan)
+        noisy = uv_true.copy()
+        if sigma > 0:
+            noisy += rng.normal(0.0, sigma, noisy.shape)      # NaN stays NaN
+        if p_drop > 0:
+            noisy[rng.random((n, P)) < p_drop] = nan          # simulated tracking loss
+        res["image_points"][k, :, :, :n] = noisy.transpose(1, 2, 0)
+        res["image_points_true"][k, :, :, :n] = uv_true.transpose(1, 2, 0)
+        res["valid"][k, :, :n] = valid.T
+    return res
+
+
+def save_results_npz(path: str, res: dict, settings: dict) -> None:
+    np.savez_compressed(path, settings_json=np.array(json.dumps(settings)), **res)
+
+
+# ══ Texture construction and rendering (no Tk; safe on worker threads) ═════
+
+def texture_geometry(mesh: dict, settings: dict) -> dict:
+    """Choose texture resolution (texels per world unit, `ppu`).
+    Auto rule: >= 5 texels across the smallest speckle, >= 4 texels per
+    ArUco cell (8 per corner marker), capped by the max-megapixel setting.
+    Dimensions are multiples of 64 so the mipmap pyramid halves exactly."""
+    q = mesh["q"]
+    a0, b1 = float(q[:, 0].min()), float(q[:, 1].max())
+    wu, hu = float(q[:, 0].max()) - a0, b1 - float(q[:, 1].min())
+    sp, mk = settings["speckles"], settings["markers"]
+    need = []
+    diam = [t["diameter"] for t in sp["types"] if t["enabled"] and t["diameter"] > 0 and t["density"] > 0]
+    if diam:
+        need.append(5.0 / min(diam))
+    if mk["type"] == "aruco" and mk["size"] > 0:
+        need.append(4.0 * (int(mk["aruco_dict"].split("_")[1][0]) + 2) / mk["size"])
+    elif mk["type"] == "corner" and mk["size"] > 0:
+        need.append(8.0 / mk["size"])
+    auto_ppu = max(need) if need else 1000.0 / max(wu, hu, 1e-9)
+    ppu = float(sp["ppu"]) if float(sp["ppu"]) > 0 else auto_ppu
+    reduced = False
+    if wu * hu * ppu * ppu > float(sp["max_mp"]) * 1e6:
+        ppu, reduced = math.sqrt(float(sp["max_mp"]) * 1e6 / (wu * hu)), True
+    tex_w = max(64, int(math.ceil(wu * ppu / 64.0)) * 64)
+    tex_h = max(64, int(math.ceil(hu * ppu / 64.0)) * 64)
+    return {"a0": a0, "b1": b1, "ppu": ppu, "tex_w": tex_w, "tex_h": tex_h,
+            "reduced": reduced, "auto_ppu": auto_ppu}
+
+
+def _aruco_cells(name: str, marker_id: int, bits: int) -> np.ndarray:
+    """(bits+2)x(bits+2) array, one pixel per cell incl. the black border."""
+    aruco = getattr(cv2, "aruco", None)
+    if aruco is None:
+        raise RuntimeError("cv2.aruco is not available (install opencv-contrib-python or OpenCV >= 4.7)")
+    dictionary = aruco.getPredefinedDictionary(getattr(aruco, name))
+    if hasattr(aruco, "generateImageMarker"):
+        return aruco.generateImageMarker(dictionary, marker_id, bits + 2, borderBits=1)
+    return aruco.drawMarker(dictionary, marker_id, bits + 2, borderBits=1)
+
+
+def _stamp_marker(bgr, cx, cy, white_half, black_rects):
+    """Stamp an opaque white square (half-size `white_half` texels) with black
+    rectangles onto the texture at sub-texel accuracy. Drawing happens on an
+    8x supersampled patch (no anti-aliasing seams between adjacent cells) that
+    is box-filtered down and alpha-composited; positions are quantised to
+    1/8 texel. Coordinates use the texel-EDGE convention (texel i spans [i,i+1))."""
+    H, W = bgr.shape[:2]
+    pw = int(math.ceil(2 * white_half)) + 4
+    ox, oy = int(math.floor(cx - pw / 2)), int(math.floor(cy - pw / 2))
+    ss = lambda v, o: int(round((v - o) * SUPERSAMPLE))
+    big = pw * SUPERSAMPLE
+    gray = np.full((big, big), 255, np.uint8)
+    cover = np.zeros((big, big), np.uint8)
+    cv2.rectangle(cover, (ss(cx - white_half, ox), ss(cy - white_half, oy)),
+                  (ss(cx + white_half, ox) - 1, ss(cy + white_half, oy) - 1), 255, -1)
+    for x0, y0, x1, y1 in black_rects:
+        cv2.rectangle(gray, (ss(x0, ox), ss(y0, oy)), (ss(x1, ox) - 1, ss(y1, oy) - 1), 0, -1)
+    gray = cv2.resize(gray, (pw, pw), interpolation=cv2.INTER_AREA)
+    cover = cv2.resize(cover, (pw, pw), interpolation=cv2.INTER_AREA)
+    x_lo, y_lo, x_hi, y_hi = max(0, ox), max(0, oy), min(W, ox + pw), min(H, oy + pw)
+    if x_hi <= x_lo or y_hi <= y_lo:
+        return
+    sl = (slice(y_lo - oy, y_hi - oy), slice(x_lo - ox, x_hi - ox))
+    a = (cover[sl].astype(np.float32) / 255.0)[..., None]
+    g = gray[sl].astype(np.float32)[..., None]
+    roi = bgr[y_lo:y_hi, x_lo:x_hi].astype(np.float32)
+    bgr[y_lo:y_hi, x_lo:x_hi] = np.clip(roi * (1 - a) + g * a, 0, 255).astype(np.uint8)
+
+
+def build_texture(mesh: dict, job: dict, geo: dict, cancel: threading.Event) -> np.ndarray:
+    """Premultiplied BGRA texture in plane coordinates. Texture x = +e1,
+    texture y = -e2, so the image looks correct (not mirrored) when viewed
+    from the normal side. Texel (px,py) covers plane coords
+    a0+px/ppu .. and b1-py/ppu .. (texel-edge convention)."""
+    S = job["settings"]
+    h, w, ppu, a0, b1 = geo["tex_h"], geo["tex_w"], geo["ppu"], geo["a0"], geo["b1"]
+    bgr = np.empty((h, w, 3), np.uint8)
+    bgr[:] = job["surface_bgr"]
+
+    # Speckles: uniform random discs; count = density * area. Drawn with
+    # anti-aliased sub-texel circles (cv2 fixed-point shift = 4). Later types
+    # are drawn on top of earlier ones.
+    area = w * h / (ppu * ppu)
+    for ti, sp in enumerate(S["speckles"]["types"]):
+        if cancel.is_set():
+            break
+        if not sp["enabled"] or sp["diameter"] <= 0 or sp["density"] <= 0:
+            continue
+        n = min(int(round(sp["density"] * area)), MAX_SPECKLES_PER_TYPE)
+        rng = np.random.default_rng([abs(int(S["speckles"]["seed"])), ti])
+        cx = np.round((rng.uniform(0, w, n) - 0.5) * 16).astype(np.int64).tolist()
+        cy = np.round((rng.uniform(0, h, n) - 0.5) * 16).astype(np.int64).tolist()
+        r16 = max(1, int(round(0.5 * sp["diameter"] * ppu * 16)))
+        col = tuple(int(c) for c in job["speckle_bgr"][ti])
+        for x, y in zip(cx, cy):
+            cv2.circle(bgr, (x, y), r16, col, -1, cv2.LINE_AA, 4)
+
+    # Markers: centerd on every object point, axis-aligned in plane coords.
+    mk = S["markers"]
+    if mk["type"] != "none" and mk["size"] > 0:
+        size = float(mk["size"])
+        if mk["type"] == "aruco":
+            bits = int(mk["aruco_dict"].split("_")[1][0])
+            dict_size = int(mk["aruco_dict"].split("_")[2])
+            cell = size / (bits + 2) * ppu
+        for idx, (a, b) in enumerate(mesh["points2d"]):
+            if cancel.is_set():
+                break
+            cx, cy = (a - a0) * ppu, (b1 - b) * ppu
+            if mk["type"] == "corner":
+                hf = 0.5 * size * ppu
+                _stamp_marker(bgr, cx, cy, hf, [(cx - hf, cy - hf, cx, cy), (cx, cy, cx + hf, cy + hf)])
+            else:
+                cells = _aruco_cells(mk["aruco_dict"], (int(mk["first_id"]) + idx) % dict_size, bits)
+                total = (bits + 2) * cell
+                x0, y0 = cx - total / 2, cy - total / 2
+                rects = [(x0 + i * cell, y0 + j * cell, x0 + (i + 1) * cell, y0 + (j + 1) * cell)
+                         for j, i in zip(*np.nonzero(cells == 0))]
+                _stamp_marker(bgr, cx, cy, total / 2 + cell, rects)     # + 1 cell quiet zone
+
+    # Alpha = quad footprint (anti-aliased), then premultiply so bilinear
+    # sampling / mipmapping does not bleed background colour into the edges.
+    mask = np.zeros((h, w), np.uint8)
+    q = mesh["q"]
+    poly = np.column_stack([(q[:, 0] - a0) * ppu, (b1 - q[:, 1]) * ppu])
+    cv2.fillConvexPoly(mask, np.round((poly - 0.5) * 16).astype(np.int32), 255, cv2.LINE_AA, 4)
+    tex = np.empty((h, w, 4), np.uint8)
+    tex[..., :3] = cv2.multiply(bgr, cv2.merge([mask, mask, mask]), scale=1.0 / 255.0)
+    tex[..., 3] = mask
+    return tex
+
+
+def build_pyramid(tex: np.ndarray) -> list:
+    """Mipmap pyramid. Texture sizes are multiples of 64, so at most 5 exact
+    halvings are possible (6 levels); the render code's level->level0
+    coordinate mapping assumes every halving is exact."""
+    levels = [tex]
+    while min(levels[-1].shape[:2]) >= 64 and len(levels) < 6:
+        p = levels[-1]
+        levels.append(cv2.resize(p, (p.shape[1] // 2, p.shape[0] // 2), interpolation=cv2.INTER_AREA))
+    return levels
+
+
+def make_camera_context(cam: dict) -> dict:
+    m = camera_model(cam)
+    m["ideal_h"] = None
+    if np.any(m["dvec"] != 0):
+        # Cache "distorted pixel -> ideal (undistorted) pixel" once per camera.
+        xs, ys = np.meshgrid(np.arange(m["w"]), np.arange(m["h"]))
+        pts = np.column_stack([xs.ravel(), ys.ravel()]).astype(np.float64).reshape(-1, 1, 2)
+        und = cv2.undistortPoints(pts, m["K"], m["dvec"], P=m["K"]).reshape(-1, 2)
+        m["ideal_h"] = np.vstack([und.T, np.ones(len(und))])
+    return m
+
+
+def render_frame(pyr, geo, mesh, ctx, motion, t, job) -> np.ndarray:
+    """Render one BGR frame of the target at simulated time t."""
+    w, h, K, R, tv = ctx["w"], ctx["h"], ctx["K"], ctx["R"], ctx["t"]
+    bg = np.array(job["background_bgr"], np.uint8)
+    Rm = rotation_for_times(motion, [t])[0]
+    c = np.asarray(motion["center"], dtype=float)
+    O_t = c + Rm @ (mesh["origin"] - c)
+    e1, e2, n_t = Rm @ mesh["e1"], Rm @ mesh["e2"], Rm @ mesh["normal"]
+    q = mesh["q"]
+    corners = O_t + q[:, 0:1] * e1 + q[:, 1:2] * e2
+    if (corners @ R[2] + tv[2]).min() <= 1e-6:   # plane crosses the camera plane:
+        return np.full((h, w, 3), bg, np.uint8)  # homography would mirror it -> background only
+    ppu, a0, b1 = geo["ppu"], geo["a0"], geo["b1"]
+    # texel (0,0) center in world; texel axes in world (half-texel offsets keep
+    # the pixel-center convention consistent with projectPoints).
+    P0 = O_t + (a0 + 0.5 / ppu) * e1 + (b1 - 0.5 / ppu) * e2
+    H = K @ np.column_stack([R @ (e1 / ppu), R @ (-e2 / ppu), R @ P0 + tv])
+
+    # Mipmap level from the local texel->pixel scale at the texture center.
+    X = H @ np.array([geo["tex_w"] / 2.0, geo["tex_h"] / 2.0, 1.0])
+    J = (H[:2, :2] * X[2] - np.outer(X[:2], H[2, :2])) / (X[2] * X[2])
+    scale = math.sqrt(abs(np.linalg.det(J)))
+    level = 0
+    if 0 < scale < 1.0:
+        level = min(len(pyr) - 1, int(math.floor(math.log2(1.0 / scale))))
+    s = 2.0 ** level
+    H_L = H @ np.array([[s, 0, 0.5 * s - 0.5], [0, s, 0.5 * s - 0.5], [0, 0, 1.0]])
+
+    if ctx["ideal_h"] is None:
+        warped = cv2.warpPerspective(pyr[level], H_L, (w, h), flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+    else:
+        res = np.linalg.inv(H_L) @ ctx["ideal_h"]
+        mx = (res[0] / res[2]).reshape(h, w).astype(np.float32)
+        my = (res[1] / res[2]).reshape(h, w).astype(np.float32)
+        warped = cv2.remap(pyr[level], mx, my, cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+    alpha = warped[..., 3:4].astype(np.uint16)
+    if float(n_t @ (ctx["C"] - O_t)) <= 0:       # back face: plain colour, no pattern
+        fg = (np.array(job["back_bgr"], np.uint16)[None, None, :] * alpha + 127) // 255
+    else:
+        fg = warped[..., :3].astype(np.uint16)
+    bgpart = (bg.astype(np.uint16)[None, None, :] * (255 - alpha) + 127) // 255
+    return np.minimum(fg + bgpart, 255).astype(np.uint8)
+
+
+def _render_one(pyr, geo, mesh, ctx, S, job, k, n, t, state):
+    if state["cancel"].is_set():
+        return
+    out = S["output"]
+    img = render_frame(pyr, geo, mesh, ctx, S["motion"], t, job)
+    if out["grayscale"]:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    sigma = float(out["image_noise"])
+    if sigma > 0:                                 # per-frame seed: reproducible, thread-safe
+        rng = np.random.default_rng([abs(int(out["seed"])), k, n])
+        img = np.clip(np.rint(img.astype(np.float32) + rng.normal(0, sigma, img.shape)), 0, 255).astype(np.uint8)
+    name = out["filename_pattern"].format(cam=k + 1, frame=n + 1) + "." + out["image_format"]
+    path = os.path.join(job["folder"], name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ok, buf = cv2.imencode("." + out["image_format"], img)   # imencode: safe for non-ASCII paths
+    if not ok:
+        raise RuntimeError(f"cannot encode {name}")
+    with open(path, "wb") as fh:
+        fh.write(buf.tobytes())
+    with state["lock"]:
+        state["done"] += 1
+
+
+def _render_worker(job: dict, state: dict) -> None:
+    """Runs on a background thread; never touches Tk."""
+    try:
+        S = job["settings"]
+        mesh = build_mesh(S["mesh"])
+        state["phase"] = "building texture"
+        geo = texture_geometry(mesh, S)
+        pyr = build_pyramid(build_texture(mesh, job, geo, state["cancel"]))
+        os.makedirs(job["folder"], exist_ok=True)
+        state["phase"] = "rendering"
+        for k, cam in enumerate(S["cameras"]):
+            if state["cancel"].is_set():
+                break
+            ctx = make_camera_context(cam)     # one camera's distortion map at a time (memory)
+            with ThreadPoolExecutor(max_workers=max(1, int(S["output"]["threads"]))) as ex:
+                futures = [ex.submit(_render_one, pyr, geo, mesh, ctx, S, job, k, n, float(t), state)
+                           for n, t in enumerate(job["times"][k])]
+                for f in as_completed(futures):
+                    exc = f.exception()
+                    if exc is not None:
+                        state["cancel"].set()
+                        raise exc
+    except Exception as e:                      # reported to the UI thread by the poller
+        state["error"] = f"{type(e).__name__}: {e}"
+        state["cancel"].set()
+    finally:
+        state["finished"] = True
+
+
+# ══ Node ═══════════════════════════════════════════════════════════════════
+
+def _fmt(v) -> str:
+    return f"{v:.10g}" if isinstance(v, float) else str(v)
+
+
+class ImageDataSimulatorNode(BaseNode):
+    """Source node: multi-camera image/data simulator. See module docstring."""
+
+    EXECUTION_MODE = ExecutionMode.SYNC
+    NODE_TYPE = "image_data_simulator"
+    DISPLAY_NAME = "Image/Data Simulator"
+    CATEGORY = "source"
+    SEARCH_KEYWORDS = ("simulator", "synthetic", "camera", "speckle", "aruco", "stereo",
+                       "rotation", "image points", "rvec", "tvec", "test data")
+    NODE_WIDTH = 230
+    NODE_HEIGHT = 110
+    HELP_TEXT = _HELP_TEXT
+
+    def __init__(self, node_id: str, canvas: tk.Canvas):
+        super().__init__(node_id, canvas)
+        # Trial settings are edited freely in the inspector (and drive the
+        # previews); only Apply copies them to the applied settings that feed
+        # the outputs, the saved files and the project file.
+        self._trial = default_settings()
+        self._applied = copy.deepcopy(self._trial)
+        self._results: dict | None = None
+        self._sim_error: str | None = None
+        self._render_state: dict | None = None
+        self._poll_after_id = None
+        self._destroyed = False
+        self._status_item = None
+        self._cam_idx = 0
+        self._preview_time = 0.0
+        self._v3 = {"yaw": -0.9, "pitch": 0.7, "zoom": 1.0, "target": [0.0, 0.0, 0.0],
+                    "dragging": False, "button": None, "last_x": 0, "last_y": 0, "last_scale": 1.0}
+        self._v3_centered = False
+        self._mesh_key = None
+        self._mesh_cache = None
+        self._reset_inspector_refs()
+
+    def _reset_inspector_refs(self) -> None:
+        self._fields: list = []
+        self._cam_combo = self._time_scale = self._time_var = None
+        self._dirty_label = self._apply_btn = self._cancel_btn = None
+        self._progress = self._progress_var = None
+        self._c2d = self._c3d = self._persp_var = None
+        self._cam_info_var = self._mesh_info_var = self._marker_info_var = None
+        self._tex_info_var = self._folder_var = None
+        self._help_popup = None
+
+    # ── pins ────────────────────────────────────────────────────────────
+    def get_pin_schema(self) -> PinSchema:
+        return PinSchema(inputs=[], outputs=[
+            PinDef("rvecs", PinType.ARRAY, "rvecs"), PinDef("tvecs", PinType.ARRAY, "tvecs"),
+            PinDef("cmats", PinType.ARRAY, "cmats"), PinDef("dvecs", PinType.ARRAY, "dvecs"),
+            PinDef("img_sizes", PinType.ARRAY, "imgSizes"), PinDef("t_cam", PinType.ARRAY, "t_cam"),
+            PinDef("n_frames", PinType.ARRAY, "nFrames"),
+            PinDef("object_points", PinType.ARRAY, "objPts"),
+            PinDef("image_points", PinType.ARRAY, "imgPts"),
+            PinDef("image_dir", PinType.STRING, "imgDir"), PinDef("data_file", PinType.STRING, "dataFile"),
+        ])
+
+    # ── compute: cheap, returns cached ground truth ─────────────────────
+    def compute(self, inputs: dict) -> dict:
+        # The engine may call compute() often (trigger_all); simulation runs
+        # only when nothing is cached (e.g. right after loading a project --
+        # the data is deterministic given the applied settings and the seed).
+        if self._results is None:
+            try:
+                self._results, self._sim_error = simulate_data(self._applied), None
+            except Exception as e:
+                self._sim_error = f"{type(e).__name__}: {e}"
+                self._update_node_status()
+                return {}
+        r = self._results
+        folder = self._output_folder_abs(self._applied)
+        self._update_node_status()
+        return {"rvecs": r["rvecs"], "tvecs": r["tvecs"], "cmats": r["cmats"], "dvecs": r["dvecs"],
+                "img_sizes": r["img_sizes"], "t_cam": r["t_cam"], "n_frames": r["n_frames"],
+                "object_points": r["object_points"], "image_points": r["image_points"],
+                "image_dir": folder, "data_file": self._data_path(self._applied) if folder else ""}
+
+    # ── serialization (applied settings only; folder stored relative) ───
+    def get_params(self) -> dict:
+        p = copy.deepcopy(self._applied)
+        f = p["output"]["folder"]
+        if f:
+            base = self._get_project_base()
+            p["output"]["folder"] = self._to_relative(self._to_absolute(f, base), base)
+        return {"settings": p}
+
+    def set_params(self, params: dict) -> None:
+        self._applied = normalize_settings(params.get("settings"))
+        f = self._applied["output"]["folder"]
+        if f:   # relative (as saved) -> absolute against the current project file
+            self._applied["output"]["folder"] = self._to_absolute(f, self._get_project_base())
+        self._trial = copy.deepcopy(self._applied)
+        self._results, self._sim_error = None, None
+        self._cam_idx = 0
+
+    # ── paths (same relative-path concept as Image Sequence) ────────────
+    @staticmethod
+    def _get_project_base():
+        return get_project_directory()
+
+    @staticmethod
+    def _to_relative(path: str, base) -> str:
+        if not path or base is None:
+            return path
+        try:
+            return os.path.relpath(str(path), str(base))
+        except Exception:
+            return path
+
+    @staticmethod
+    def _to_absolute(path: str, base) -> str:
+        p = Path(path)
+        if p.is_absolute() or base is None:
+            return str(p)
+        return str((Path(base) / p).resolve())
+
+    def _output_folder_abs(self, settings: dict) -> str:
+        f = settings["output"]["folder"]
+        return self._to_absolute(f, self._get_project_base()) if f else ""
+
+    def _data_path(self, settings: dict) -> str:
+        name = settings["output"]["data_filename"].strip() or "sim_data.npz"
+        if not name.lower().endswith(".npz"):
+            name += ".npz"
+        return os.path.join(self._output_folder_abs(settings), name)
+
+    # ── node face ───────────────────────────────────────────────────────
+    def _status_text(self) -> str:
+        st = self._render_state
+        if st is not None and not st["finished"]:
+            return f"rendering {st['done']}/{st['total']}"
+        if self._sim_error:
+            return "error: " + self._sim_error[:34]
+        if self._results is None:
+            return "not simulated yet"
+        r = self._results
+        return f"{len(r['n_frames'])} cams, {r['object_points'].shape[1]} pts, {r['t_cam'].shape[1]} steps"
+
+    def _update_node_status(self) -> None:
+        if self._status_item is not None:
+            try:
+                self.canvas.itemconfig(self._status_item, text=self._status_text())
+            except tk.TclError:
+                pass
+
+    def build_body(self) -> None:
+        x, y, w, h = self.x, self.y, self.width, self.height
+        self._body_rect = self.canvas.create_rectangle(x, y, x + w, y + h, fill="#e9efe3",
+                                                       outline="#5a7a3a", width=2, tags=(self.node_id,))
+        self._title_item = self.canvas.create_text(x + w / 2, y + 13, text=self.get_canvas_title(),
+                                                   font=("Arial", 9, "bold"), fill="#26381a", tags=(self.node_id,))
+        self._status_item = self.canvas.create_text(x + w / 2, y + h - 12, text=self._status_text(),
+                                                    font=("Arial", 7), fill="#456", tags=(self.node_id,))
+        self._canvas_items += [self._body_rect, self._title_item, self._status_item]
+
+    def on_resize(self, old_width, old_height, new_width, new_height) -> None:
+        if self._status_item is not None:
+            self.canvas.coords(self._status_item, self.x + new_width / 2, self.y + new_height - 12)
+
+    # ── settings access used by the field widgets ───────────────────────
+    def _resolve(self, path):
+        node = self._trial
+        for key in path[:-1]:
+            node = self._trial["cameras"][self._cam_idx] if key == "@cam" else node[key]
+        return node, path[-1]
+
+    def _get_value(self, path, index=None):
+        node, key = self._resolve(path)
+        return node[key] if index is None else node[key][index]
+
+    def _set_value(self, path, value, index=None):
+        node, key = self._resolve(path)
+        if index is None:
+            node[key] = value
+        else:
+            node[key][index] = value
+
+    def _mesh(self) -> dict:
+        key = json.dumps(self._trial["mesh"], sort_keys=True)
+        if key != self._mesh_key:
+            self._mesh_cache, self._mesh_key = build_mesh(self._trial["mesh"]), key
+        return self._mesh_cache
+
+    def _color_bgr(self, color: str):
+        try:
+            r, g, b = self.canvas.winfo_rgb(color)
+        except tk.TclError:
+            r = g = b = 128 * 257
+        return (b >> 8, g >> 8, r >> 8)
+
+    # ══ Inspector: construction ═════════════════════════════════════════
+    def build_inspector(self, parent: tk.Frame) -> None:
+        self._reset_inspector_refs()
+        self._cam_info_var, self._mesh_info_var = tk.StringVar(), tk.StringVar()
+        self._marker_info_var, self._tex_info_var = tk.StringVar(), tk.StringVar()
+        self._folder_var, self._progress_var = tk.StringVar(), tk.StringVar()
+        win = self._inspector_win
+        if win is not None:
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            win.geometry(f"{min(1500, sw - 80)}x{min(860, sh - 120)}")
+            win.minsize(min(1000, sw - 80), min(560, sh - 120))
+        self._build_toolbar(parent)
+        panes = tk.PanedWindow(parent, orient=tk.HORIZONTAL, sashwidth=6, sashrelief=tk.RAISED)
+        panes.pack(fill="both", expand=True, pady=(4, 0))
+        left = tk.Frame(panes)
+        mid = tk.LabelFrame(panes, text="Camera view (wireframe)")
+        right = tk.LabelFrame(panes, text="3D preview  (L-drag rotate, R-drag pan, wheel zoom)")
+        panes.add(left, width=440, minsize=320)
+        panes.add(mid, width=430, minsize=260)
+        panes.add(right, minsize=260)
+        self._build_notebook(left)
+        self._build_2d(mid)
+        self._build_3d(right)
+        self._refresh_camera_selector()
+        self._refresh_fields()
+        self._v3_centered = False
+        self._on_settings_changed()
+        st = self._render_state
+        if st is not None and not st["finished"]:
+            self._set_render_widgets_running(True)
+            self._update_render_widgets()
+
+    def _build_toolbar(self, parent) -> None:
+        r1 = tk.Frame(parent)
+        r1.pack(fill="x")
+        tk.Label(r1, text="Camera:", font=("Arial", 9, "bold")).pack(side="left")
+        self._cam_combo = ttk.Combobox(r1, width=4, state="readonly")
+        self._cam_combo.pack(side="left", padx=(2, 14))
+        self._cam_combo.bind("<<ComboboxSelected>>", self._on_camera_selected)
+        tk.Label(r1, text="Preview time (s):", font=("Arial", 9)).pack(side="left")
+        self._time_var = tk.DoubleVar(value=self._preview_time)
+        self._time_scale = tk.Scale(r1, orient=tk.HORIZONTAL, from_=0.0, to=1.0, resolution=0.01,
+                                    length=260, variable=self._time_var,
+                                    command=lambda _v: self._on_preview_time_changed())
+        self._time_scale.pack(side="left", padx=4)
+        r2 = tk.Frame(parent)
+        r2.pack(fill="x", pady=(2, 0))
+        self._apply_btn = tk.Button(r2, text="Apply", font=("Arial", 9, "bold"), bg="#33558a", fg="white",
+                                    relief=tk.FLAT, padx=14, pady=2, command=self._on_apply)
+        self._apply_btn.pack(side="left")
+        self._dirty_label = tk.Label(r2, font=("Arial", 9, "bold"))
+        self._dirty_label.pack(side="left", padx=8)
+        self._progress = ttk.Progressbar(r2, length=220, mode="determinate")
+        self._progress.pack(side="left", padx=(12, 4))
+        tk.Label(r2, textvariable=self._progress_var, font=("Arial", 8)).pack(side="left")
+        self._cancel_btn = tk.Button(r2, text="Cancel render", state=tk.DISABLED, command=self._cancel_render)
+        self._cancel_btn.pack(side="left", padx=6)
+        tk.Button(r2, text="Help", command=self._open_help).pack(side="right")
+
+    def _build_notebook(self, parent) -> None:
+        nb = ttk.Notebook(parent)
+        nb.pack(fill="both", expand=True)
+        for title, builder in (("Cameras", self._tab_cameras), ("Mesh", self._tab_mesh),
+                               ("Markers", self._tab_markers), ("Speckles", self._tab_speckles),
+                               ("Motion", self._tab_motion), ("Output", self._tab_output)):
+            tab = tk.Frame(nb)
+            nb.add(tab, text=title)
+            inner, cv = self._make_scrollable(tab)
+            builder(inner)
+            self._bind_wheel_recursive(tab, cv)
+
+    @staticmethod
+    def _make_scrollable(parent):
+        outer = tk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+        cv = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+        hsb = ttk.Scrollbar(outer, orient="horizontal", command=cv.xview)
+        cv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        cv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        inner = tk.Frame(cv)
+        cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        return inner, cv
+
+    @staticmethod
+    def _wheel_steps(e) -> int:
+        if getattr(e, "num", None) == 4:
+            return 1
+        if getattr(e, "num", None) == 5:
+            return -1
+        d = getattr(e, "delta", 0)
+        return int(d / 120) if abs(d) >= 120 else (1 if d > 0 else -1 if d < 0 else 0)
+
+    def _bind_wheel_recursive(self, widget, cv) -> None:
+        """Wheel scrolls the tab (Shift = horizontal). Bound per widget (not
+        bind_all) so the editor's own global wheel bindings stay intact, and
+        returning "break" stops comboboxes/spinboxes changing value on scroll."""
+        def on_wheel(e):
+            steps = self._wheel_steps(e)
+            (cv.xview_scroll if e.state & 0x0001 else cv.yview_scroll)(-steps * 3, "units")
+            return "break"
+
+        def bind(w):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                w.bind(seq, on_wheel, add="+")
+            for ch in w.winfo_children():
+                bind(ch)
+        bind(widget)
+
+    # ── field helpers ───────────────────────────────────────────────────
+    @staticmethod
+    def _lbl(parent, text, row, col=0, span=1, fg="#111111", bold=False) -> None:
+        tk.Label(parent, text=text, font=("Arial", 9, "bold" if bold else "normal"), fg=fg,
+                 anchor="w", justify="left").grid(row=row, column=col, columnspan=span, sticky="w", padx=3, pady=1)
+
+    def _entry(self, parent, row, col, path, cast=float, index=None, width=9, span=1):
+        var = tk.StringVar()
+        ent = tk.Entry(parent, textvariable=var, width=width, font=("Arial", 9))
+        ent.grid(row=row, column=col, columnspan=span, sticky="w", padx=2, pady=1)
+        f = {"kind": "entry", "var": var, "path": path, "index": index, "cast": cast, "widget": ent}
+
+        def commit(_e=None):
+            try:
+                val = f["cast"](var.get().strip())
+            except (ValueError, TypeError):
+                ent.configure(fg="#c62828")
+                return
+            ent.configure(fg="#111111")
+            if val != self._get_value(path, index):
+                self._set_value(path, val, index)
+                self._on_settings_changed()
+        ent.bind("<Return>", commit)
+        ent.bind("<FocusOut>", commit)
+        self._fields.append(f)
+        return ent
+
+    def _vec3(self, parent, row, label, path, width=9):
+        self._lbl(parent, label, row)
+        for i in range(3):
+            self._entry(parent, row, 1 + i, path, index=i, width=width)
+
+    def _combo(self, parent, row, col, path, values, width=14, span=1):
+        var = tk.StringVar()
+        cb = ttk.Combobox(parent, textvariable=var, values=list(values), state="readonly", width=width)
+        cb.grid(row=row, column=col, columnspan=span, sticky="w", padx=2, pady=1)
+        f = {"kind": "combo", "var": var, "path": path, "index": None}
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._commit(f, var.get()))
+        self._fields.append(f)
+
+    def _check(self, parent, row, text, path, span=4):
+        var = tk.BooleanVar()
+        f = {"kind": "check", "var": var, "path": path, "index": None}
+        tk.Checkbutton(parent, text=text, variable=var, font=("Arial", 9),
+                       command=lambda: self._commit(f, bool(var.get()))).grid(
+            row=row, column=0, columnspan=span, sticky="w", padx=3)
+        self._fields.append(f)
+
+    def _color(self, parent, row, label, path):
+        self._lbl(parent, label, row)
+        var = tk.StringVar()
+        ent = tk.Entry(parent, textvariable=var, width=9, font=("Arial", 9))
+        ent.grid(row=row, column=1, sticky="w", padx=2)
+        btn = tk.Button(parent, width=3, relief=tk.SUNKEN)
+        btn.grid(row=row, column=2, sticky="w")
+        f = {"kind": "color", "var": var, "path": path, "index": None, "swatch": btn, "widget": ent}
+
+        def commit(_e=None):
+            try:
+                self.canvas.winfo_rgb(var.get().strip())
+            except tk.TclError:
+                ent.configure(fg="#c62828")
+                return
+            ent.configure(fg="#111111")
+            self._commit(f, var.get().strip())
+
+        def pick():
+            _rgb, hexv = colorchooser.askcolor(color=self._get_value(path), parent=self._inspector_win)
+            if hexv:
+                var.set(hexv)
+                commit()
+        btn.configure(command=pick)
+        ent.bind("<Return>", commit)
+        ent.bind("<FocusOut>", commit)
+        self._fields.append(f)
+
+    def _commit(self, f, value) -> None:
+        if value != self._get_value(f["path"], f["index"]):
+            self._set_value(f["path"], value, f["index"])
+            self._refresh_fields()
+            self._on_settings_changed()
+
+    def _refresh_fields(self) -> None:
+        for f in self._fields:
+            try:
+                val = self._get_value(f["path"], f["index"])
+            except (KeyError, IndexError):
+                continue
+            try:
+                if f["kind"] == "check":
+                    f["var"].set(bool(val))
+                else:
+                    f["var"].set(_fmt(val))
+                    if f["kind"] == "color":
+                        f["swatch"].configure(bg=str(val))
+                    if "widget" in f:
+                        f["widget"].configure(fg="#111111")
+            except tk.TclError:
+                pass
+
+    # ── tabs ────────────────────────────────────────────────────────────
+    def _tab_cameras(self, f) -> None:
+        row = tk.Frame(f)
+        row.grid(row=0, column=0, columnspan=5, sticky="w", pady=3)
+        tk.Button(row, text="Add camera", command=self._add_camera).pack(side="left")
+        tk.Button(row, text="Duplicate", command=lambda: self._add_camera(True)).pack(side="left", padx=4)
+        tk.Button(row, text="Remove", command=self._remove_camera).pack(side="left")
+        self._lbl(f, "Settings apply to the camera selected in the toolbar.", 1, span=5, fg="#666666")
+        self._vec3(f, 2, "Position x, y, z", ("@cam", "pos"))
+        self._vec3(f, 3, "View direction (cam +z)", ("@cam", "view_dir"))
+        tk.Button(f, text="Aim at mesh center", command=self._aim_at_mesh).grid(row=4, column=1, columnspan=3, sticky="w", pady=2)
+        self._lbl(f, "Roll (deg)", 5); self._entry(f, 5, 1, ("@cam", "roll"))
+        self._lbl(f, "Horizontal FOV (deg)", 6); self._entry(f, 6, 1, ("@cam", "hfov"))
+        self._lbl(f, "Image width, height (px)", 7)
+        self._entry(f, 7, 1, ("@cam", "width"), cast=int); self._entry(f, 7, 2, ("@cam", "height"), cast=int)
+        self._lbl(f, "Frames per second", 8); self._entry(f, 8, 1, ("@cam", "fps"))
+        self._lbl(f, "Start time (s)", 9); self._entry(f, 9, 1, ("@cam", "start_time"))
+        self._lbl(f, "Distortion k1 k2 p1 p2 k3 k4 k5 k6", 10)
+        for i in range(8):
+            self._entry(f, 11, i, ("@cam", "dist"), index=i, width=7)
+        tk.Label(f, textvariable=self._cam_info_var, font=("Courier", 8), justify="left", anchor="w").grid(
+            row=12, column=0, columnspan=5, sticky="w", padx=3, pady=6)
+
+    def _tab_mesh(self, f) -> None:
+        self._lbl(f, "Corners go around the quad. 1->2 = direction 1, 1->4 = direction 2.\n"
+                     "Normal = (c2-c1) x (c4-c1) faces the cameras.", 0, span=4, fg="#666666")
+        for i in range(4):
+            self._vec3(f, 1 + i, f"Corner {i + 1} x, y, z", ("mesh", "corners", i))
+        self._lbl(f, "Cells n1, n2", 5)
+        self._entry(f, 5, 1, ("mesh", "n1"), cast=int); self._entry(f, 5, 2, ("mesh", "n2"), cast=int)
+        self._check(f, 6, "Perspective (homography) interpolation of grid points", ("mesh", "perspective"))
+        self._color(f, 7, "Surface colour", ("mesh", "surface_color"))
+        self._color(f, 8, "Scene background", ("mesh", "background_color"))
+        self._color(f, 9, "Back-face colour", ("mesh", "back_color"))
+        tk.Label(f, textvariable=self._mesh_info_var, font=("Courier", 8), justify="left", anchor="w").grid(
+            row=10, column=0, columnspan=4, sticky="w", padx=3, pady=6)
+
+    def _tab_markers(self, f) -> None:
+        self._lbl(f, "Marker type", 0); self._combo(f, 0, 1, ("markers", "type"), MARKER_TYPE_CHOICES, span=2)
+        self._lbl(f, "Size (world units)", 1); self._entry(f, 1, 1, ("markers", "size"))
+        self._lbl(f, "ArUco dictionary", 2); self._combo(f, 2, 1, ("markers", "aruco_dict"), ARUCO_DICT_CHOICES, span=2)
+        self._lbl(f, "First ArUco id", 3); self._entry(f, 3, 1, ("markers", "first_id"), cast=int)
+        self._lbl(f, "One marker is centerd on every object point (id wraps around the dictionary).\n"
+                     "'corner' = 2x2 checker whose saddle is the object point.", 4, span=4, fg="#666666")
+        tk.Label(f, textvariable=self._marker_info_var, font=("Courier", 8), justify="left", anchor="w").grid(
+            row=5, column=0, columnspan=4, sticky="w", padx=3, pady=6)
+
+    def _tab_speckles(self, f) -> None:
+        self._lbl(f, "Random seed", 0); self._entry(f, 0, 1, ("speckles", "seed"), cast=int)
+        for c, t in enumerate(("on", "diameter", "per unit area", "colour")):
+            self._lbl(f, t, 1, c, bold=True)
+        for i in range(NUM_SPECKLE_TYPES):
+            var = tk.BooleanVar()
+            fld = {"kind": "check", "var": var, "path": ("speckles", "types", i, "enabled"), "index": None}
+            tk.Checkbutton(f, variable=var, command=lambda ff=fld, v=var: self._commit(ff, bool(v.get()))).grid(row=2 + i, column=0)
+            self._fields.append(fld)
+            self._entry(f, 2 + i, 1, ("speckles", "types", i, "diameter"), width=8)
+            self._entry(f, 2 + i, 2, ("speckles", "types", i, "density"), width=8)
+            cvar = tk.StringVar()
+            ent = tk.Entry(f, textvariable=cvar, width=9, font=("Arial", 9))
+            ent.grid(row=2 + i, column=3, sticky="w")
+            cf = {"kind": "color", "var": cvar, "path": ("speckles", "types", i, "color"), "index": None,
+                  "swatch": tk.Button(f, width=2, relief=tk.SUNKEN), "widget": ent}
+            cf["swatch"].grid(row=2 + i, column=4, padx=2)
+            cf["swatch"].configure(command=lambda ff=cf: self._pick_into(ff))
+            ent.bind("<Return>", lambda _e, ff=cf, v=cvar: self._commit(ff, v.get().strip()))
+            ent.bind("<FocusOut>", lambda _e, ff=cf, v=cvar: self._commit(ff, v.get().strip()))
+            self._fields.append(cf)
+        self._lbl(f, "Diameter in world units; density = speckles per unit area.", 6, span=5, fg="#666666")
+        self._lbl(f, "Texture px per unit (0 = auto)", 7); self._entry(f, 7, 1, ("speckles", "ppu"))
+        self._lbl(f, "Max texture size (megapixels)", 8); self._entry(f, 8, 1, ("speckles", "max_mp"))
+        tk.Label(f, textvariable=self._tex_info_var, font=("Courier", 8), justify="left", anchor="w").grid(
+            row=9, column=0, columnspan=5, sticky="w", padx=3, pady=6)
+
+    def _pick_into(self, fld) -> None:
+        _rgb, hexv = colorchooser.askcolor(color=self._get_value(fld["path"]), parent=self._inspector_win)
+        if hexv:
+            self._commit(fld, hexv)
+
+    def _tab_motion(self, f) -> None:
+        self._lbl(f, "Motion type", 0); self._combo(f, 0, 1, ("motion", "type"), MOTION_TYPE_CHOICES, span=2)
+        self._vec3(f, 1, "Rotation center x0, y0, z0", ("motion", "center"))
+        self._vec3(f, 2, "Rotation axis rx0, ry0, rz0", ("motion", "axis"))
+        self._lbl(f, "Angular velocity (deg/s)", 3); self._entry(f, 3, 1, ("motion", "omega"))
+        self._lbl(f, "Simulated duration (s)", 4); self._entry(f, 4, 1, ("motion", "duration"))
+        self._lbl(f, "Rotation is right-handed about the axis; mesh, speckles and\nmarkers rotate together. Time starts at 0.", 5, span=4, fg="#666666")
+
+    def _tab_output(self, f) -> None:
+        self._lbl(f, "Output folder", 0)
+        tk.Label(f, textvariable=self._folder_var, font=("Arial", 8), fg="#333333", wraplength=250,
+                 justify="left").grid(row=1, column=0, columnspan=4, sticky="w", padx=3)
+        b = tk.Frame(f)
+        b.grid(row=2, column=0, columnspan=4, sticky="w", pady=2)
+        tk.Button(b, text="Browse...", command=self._browse_folder).pack(side="left")
+        tk.Button(b, text="Clear", command=lambda: self._commit({"path": ("output", "folder"), "index": None}, "")).pack(side="left", padx=4)
+        self._lbl(f, "Data file name (.npz)", 3); self._entry(f, 3, 1, ("output", "data_filename"), cast=str, width=18, span=3)
+        self._check(f, 4, "Render images", ("output", "render_images"))
+        self._lbl(f, "Image format", 5); self._combo(f, 5, 1, ("output", "image_format"), IMAGE_FORMAT_CHOICES, width=8)
+        self._lbl(f, "File pattern ({cam}, {frame})", 6); self._entry(f, 7, 0, ("output", "filename_pattern"), cast=str, width=34, span=4)
+        self._check(f, 8, "Save grayscale images", ("output", "grayscale"))
+        self._lbl(f, "Image noise sigma (gray levels)", 9); self._entry(f, 9, 1, ("output", "image_noise"))
+        self._lbl(f, "Image-point noise sigma (px)", 10); self._entry(f, 10, 1, ("output", "point_noise"))
+        self._lbl(f, "Point dropout probability", 11); self._entry(f, 11, 1, ("output", "dropout_prob"))
+        self._check(f, 12, "Image points outside the image -> NaN", ("output", "nan_outside"))
+        self._lbl(f, "Render threads", 13); self._entry(f, 13, 1, ("output", "threads"), cast=int)
+        self._lbl(f, "Noise random seed", 14); self._entry(f, 14, 1, ("output", "seed"), cast=int)
+
+    def _browse_folder(self) -> None:
+        folder = filedialog.askdirectory(parent=self._inspector_win, title="Select output folder")
+        if folder:
+            # Kept absolute at run time; made project-relative only on save.
+            self._trial["output"]["folder"] = os.path.abspath(folder)
+            self._on_settings_changed()
+
+    # ── camera list management ──────────────────────────────────────────
+    def _refresh_camera_selector(self) -> None:
+        n = len(self._trial["cameras"])
+        self._cam_idx = max(0, min(self._cam_idx, n - 1))
+        if self._cam_combo is not None:
+            self._cam_combo.configure(values=[str(i + 1) for i in range(n)])
+            self._cam_combo.set(str(self._cam_idx + 1))
+
+    def _on_camera_selected(self, _e=None) -> None:
+        self._cam_idx = int(self._cam_combo.get()) - 1
+        self._refresh_fields()
+        self._on_settings_changed()
+
+    def _add_camera(self, duplicate: bool = False) -> None:
+        cams = self._trial["cameras"]
+        if len(cams) >= MAX_CAMERAS:
+            messagebox.showinfo("Cameras", f"At most {MAX_CAMERAS} cameras.", parent=self._inspector_win)
+            return
+        cams.append(copy.deepcopy(cams[self._cam_idx]) if duplicate else default_camera(len(cams)))
+        self._cam_idx = len(cams) - 1
+        self._refresh_camera_selector()
+        self._refresh_fields()
+        self._on_settings_changed()
+
+    def _remove_camera(self) -> None:
+        cams = self._trial["cameras"]
+        if len(cams) <= 1:
+            return
+        del cams[self._cam_idx]
+        self._refresh_camera_selector()
+        self._refresh_fields()
+        self._on_settings_changed()
+
+    def _aim_at_mesh(self) -> None:
+        try:
+            target = self._mesh()["corners"].mean(axis=0)
+        except Exception as e:
+            messagebox.showerror("Aim", str(e), parent=self._inspector_win)
+            return
+        cam = self._trial["cameras"][self._cam_idx]
+        cam["view_dir"] = [float(v) for v in target - np.asarray(cam["pos"], dtype=float)]
+        self._refresh_fields()
+        self._on_settings_changed()
+
+    # ── change handling, info text, previews ────────────────────────────
+    def _on_settings_changed(self) -> None:
+        self._update_dirty_label()
+        self._update_infos()
+        self._update_time_scale_range()
+        self._redraw_previews()
+
+    def _update_dirty_label(self) -> None:
+        if self._dirty_label is None:
+            return
+        try:
+            if self._trial != self._applied:
+                self._dirty_label.configure(text="Needs Apply", fg="#b36b00")
+            else:
+                self._dirty_label.configure(text="Applied", fg="#1a7a1a")
+            if self._folder_var is not None:
+                self._folder_var.set(self._trial["output"]["folder"] or "(no folder selected)")
+        except tk.TclError:
+            pass
+
+    def _update_time_scale_range(self) -> None:
+        if self._time_scale is None:
+            return
+        dur = max(0.01, float(self._trial["motion"]["duration"]))
+        self._preview_time = min(self._preview_time, dur)
+        try:
+            self._time_scale.configure(to=dur)
+            self._time_var.set(self._preview_time)
+        except tk.TclError:
+            pass
+
+    def _on_preview_time_changed(self) -> None:
+        self._preview_time = float(self._time_var.get())
+        self._redraw_previews()
+
+    def _update_infos(self) -> None:
+        if self._cam_info_var is None:
+            return
+        try:
+            m = camera_model(self._trial["cameras"][self._cam_idx])
+            ts = camera_frame_times(self._trial["cameras"][self._cam_idx], float(self._trial["motion"]["duration"]))
+            self._cam_info_var.set(
+                f"fx=fy={m['K'][0, 0]:.2f}  cx={m['K'][0, 2]:.1f}  cy={m['K'][1, 2]:.1f}\n"
+                f"rvec={np.round(m['rvec'], 5).tolist()}\ntvec={np.round(m['t'], 4).tolist()}\n"
+                f"frames: {len(ts)}" + (f"  (t = {ts[0]:.4g} .. {ts[-1]:.4g} s)" if len(ts) else ""))
+        except Exception as e:
+            self._cam_info_var.set(f"camera error: {e}")
+        try:
+            mesh = self._mesh()
+            mk = self._trial["markers"]
+            outer = 0.0
+            if mk["type"] == "aruco":
+                bits = int(mk["aruco_dict"].split("_")[1][0])
+                outer = mk["size"] * (bits + 4) / (bits + 2)      # marker + quiet zone
+            elif mk["type"] == "corner":
+                outer = mk["size"]
+            warn = "  WARNING: markers overlap neighbours" if outer > mesh["spacing_min"] else ""
+            n = np.round(mesh["normal"], 4).tolist()
+            self._mesh_info_var.set(f"{len(mesh['points'])} object points ({mesh['n1'] + 1} x {mesh['n2'] + 1})\n"
+                                    f"normal {n}\ncorner non-planarity {mesh['dev_max']:.3g} (corners projected)")
+            self._marker_info_var.set(f"min point spacing {mesh['spacing_min']:.4g}, marker footprint {outer:.4g}{warn}")
+            geo = texture_geometry(mesh, self._trial)
+            self._tex_info_var.set(f"texture {geo['tex_w']} x {geo['tex_h']} px at {geo['ppu']:.4g} px/unit"
+                                   f" (auto {geo['auto_ppu']:.4g})" + ("\nWARNING: reduced by the size cap" if geo["reduced"] else ""))
+        except Exception as e:
+            self._mesh_info_var.set(f"mesh error: {e}")
+            self._marker_info_var.set("")
+            self._tex_info_var.set("")
+
+    def _redraw_previews(self) -> None:
+        self._redraw_2d()
+        self._redraw_3d()
+
+    # ── 2D wireframe view ───────────────────────────────────────────────
+    def _build_2d(self, parent) -> None:
+        self._c2d = tk.Canvas(parent, bg="#ffffff", highlightthickness=0)
+        self._c2d.pack(fill="both", expand=True)
+        self._c2d.bind("<Configure>", lambda e: self._redraw_2d())
+
+    @staticmethod
+    def _draw_runs(c, uv, ok, ox, oy, s, color, width) -> None:
+        run = []
+
+        def flush():
+            if len(run) >= 2:
+                c.create_line(*[v for xy in run for v in xy], fill=color, width=width)
+            run.clear()
+        for (u, v), good in zip(uv, ok):
+            if good and abs(u) < 1e5 and abs(v) < 1e5:
+                run.append((ox + (u + 0.5) * s, oy + (v + 0.5) * s))
+            else:
+                flush()
+        flush()
+
+    def _redraw_2d(self) -> None:
+        c = self._c2d
+        if c is None:
+            return
+        try:
+            c.delete("all")
+            cw, ch = c.winfo_width(), c.winfo_height()
+        except tk.TclError:
+            return
+        if cw < 40 or ch < 40:
+            return
+        try:
+            cam = self._trial["cameras"][self._cam_idx]
+            model, mesh, motion = camera_model(cam), self._mesh(), self._trial["motion"]
+            Rm = rotation_for_times(motion, [self._preview_time])[0]
+            center = np.asarray(motion["center"], dtype=float)
+            xf = lambda p: center + (np.asarray(p, dtype=float) - center) @ Rm.T
+            w, h = model["w"], model["h"]
+            s = min((cw - 52) / w, (ch - 52) / h)
+            ox, oy = (cw - w * s) / 2, (ch - h * s) / 2
+            c.create_rectangle(ox, oy, ox + w * s, oy + h * s, outline="#666666", fill="#fafafa")
+            # grid lines, densely sampled so lens distortion bends them visibly
+            n1, n2, sub = mesh["n1"], mesh["n2"], 6
+            us, vs = np.linspace(0, 1, n1 * sub + 1), np.linspace(0, 1, n2 * sub + 1)
+            chunks = [np.column_stack([us, np.full_like(us, j / n2)]) for j in range(n2 + 1)]
+            chunks += [np.column_stack([np.full_like(vs, i / n1), vs]) for i in range(n1 + 1)]
+            world, _ = mesh_uv_to_world(mesh, np.vstack(chunks))
+            uv_all, ok_all = project_points(xf(world), model)
+            start = 0
+            for idx, chunk in enumerate(chunks):
+                n = len(chunk)
+                edge = (idx in (0, n2)) if idx <= n2 else ((idx - n2 - 1) in (0, n1))
+                self._draw_runs(c, uv_all[start:start + n], ok_all[start:start + n], ox, oy, s,
+                                "#1f5fbf", 2 if edge else 1)
+                start += n
+            # object points and marker footprints
+            pts_t = xf(mesh["points"])
+            uv_p, ok_p = project_points(pts_t, model)
+            for (u, v), good in zip(uv_p, ok_p):
+                if good:
+                    x, y = ox + (u + 0.5) * s, oy + (v + 0.5) * s
+                    c.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#1f5fbf", outline="")
+            mk = self._trial["markers"]
+            if mk["type"] != "none":
+                half, e1, e2 = mk["size"] / 2.0, Rm @ mesh["e1"], Rm @ mesh["e2"]
+                offs = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
+                uv_m, ok_m = project_points(np.concatenate([pts_t + a * half * e1 + b * half * e2 for a, b in offs]), model)
+                P = len(pts_t)
+                for k in range(P):
+                    if all(ok_m[k + m * P] for m in range(4)):
+                        c.create_polygon([v for m in range(4) for v in (ox + (uv_m[k + m * P][0] + 0.5) * s,
+                                                                        oy + (uv_m[k + m * P][1] + 0.5) * s)],
+                                         outline="#c0392b", fill="")
+            # principal point and notes
+            px, py = ox + (model["K"][0, 2] + 0.5) * s, oy + (model["K"][1, 2] + 0.5) * s
+            c.create_line(px - 6, py, px + 6, py, fill="#999999")
+            c.create_line(px, py - 6, px, py + 6, fill="#999999")
+            notes = []
+            if float(Rm @ mesh["normal"] @ (model["C"] - xf(mesh["origin"]))) <= 0:
+                notes.append("BACK FACE visible: image points invalid")
+            if (xf(mesh["corners"]) @ model["R"][2] + model["t"][2]).min() <= 1e-6:
+                notes.append("plane crosses the camera plane")
+            c.create_text(8, 8, anchor="nw", font=("Arial", 8), fill="#333333",
+                          text=f"Camera {self._cam_idx + 1}   t = {self._preview_time:.3f} s   HFOV {cam['hfov']:g} deg")
+            if notes:
+                c.create_text(8, ch - 8, anchor="sw", font=("Arial", 8, "bold"), fill="#c62828", text="\n".join(notes))
+        except Exception as e:
+            c.create_text(cw / 2, ch / 2, text=f"Preview unavailable:\n{e}", fill="#c62828", width=cw - 40)
+
+    # ── 3D preview (same interaction conventions as Camera Layout Viewer) ─
+    def _build_3d(self, parent) -> None:
+        hdr = tk.Frame(parent)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Perspective", font=("Arial", 8)).pack(side="left")
+        self._persp_var = tk.DoubleVar(value=0.0)
+        tk.Scale(hdr, from_=0.0, to=1.0, resolution=0.02, orient=tk.HORIZONTAL, length=140,
+                 variable=self._persp_var, command=lambda _v: self._redraw_3d()).pack(side="left")
+        tk.Button(hdr, text="Reset view", font=("Arial", 8), command=self._reset_view).pack(side="right")
+        c = self._c3d = tk.Canvas(parent, bg="#ffffff", highlightthickness=0)
+        c.pack(fill="both", expand=True)
+        c.bind("<ButtonPress-1>", lambda e: self._v3.update(dragging=True, button=1, last_x=e.x, last_y=e.y))
+        c.bind("<ButtonPress-3>", lambda e: self._v3.update(dragging=True, button=3, last_x=e.x, last_y=e.y))
+        c.bind("<B1-Motion>", self._on_rotate)
+        c.bind("<B3-Motion>", self._on_pan)
+        for seq in ("<ButtonRelease-1>", "<ButtonRelease-3>"):
+            c.bind(seq, lambda e: self._v3.update(dragging=False, button=None))
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            c.bind(seq, self._on_zoom)
+        c.bind("<Configure>", lambda e: self._redraw_3d())
+
+    def _reset_view(self) -> None:
+        self._v3.update(yaw=-0.9, pitch=0.7, zoom=1.0)
+        self._v3_centered = False
+        self._redraw_3d()
+
+    def _on_rotate(self, e) -> None:
+        if self._v3["dragging"] and self._v3["button"] == 1:
+            self._v3["yaw"] += (e.x - self._v3["last_x"]) * 0.01
+            self._v3["pitch"] += (e.y - self._v3["last_y"]) * 0.01
+            self._v3["last_x"], self._v3["last_y"] = e.x, e.y
+            self._redraw_3d()
+
+    def _on_pan(self, e) -> None:
+        if not (self._v3["dragging"] and self._v3["button"] == 3):
+            return
+        dx, dy, sc = e.x - self._v3["last_x"], e.y - self._v3["last_y"], self._v3["last_scale"]
+        if sc > 1e-12:
+            rt = self._v3_rot().T
+            self._v3["target"] = (np.asarray(self._v3["target"]) - (rt[:, 0] * dx - rt[:, 2] * dy) / sc).tolist()
+        self._v3["last_x"], self._v3["last_y"] = e.x, e.y
+        self._redraw_3d()
+
+    def _on_zoom(self, e) -> str:
+        steps = self._wheel_steps(e)
+        if steps:
+            self._v3["zoom"] = max(0.05, self._v3["zoom"] * (1.12 ** steps))
+            self._redraw_3d()
+        return "break"
+
+    def _v3_rot(self) -> np.ndarray:
+        yaw, pitch = self._v3["yaw"], self._v3["pitch"]
+        cy, sy, cp, sp = np.cos(yaw), np.sin(yaw), np.cos(pitch), np.sin(pitch)
+        return np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]]) @ np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+
+    # Small cube drawn at the origin of the lower-left axes icon; it rotates with the view.
+    _CUBE_VERTS = np.array([
+        [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0],
+    ], dtype=np.float64)
+
+    _CUBE_FACES = [
+        {"normal": np.array([1.0, 0.0, 0.0]),  "verts": [1, 2, 6, 5], "color": "#ff9999"},
+        {"normal": np.array([-1.0, 0.0, 0.0]), "verts": [0, 3, 7, 4], "color": "#ffcccc"},
+        {"normal": np.array([0.0, 1.0, 0.0]),  "verts": [3, 2, 6, 7], "color": "#99dd99"},
+        {"normal": np.array([0.0, -1.0, 0.0]), "verts": [0, 1, 5, 4], "color": "#cceecc"},
+        {"normal": np.array([0.0, 0.0, 1.0]),  "verts": [4, 5, 6, 7], "color": "#9999ff"},
+        {"normal": np.array([0.0, 0.0, -1.0]), "verts": [0, 1, 2, 3], "color": "#ccccff"},
+    ]
+
+    def _draw_axes_icon(self, c: tk.Canvas, ch: float) -> None:
+        """Lower-left X/Y/Z axes icon with a small view-aligned cube at its origin."""
+        R = self._v3_rot()
+        corner = np.array([32.0, float(ch) - 32.0])
+        axis_len = 22.0
+
+        for ax_v, col, lab in ((np.array([1.0, 0.0, 0.0]), "#cc0000", "X"),
+                               (np.array([0.0, 1.0, 0.0]), "#00aa00", "Y"),
+                               (np.array([0.0, 0.0, 1.0]), "#0000cc", "Z")):
+            rv = R @ ax_v
+            e = corner + np.array([rv[0], -rv[2]]) * axis_len
+            c.create_line(corner[0], corner[1], e[0], e[1], fill=col, width=2)
+            c.create_text(e[0] + (e[0] - corner[0]) * 0.25, e[1] + (e[1] - corner[1]) * 0.25,
+                          text=lab, fill=col, font=("Arial", 8, "bold"))
+
+        # Cube: draw only the 3 faces nearest the viewer (smallest depth = rotated y),
+        # so the hidden faces never show through.
+        verts = (self._CUBE_VERTS * (axis_len * 0.32)) @ R.T
+        faces_by_depth = sorted(self._CUBE_FACES, key=lambda f: float((R @ f["normal"])[1]))
+        for face in faces_by_depth[:3]:
+            pts = [(corner[0] + verts[vi][0], corner[1] - verts[vi][2]) for vi in face["verts"]]
+            c.create_polygon(pts, fill=face["color"], outline="#333333", width=1.3)
+
+    def _v3_project(self, pts, scale, radius) -> np.ndarray:
+        c = self._c3d
+        rot = (self._v3_rot() @ (np.asarray(pts, dtype=float).reshape(-1, 3) - np.asarray(self._v3["target"])).T).T
+        p = float(self._persp_var.get()) if self._persp_var is not None else 0.0
+        if p <= 1e-6:
+            f = np.ones(len(rot))
+        else:                                    # eye at d0 in front of the pivot; clamp points behind it
+            d0 = max(radius, 1e-6) * 3.0 / p
+            f = d0 / np.maximum(d0 + rot[:, 1], d0 * 1e-3)
+        return np.column_stack([rot[:, 0] * scale * f + c.winfo_width() / 2.0,
+                                -rot[:, 2] * scale * f + c.winfo_height() / 2.0])
+
+    def _redraw_3d(self) -> None:
+        c = self._c3d
+        if c is None:
+            return
+        try:
+            c.delete("all")
+            cw, ch = c.winfo_width(), c.winfo_height()
+        except tk.TclError:
+            return
+        if cw < 40 or ch < 40:
+            return
+        try:
+            mesh, motion = self._mesh(), self._trial["motion"]
+            models = [camera_model(cam) for cam in self._trial["cameras"]]
+            center = np.asarray(motion["center"], dtype=float)
+            allp = np.vstack([mesh["corners"], center[None, :]] + [m["C"][None, :] for m in models])
+            center = allp.mean(axis=0)
+            radius = max(float(np.linalg.norm(allp - center, axis=1).max()), 1e-6)
+            if not self._v3_centered:
+                self._v3["target"], self._v3_centered = center.tolist(), True
+            scale = min(cw, ch) * 0.36 * self._v3["zoom"] / radius
+            self._v3["last_scale"] = scale
+            proj = lambda p: self._v3_project(p, scale, radius)
+
+            def line(pts, color, width=1, dash=None):
+                xy = proj(pts)
+                c.create_line(*xy.ravel().tolist(), fill=color, width=width, dash=dash)
+
+            def draw_mesh(pts, color, width, dash=None):
+                g = pts.reshape(mesh["n2"] + 1, mesh["n1"] + 1, 3)
+                for j in range(mesh["n2"] + 1):
+                    line(g[j], color, width if j in (0, mesh["n2"]) else 1, dash)
+                for i in range(mesh["n1"] + 1):
+                    line(g[:, i], color, width if i in (0, mesh["n1"]) else 1, dash)
+
+            Rm = rotation_for_times(motion, [self._preview_time])[0]
+            draw_mesh(mesh["points"], "#bbbbbb", 1, (3, 3))                          # t = 0 reference
+            draw_mesh(center + (mesh["points"] - center) @ Rm.T, "#1f5fbf", 2)       # at preview time
+            cen_t = center + (mesh["corners"].mean(axis=0) - center) @ Rm.T
+            nrm = Rm @ mesh["normal"]
+            line(np.vstack([cen_t, cen_t + nrm * radius * 0.18]), "#2ca02c", 2)      # front-face normal
+            axis = _unit(motion["axis"])
+            if axis is not None:
+                line(np.vstack([center - axis * radius, center + axis * radius]), "#ff7f0e", 1, (6, 3))
+            cxy = proj(center.reshape(1, 3))[0]
+            c.create_oval(cxy[0] - 3, cxy[1] - 3, cxy[0] + 3, cxy[1] + 3, fill="#ff7f0e", outline="")
+            depth = 0.3 * radius                                                     # frustum size (auto)
+            for k, m in enumerate(models):
+                col, wd = CAMERA_COLORS[k % len(CAMERA_COLORS)], (3 if k == self._cam_idx else 1)
+                K, w, h = m["K"], m["w"], m["h"]
+                cs = [np.array([(u - K[0, 2]) / K[0, 0] * depth, (v - K[1, 2]) / K[1, 1] * depth, depth])
+                      for u, v in ((-0.5, -0.5), (w - 0.5, -0.5), (w - 0.5, h - 0.5), (-0.5, h - 0.5))]
+                base = np.array([m["R"].T @ p + m["C"] for p in cs])
+                for i in range(4):
+                    line(np.vstack([m["C"], base[i]]), col, wd)
+                    line(np.vstack([base[i], base[(i + 1) % 4]]), col, wd)
+                a = proj(m["C"].reshape(1, 3))[0]
+                c.create_text(a[0], a[1] - 10, text=str(k + 1), fill=col, font=("Arial", 9, "bold"))
+            self._draw_axes_icon(c, ch)                                               # axes icon + cube
+        except Exception as e:
+            c.create_text(cw / 2, ch / 2, text=f"Preview unavailable:\n{e}", fill="#c62828", width=cw - 40)
+
+    # ══ Apply and rendering control ═════════════════════════════════════
+    def _validate(self, s: dict) -> list:
+        """Return a list of human-readable problems (empty list = settings are OK)."""
+        errs: list = []
+        finite = lambda v: bool(np.all(np.isfinite(np.asarray(v, dtype=float))))
+
+        try:
+            mesh = build_mesh(s["mesh"])
+        except Exception as e:
+            mesh = None
+            errs.append(f"Mesh: {e}")
+        for key, label in (("surface_color", "surface"), ("background_color", "background"),
+                           ("back_color", "back-face")):
+            try:
+                self.canvas.winfo_rgb(s["mesh"][key])
+            except tk.TclError:
+                errs.append(f"Mesh: invalid {label} colour '{s['mesh'][key]}'")
+
+        mo = s["motion"]
+        if not (finite(mo["center"]) and finite(mo["axis"]) and finite(mo["omega"]) and finite(mo["duration"])):
+            errs.append("Motion: center, axis, angular velocity and duration must be finite numbers")
+        else:
+            if float(mo["duration"]) <= 0:
+                errs.append("Motion: duration must be > 0")
+            if float(mo["omega"]) != 0 and _unit(mo["axis"]) is None:
+                errs.append("Motion: rotation axis must be non-zero")
+
+        for i, cam in enumerate(s["cameras"], 1):
+            tag = f"Camera {i}: "
+            if not all(finite(cam[k]) for k in ("pos", "view_dir", "roll", "dist", "hfov", "fps", "start_time")):
+                errs.append(tag + "all numeric fields must be finite numbers")
+                continue
+            if _unit(cam["view_dir"]) is None:
+                errs.append(tag + "view direction must be non-zero")
+            if not (1 <= int(cam["width"]) <= 16384 and 1 <= int(cam["height"]) <= 16384):
+                errs.append(tag + "image width/height must be 1..16384 px")
+            if not (0.0 < float(cam["hfov"]) < 180.0):
+                errs.append(tag + "horizontal FOV must be between 0 and 180 degrees")
+            if float(cam["fps"]) <= 0:
+                errs.append(tag + "frames per second must be > 0")
+            if float(cam["start_time"]) < 0:
+                errs.append(tag + "start time must be >= 0")
+            elif finite(mo["duration"]) and float(cam["start_time"]) > float(mo["duration"]):
+                errs.append(tag + "start time is after the simulated duration (no frames)")
+
+        mk = s["markers"]
+        if float(mk["size"]) < 0:
+            errs.append("Markers: size must be >= 0")
+        if mk["type"] == "aruco":
+            aruco = getattr(cv2, "aruco", None)
+            if aruco is None or not hasattr(aruco, mk["aruco_dict"]):
+                errs.append("Markers: cv2.aruco / this dictionary is unavailable "
+                            "(install opencv-contrib-python or OpenCV >= 4.7)")
+
+        for i, sp in enumerate(s["speckles"]["types"], 1):
+            if float(sp["diameter"]) < 0 or float(sp["density"]) < 0:
+                errs.append(f"Speckles: type {i} diameter and density must be >= 0")
+            try:
+                self.canvas.winfo_rgb(sp["color"])
+            except tk.TclError:
+                errs.append(f"Speckles: type {i} has an invalid colour '{sp['color']}'")
+
+        out = s["output"]
+        if out["image_format"] not in IMAGE_FORMAT_CHOICES:
+            errs.append("Output: unknown image format")
+        if not (1 <= int(out["threads"]) <= 64):
+            errs.append("Output: render threads must be 1..64")
+        if float(out["image_noise"]) < 0 or float(out["point_noise"]) < 0:
+            errs.append("Output: noise sigmas must be >= 0")
+        if not (0.0 <= float(out["dropout_prob"]) <= 1.0):
+            errs.append("Output: dropout probability must be between 0 and 1")
+        pat = out["filename_pattern"]
+        try:
+            a, b, c = pat.format(cam=1, frame=1), pat.format(cam=1, frame=2), pat.format(cam=2, frame=1)
+        except Exception:
+            errs.append("Output: file pattern may only use {cam} and {frame}, "
+                        "e.g. cam{cam:02d}/frame_{frame:05d}")
+        else:
+            if a == b:
+                errs.append("Output: file pattern must contain {frame}, otherwise frames overwrite each other")
+            if len(s["cameras"]) > 1 and a == c:
+                errs.append("Output: file pattern must contain {cam} when there is more than one camera")
+            if os.path.isabs(a) or ".." in a.replace("\\", "/").split("/"):
+                errs.append("Output: file pattern must stay inside the output folder")
+        if out["render_images"]:
+            if not out["folder"].strip():
+                errs.append("Output: choose an output folder to render images")
+            if mesh is not None:
+                geo = texture_geometry(mesh, s)
+                area = geo["tex_w"] * geo["tex_h"] / (geo["ppu"] ** 2)
+                for i, sp in enumerate(s["speckles"]["types"], 1):
+                    n = float(sp["density"]) * area
+                    if sp["enabled"] and n > MAX_SPECKLES_PER_TYPE:
+                        errs.append(f"Speckles: type {i} needs {n:,.0f} speckles "
+                                    f"(limit {MAX_SPECKLES_PER_TYPE:,}); lower its density")
+        return errs
+
+    def _on_apply(self) -> None:
+        """Validate -> compute ground-truth data (fast) -> update output pins ->
+        start the background worker (save .npz, render images)."""
+        st = self._render_state
+        if st is not None and not st["finished"]:
+            messagebox.showinfo("Apply", "A render is still running. Cancel it first.",
+                                parent=self._inspector_win)
+            return
+        s = copy.deepcopy(self._trial)
+        errs = self._validate(s)
+        if errs:
+            shown = "\n".join("- " + e for e in errs[:12])
+            more = f"\n... and {len(errs) - 12} more" if len(errs) > 12 else ""
+            messagebox.showerror("Cannot apply", shown + more, parent=self._inspector_win)
+            return
+        try:
+            results = simulate_data(s)
+        except Exception as e:
+            messagebox.showerror("Cannot apply", f"{type(e).__name__}: {e}", parent=self._inspector_win)
+            return
+
+        out = s["output"]
+        folder = self._output_folder_abs(s)
+        render = bool(out["render_images"])
+        times = [camera_frame_times(c, float(s["motion"]["duration"])) for c in s["cameras"]]
+        total = sum(len(t) for t in times) if render else 0
+        if render and total > 500 and not messagebox.askyesno(
+                "Render images", f"Render {total} images into\n{folder}\n\nContinue?",
+                parent=self._inspector_win):
+            return
+
+        self._applied = s
+        self._results, self._sim_error = results, None
+        self._update_dirty_label()
+        self._update_node_status()
+        if self._request_downstream is not None:
+            self._request_downstream(self.node_id)     # pins carry the new data immediately
+
+        if not folder and not render:
+            return                                      # no folder chosen: nothing to write
+        job = {"settings": s, "folder": folder, "times": times, "results": results, "render": render,
+               "npz_path": self._data_path(s) if folder else "",
+               # Tk colour lookups must happen here, never on the worker thread.
+               "surface_bgr": self._color_bgr(s["mesh"]["surface_color"]),
+               "background_bgr": self._color_bgr(s["mesh"]["background_color"]),
+               "back_bgr": self._color_bgr(s["mesh"]["back_color"]),
+               "speckle_bgr": [self._color_bgr(t["color"]) for t in s["speckles"]["types"]]}
+        state = {"cancel": threading.Event(), "lock": threading.Lock(), "done": 0, "total": total,
+                 "phase": "starting", "finished": False, "error": None}
+        self._render_state = state
+        self._set_render_widgets_running(True)
+        self._update_render_widgets()
+        threading.Thread(target=_apply_worker, args=(job, state), daemon=True, name="sim-render").start()
+        self._poll_after_id = self.canvas.after(250, self._poll_render)
+
+    def _cancel_render(self) -> None:
+        st = self._render_state
+        if st is not None and not st["finished"]:
+            st["cancel"].set()
+            if self._progress_var is not None:
+                self._progress_var.set("cancelling...")
+
+    def _set_render_widgets_running(self, running: bool) -> None:
+        try:
+            if self._apply_btn is not None:
+                self._apply_btn.configure(state=tk.DISABLED if running else tk.NORMAL)
+            if self._cancel_btn is not None:
+                self._cancel_btn.configure(state=tk.NORMAL if running else tk.DISABLED)
+        except tk.TclError:
+            pass
+
+    def _update_render_widgets(self) -> None:
+        st = self._render_state
+        if self._progress is None or self._progress_var is None or st is None:
+            return
+        try:
+            total = max(1, st["total"])
+            if st["phase"] == "rendering":
+                self._progress.configure(maximum=total, value=st["done"])
+                self._progress_var.set(f"rendering {st['done']}/{st['total']} ({100 * st['done'] // total}%)")
+            else:
+                self._progress.configure(maximum=total, value=0)
+                self._progress_var.set(st["phase"])
+        except tk.TclError:
+            pass
+
+    def _poll_render(self) -> None:
+        """Runs on the Tk thread every 250 ms while a job is active, even if the
+        inspector is closed (progress then shows on the node face only)."""
+        self._poll_after_id = None
+        st = self._render_state
+        if st is None or self._destroyed:
+            return
+        self._update_node_status()
+        self._update_render_widgets()
+        if st["finished"]:
+            self._finish_render(st)
+            return
+        try:
+            self._poll_after_id = self.canvas.after(250, self._poll_render)
+        except tk.TclError:
+            pass
+
+    def _finish_render(self, st: dict) -> None:
+        self._render_state = None
+        self._set_render_widgets_running(False)
+        if st["error"]:
+            msg = "failed: " + st["error"]
+        elif st["cancel"].is_set():
+            msg = f"render cancelled ({st['done']}/{st['total']} images written)"
+        elif st["total"]:
+            msg = f"render complete ({st['done']} images)"
+        else:
+            msg = "data saved"
+        try:
+            if self._progress_var is not None:
+                self._progress_var.set(msg)
+            if self._progress is not None:
+                self._progress.configure(value=self._progress["maximum"])
+            if self._status_item is not None:
+                self.canvas.itemconfig(self._status_item, text=msg[:44])
+        except tk.TclError:
+            pass
+        if st["error"]:
+            messagebox.showerror("Image/Data Simulator", st["error"],
+                                 parent=self._inspector_win if self.is_inspector_open() else None)
+
+    # ── help, lifecycle ─────────────────────────────────────────────────
+    def _open_help(self) -> None:
+        if self._help_popup is not None and self._help_popup.winfo_exists():
+            self._help_popup.lift()
+            return
+        popup = tk.Toplevel(self._inspector_win)
+        popup.title("Image/Data Simulator - Help")
+        popup.geometry("720x560")
+        body = tk.Frame(popup, padx=8, pady=8)
+        body.pack(fill="both", expand=True)
+        txt = tk.Text(body, font=("Courier", 9), wrap=tk.WORD, relief=tk.FLAT)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", _HELP_TEXT)
+        txt.configure(state="disabled")
+        popup.bind("<Escape>", lambda _e: popup.destroy())
+        self._help_popup = popup
+
+    def get_help_text(self) -> str:
+        return _HELP_TEXT
+
+    def close_inspector(self) -> None:
+        if self._help_popup is not None:
+            try:
+                self._help_popup.destroy()
+            except tk.TclError:
+                pass
+        super().close_inspector()
+        self._reset_inspector_refs()     # widgets are gone; a running render keeps going
+
+    def on_destroy(self) -> None:
+        self._destroyed = True
+        if self._render_state is not None:
+            self._render_state["cancel"].set()
+        if self._poll_after_id is not None:
+            try:
+                self.canvas.after_cancel(self._poll_after_id)
+            except tk.TclError:
+                pass
+        super().on_destroy()
+
+
+def _apply_worker(job: dict, state: dict) -> None:
+    """Background thread: save the .npz first (so the data survive a cancelled
+    render), then render images. Never touches Tk."""
+    try:
+        if job["npz_path"]:
+            state["phase"] = "saving data"
+            os.makedirs(os.path.dirname(job["npz_path"]), exist_ok=True)
+            save_results_npz(job["npz_path"], job["results"], job["settings"])
+        if job["render"] and not state["cancel"].is_set():
+            _render_worker(job, state)       # sets state["finished"] itself
+            return
+    except Exception as e:
+        state["error"] = f"{type(e).__name__}: {e}"
+        state["cancel"].set()
+    state["finished"] = True

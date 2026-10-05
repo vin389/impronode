@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 from pathlib import Path
 import time
+import traceback
 from typing import Type
 
 from node_editor.base_node        import BaseNode
@@ -12,6 +13,8 @@ from node_editor.execution        import ExecutionMode
 from node_editor.data_flow_engine import DataFlowEngine
 from node_editor.project_io       import load_project, save_project, ProjectFormatError
 from node_editor.project_context  import set_project_file_path, get_project_directory
+from node_editor.ui_style         import apply_notebook_tab_style
+from node_editor                  import link_geometry
 
 
 class NodeEditorApp:
@@ -39,6 +42,7 @@ class NodeEditorApp:
 
     def __init__(self, root: tk.Tk):
         self.root   = root
+        apply_notebook_tab_style(root)     # visible tabs in every node's inspector
         self.engine = DataFlowEngine(root)
         self._tb_drag: dict | None = None
         self._node_type_map: dict[str, Type[BaseNode]] = {}
@@ -59,8 +63,11 @@ class NodeEditorApp:
         self._file_load_last_finished_at: float | None = None
         self._project_progress_window: tk.Toplevel | None = None
         self._project_progress_text: tk.Text | None = None
+        self._project_progress_close_button: tk.Button | None = None
         self._project_progress_start: float | None = None
         self._project_node_load_starts: dict[str, float] = {}
+        self._project_load_file_ready = False
+        self._project_load_execution_done = False
 
         self._node_counter = 0
         # canvas_nodes: node_id -> BaseNode (shared with engine.nodes)
@@ -68,6 +75,10 @@ class NodeEditorApp:
         # Canvas line ids for links
         # link_items: (src_node, src_pin, dst_node, dst_pin) -> canvas line id
         self.link_items: dict[tuple, int] = {}
+        # link_geom: same keys -> curve edit points (link_geometry.normalize() dict)
+        self.link_geom: dict[tuple, dict] = {}
+        # Curve edit mode: the link being edited and the handle being dragged.
+        self._link_edit: dict = {"key": None, "drag": None, "moved": False}
 
         self._build_ui()
         self._toolbox_search_var.trace_add("write", lambda *_args: self._refresh_toolbox_palette())
@@ -288,6 +299,7 @@ class NodeEditorApp:
             try:
                 self.canvas.tag_raise("graph_link")
                 self.canvas.tag_raise("temp_link")
+                self.canvas.tag_raise("link_edit")
             except Exception:
                 pass
         self._clear_hovered_link()
@@ -871,6 +883,7 @@ class NodeEditorApp:
         self.canvas.bind("<B3-Motion>",       self._on_canvas_pan_motion)
         self.canvas.bind("<ButtonRelease-3>", self._on_canvas_pan_release)
         self.canvas.bind("<Delete>",          self._on_delete_key)
+        self.canvas.bind("<Escape>",          lambda _e: self._exit_link_edit())
         # NOTE: Tk ignores letter case for Control-modified key events (a
         # Control-o keypress matches BOTH "<Control-o>" and "<Control-O>"
         # patterns), so binding both here would fire the handler twice per
@@ -913,6 +926,11 @@ class NodeEditorApp:
         item = self._item_at(cx, cy)
         if item is None:
             return None
+        if "graph_link" in self.canvas.gettags(item) or "link_edit" in self.canvas.gettags(item):
+            key = self._link_edit["key"] or self._find_link_key_near(cx, cy)
+            if key is not None:
+                self._enter_link_edit(key)
+                return "break"
 
         tags = self.canvas.gettags(item)
         node_id = self._node_id_from_tags(tags)
@@ -1004,6 +1022,19 @@ class NodeEditorApp:
         menu.add_command(
             label=f"To {dst_id}: {dst_node_name} {dst_pin_label}",
             state=tk.DISABLED,
+        )
+        menu.add_separator()
+        if self._link_edit["key"] == link_key:
+            menu.add_command(label="Done editing curve", command=self._exit_link_edit)
+        else:
+            menu.add_command(
+                label="Edit curve points",
+                command=lambda key=link_key: self._enter_link_edit(key),
+            )
+        menu.add_command(
+            label="Reset curve (horizontal ends)",
+            command=lambda key=link_key: self._reset_link_curve(key),
+            state=tk.DISABLED if link_geometry.is_default(self.link_geom.get(link_key)) else tk.NORMAL,
         )
         menu.add_separator()
         menu.add_command(
@@ -1334,6 +1365,14 @@ class NodeEditorApp:
     def _on_canvas_press(self, event) -> None:
         self.canvas.focus_set()
         cx, cy = self._event_canvas_xy(event)
+        if self._link_edit["key"] is not None:
+            handle = self._link_edit_handle_at(cx, cy)
+            if handle is not None:
+                self._link_edit.update(drag=handle, moved=False)
+                return
+            if self._find_link_key_near(cx, cy) == self._link_edit["key"]:
+                return                       # clicking the edited curve itself keeps edit mode
+            self._exit_link_edit()
         pin_item = self._find_pin_item_near(cx, cy)
         item = pin_item if pin_item is not None else self._item_at(cx, cy)
         if item is None:
@@ -1400,17 +1439,19 @@ class NodeEditorApp:
 
     def _on_canvas_motion(self, event) -> None:
         cx, cy = self._event_canvas_xy(event)
-        if self._linking["active"]:
+        if self._link_edit["drag"] is not None:
+            self._drag_link_edit_handle(cx, cy)
+        elif self._linking["active"]:
             self.canvas.coords(self._linking["line"],
-                               *self.canvas.coords(self._linking["line"])[:2],
-                               cx, cy)
+                               *link_geometry.control_points(self._linking["start"], (cx, cy), None))
         elif self._resize["active"]:
             self._resize_node(cx, cy)
         elif self._drag["mode"] == "move":
             self._move_nodes(cx, cy)
 
     def _on_canvas_hover_motion(self, event) -> None:
-        if self._linking["active"] or self._resize["active"] or self._drag["mode"] == "move":
+        if (self._linking["active"] or self._resize["active"] or self._drag["mode"] == "move"
+                or self._link_edit["drag"] is not None):
             self._clear_hovered_pin()
             self._hover_pin_candidate = None
             self._cancel_pin_hover_after()
@@ -1538,6 +1579,10 @@ class NodeEditorApp:
         self._hover_link_key = None
 
     def _on_canvas_release(self, event) -> None:
+        if self._link_edit["drag"] is not None:
+            if self._link_edit["moved"]:
+                self._mark_dirty()
+            self._link_edit.update(drag=None, moved=False)
         if self._linking["active"]:
             self._try_finish_link(event)
         self._drag  = {"mode": None, "node_id": None, "ox": 0, "oy": 0}
@@ -1560,11 +1605,11 @@ class NodeEditorApp:
         cx_event, cy_event = self._event_canvas_xy(event)
         x1, y1, x2, y2 = self.canvas.coords(item)
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-        line = self.canvas.create_line(cx, cy, cx_event, cy_event,
+        line = self.canvas.create_line(*link_geometry.control_points((cx, cy), (cx_event, cy_event), None),
                                        fill=self.PIN_OUT_COLOR, width=2,
-                                       dash=(4, 2),
+                                       dash=(4, 2), smooth="raw", splinesteps=24,
                                        tags=("temp_link",))
-        self._linking = {"active": True, "line": line,
+        self._linking = {"active": True, "line": line, "start": (cx, cy),
                          "src_node": src_node, "src_pin": src_pin,
                          "src_type": pin_def.type}
 
@@ -1594,11 +1639,12 @@ class NodeEditorApp:
                             # An input pin can only have one incoming link.
                             self._remove_links_to(dst_node, dst_pin)
 
-                            # Turn the temporary dashed line into a solid connection.
+                            # Turn the temporary dashed line into a solid connection
+                            # with the default curve (horizontal at both pins).
                             x1, y1, x2, y2 = self.canvas.coords(item)
                             ex, ey = (x1 + x2) / 2, (y1 + y2) / 2
-                            sx, sy = self.canvas.coords(line)[:2]
-                            self.canvas.coords(line, sx, sy, ex, ey)
+                            self.canvas.coords(line, *link_geometry.control_points(
+                                self._linking["start"], (ex, ey), None))
                             self.canvas.itemconfig(line, dash=())
                             self.canvas.itemconfig(line, tags=("graph_link",))
                             try:
@@ -1613,6 +1659,7 @@ class NodeEditorApp:
                                 dst_pin,
                             )
                             self.link_items[key] = line
+                            self.link_geom[key] = link_geometry.default_geometry()
                             self._set_links_visibility(self._show_links)
 
                             ok = self.engine.add_link(
@@ -1625,6 +1672,7 @@ class NodeEditorApp:
                             if not ok:
                                 self.canvas.delete(line)
                                 del self.link_items[key]
+                                self.link_geom.pop(key, None)
                                 messagebox.showwarning(
                                     "Cycle Dependency",
                                     "This connection would create a cycle and was rejected.",
@@ -1640,6 +1688,7 @@ class NodeEditorApp:
         self._linking = {
             "active": False,
             "line": None,
+            "start": None,
             "src_node": None,
             "src_pin": None,
             "src_type": None,
@@ -1710,6 +1759,9 @@ class NodeEditorApp:
         line_id = self.link_items.pop(key, None)
         if line_id is None:
             return
+        self.link_geom.pop(key, None)
+        if self._link_edit["key"] == key:
+            self._exit_link_edit()
         if self._hover_link_key == key:
             self._hover_link_key = None
         if self._hover_link_candidate == key:
@@ -1840,30 +1892,110 @@ class NodeEditorApp:
         self._mark_dirty()
 
     def _update_links_for_node(self, node_id: str) -> None:
-        node   = self.canvas_nodes[node_id]
-        schema = node.get_pin_schema()
+        for key in [k for k in self.link_items if k[0] == node_id or k[2] == node_id]:
+            self._redraw_link(key)
+        if self._link_edit["key"] is not None and node_id in (self._link_edit["key"][0],
+                                                              self._link_edit["key"][2]):
+            self._draw_link_edit_handles()
 
-        for pin_def in schema.outputs:
-            oid = node.output_pin_items.get(pin_def.name)
-            if oid is None:
-                continue
-            x1, y1, x2, y2 = self.canvas.coords(oid)
-            sx, sy = (x1 + x2) / 2, (y1 + y2) / 2
-            for k, line_id in self.link_items.items():
-                if k[0] == node_id and k[1] == pin_def.name:
-                    coords = self.canvas.coords(line_id)
-                    self.canvas.coords(line_id, sx, sy, coords[2], coords[3])
+    # ══ Link curves and curve editing ═════════════════════════════
 
-        for pin_def in schema.inputs:
-            oid = node.input_pin_items.get(pin_def.name)
-            if oid is None:
-                continue
-            x1, y1, x2, y2 = self.canvas.coords(oid)
-            ex, ey = (x1 + x2) / 2, (y1 + y2) / 2
-            for k, line_id in self.link_items.items():
-                if k[2] == node_id and k[3] == pin_def.name:
-                    coords = self.canvas.coords(line_id)
-                    self.canvas.coords(line_id, coords[0], coords[1], ex, ey)
+    def _pin_center(self, node_id: str, pin_name: str, direction: str) -> tuple[float, float] | None:
+        node = self.canvas_nodes.get(node_id)
+        if node is None:
+            return None
+        items = node.output_pin_items if direction == "out" else node.input_pin_items
+        oid = items.get(pin_name)
+        if oid is None:
+            return None
+        coords = self.canvas.coords(oid)
+        if len(coords) < 4:
+            return None
+        x1, y1, x2, y2 = coords[:4]
+        return (x1 + x2) / 2, (y1 + y2) / 2
+
+    def _link_endpoints(self, key: tuple):
+        s = self._pin_center(key[0], key[1], "out")
+        e = self._pin_center(key[2], key[3], "in")
+        return (s, e) if s is not None and e is not None else (None, None)
+
+    def _redraw_link(self, key: tuple) -> None:
+        line_id = self.link_items.get(key)
+        s, e = self._link_endpoints(key)
+        if line_id is None or s is None:
+            return
+        self.canvas.coords(line_id, *link_geometry.control_points(s, e, self.link_geom.get(key)))
+
+    def _enter_link_edit(self, key: tuple) -> None:
+        if key not in self.link_items:
+            return
+        self._exit_link_edit()
+        self._link_edit = {"key": key, "drag": None, "moved": False}
+        self.canvas.itemconfigure(self.link_items[key], state="normal")
+        self._draw_link_edit_handles()
+
+    def _exit_link_edit(self) -> None:
+        self.canvas.delete("link_edit")
+        self._link_edit = {"key": None, "drag": None, "moved": False}
+
+    def _reset_link_curve(self, key: tuple) -> None:
+        if key not in self.link_items:
+            return
+        self.link_geom[key] = link_geometry.default_geometry()
+        self._redraw_link(key)
+        if self._link_edit["key"] == key:
+            self._draw_link_edit_handles()
+        self._mark_dirty()
+
+    LINK_EDIT_HANDLE = 5          # half-size of the square tangent handles (px)
+    LINK_EDIT_COLOR = "#1f6fd1"
+
+    def _draw_link_edit_handles(self) -> None:
+        """Three edit points: start tangent handle (square, joined to the output
+        pin), middle point on the curve (circle), end tangent handle (square,
+        joined to the input pin)."""
+        self.canvas.delete("link_edit")
+        key = self._link_edit["key"]
+        s, e = self._link_endpoints(key) if key is not None else (None, None)
+        if s is None:
+            return
+        geom = self.link_geom.get(key)
+        c1, c2 = link_geometry.handle_points(s, e, geom)
+        m = link_geometry.mid_point(s, e, geom)
+        col, r = self.LINK_EDIT_COLOR, self.LINK_EDIT_HANDLE
+        for (ax, ay), (hx, hy) in ((s, c1), (e, c2)):
+            self.canvas.create_line(ax, ay, hx, hy, fill=col, dash=(3, 2), tags=("link_edit",))
+        for name, (hx, hy) in (("h1", c1), ("h2", c2)):
+            self.canvas.create_rectangle(hx - r, hy - r, hx + r, hy + r, fill="white", outline=col, width=2,
+                                         tags=("link_edit", "link_edit_handle", f"leh_{name}"))
+        self.canvas.create_oval(m[0] - r - 1, m[1] - r - 1, m[0] + r + 1, m[1] + r + 1, fill="#ffd34d",
+                                outline=col, width=2, tags=("link_edit", "link_edit_handle", "leh_mid"))
+        self.canvas.tag_raise("link_edit")
+
+    def _link_edit_handle_at(self, x: float, y: float) -> str | None:
+        pad = self.LINK_EDIT_HANDLE + 3
+        for item in reversed(self.canvas.find_overlapping(x - pad, y - pad, x + pad, y + pad)):
+            for tag in self.canvas.gettags(item):
+                if tag.startswith("leh_"):
+                    return tag[4:]
+        return None
+
+    def _drag_link_edit_handle(self, x: float, y: float) -> None:
+        key, handle = self._link_edit["key"], self._link_edit["drag"]
+        s, e = self._link_endpoints(key) if key is not None else (None, None)
+        if s is None:
+            return
+        geom = link_geometry.normalize(self.link_geom.get(key))
+        if handle == "h1":
+            geom["h1"] = (x - s[0], y - s[1])
+        elif handle == "h2":
+            geom["h2"] = (x - e[0], y - e[1])
+        else:
+            geom["mid"] = link_geometry.mid_to_frame(s, e, (x, y))
+        self.link_geom[key] = geom
+        self._link_edit["moved"] = True
+        self._redraw_link(key)
+        self._draw_link_edit_handles()
 
     # ══ Helper methods ════════════════════════════════════════════
 
@@ -2110,7 +2242,8 @@ class NodeEditorApp:
         self._mark_dirty()
 
     def _draw_link(self, src_node: str, src_pin: str,
-                   dst_node: str, dst_pin: str, trigger: bool = True) -> bool:
+                   dst_node: str, dst_pin: str, trigger: bool = True,
+                   geometry: dict | None = None) -> bool:
         src = self.canvas_nodes.get(src_node)
         dst = self.canvas_nodes.get(dst_node)
         if src is None or dst is None:
@@ -2125,8 +2258,10 @@ class NodeEditorApp:
         dx1, dy1, dx2, dy2 = self.canvas.coords(dst_oid)
         sx, sy = (sx1 + sx2) / 2, (sy1 + sy2) / 2
         ex, ey = (dx1 + dx2) / 2, (dy1 + dy2) / 2
-        line = self.canvas.create_line(sx, sy, ex, ey,
+        geom = link_geometry.normalize(geometry)
+        line = self.canvas.create_line(*link_geometry.control_points((sx, sy), (ex, ey), geom),
                                        fill=self.PIN_OUT_COLOR, width=2,
+                                       smooth="raw", splinesteps=24,
                                        tags=("graph_link",))
         try:
             self.canvas.tag_raise("graph_link")
@@ -2139,6 +2274,7 @@ class NodeEditorApp:
             return False
 
         self.link_items[(src_node, src_pin, dst_node, dst_pin)] = line
+        self.link_geom[(src_node, src_pin, dst_node, dst_pin)] = geom
         self._set_links_visibility(self._show_links)
         return True
 
@@ -2158,13 +2294,18 @@ class NodeEditorApp:
                 )
 
         links = []
-        for src_node, src_pin, dst_node, dst_pin in self.link_items.keys():
-            links.append({
+        for key in self.link_items.keys():
+            src_node, src_pin, dst_node, dst_pin = key
+            link = {
                 "src_node": src_node,
                 "src_pin": src_pin,
                 "dst_node": dst_node,
                 "dst_pin": dst_pin,
-            })
+            }
+            geometry = link_geometry.to_json_dict(self.link_geom.get(key))
+            if geometry is not None:            # default curves are not written
+                link["geometry"] = geometry
+            links.append(link)
 
         meta = {
             "saved_at_unix": time.time(),
@@ -2209,26 +2350,56 @@ class NodeEditorApp:
         window.title(f"Project {operation} progress")
         window.geometry("760x420")
         window.transient(self.root)
-        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        window.protocol("WM_DELETE_WINDOW", self._close_project_progress)
 
-        text = tk.Text(window, wrap=tk.WORD, font=("Courier", 9),
-                       state=tk.DISABLED)
-        scrollbar = tk.Scrollbar(window, orient=tk.VERTICAL,
+        # Pack order matters: pack hands out space in the order widgets are
+        # packed, and when the window is too small it is the LAST-packed
+        # widgets that get squeezed/clipped. The Text widget requests a
+        # default 24-line height, which (especially at Windows display
+        # scaling > 100%) can leave no room for a button packed after it,
+        # so the button was pushed out of the fixed-size window. Pack the
+        # button row FIRST, on the bottom edge, so it always keeps its
+        # space, then let the text area fill whatever remains.
+        button_row = tk.Frame(window)
+        button_row.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8))
+        close_button = tk.Button(button_row, text="Close", width=10,
+                                 state=tk.DISABLED,
+                                 command=self._close_project_progress)
+        close_button.pack(side=tk.RIGHT)
+
+        text_frame = tk.Frame(window)
+        text_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True,
+                        padx=8, pady=(8, 4))
+        text = tk.Text(text_frame, wrap=tk.WORD, font=("Courier", 9),
+                       height=10, state=tk.DISABLED)
+        scrollbar = tk.Scrollbar(text_frame, orient=tk.VERTICAL,
                                  command=text.yview)
         text.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
-        tk.Button(window, text="Close", command=window.destroy).pack(
-            anchor="e", padx=8, pady=(0, 8))
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self._project_progress_window = window
         self._project_progress_text = text
+        self._project_progress_close_button = close_button
         self._project_progress_start = time.perf_counter()
         self._project_node_load_starts = {}
+        self._project_load_file_ready = False
+        self._project_load_execution_done = False
         self.engine.node_compute_callback = (
             self._on_project_node_computed if operation == "load" else None
         )
         self._append_project_progress(f"Starting project {operation}...")
+
+    def _close_project_progress(self) -> None:
+        button = self._project_progress_close_button
+        if button is None or str(button.cget("state")) != tk.NORMAL:
+            return
+        window = self._project_progress_window
+        if window is not None and window.winfo_exists():
+            window.destroy()
+        self._project_progress_window = None
+        self._project_progress_text = None
+        self._project_progress_close_button = None
 
     def _append_project_progress(self, message: str) -> None:
         text = getattr(self, "_project_progress_text", None)
@@ -2246,7 +2417,7 @@ class NodeEditorApp:
             self._project_progress_text = None
             self._project_progress_window = None
 
-    def _finish_project_progress(self, operation: str) -> None:
+    def _finish_project_progress(self, operation: str, *, failed: bool = False) -> None:
         progress_start = getattr(self, "_project_progress_start", None)
         if progress_start is None:
             return
@@ -2262,11 +2433,24 @@ class NodeEditorApp:
         self._project_progress_start = None
         self.engine.node_compute_callback = None
         self.engine.execution_complete_callback = None
-
+        finished_window = self._project_progress_window
         elapsed = time.perf_counter() - progress_start
         self._append_project_progress(
-            f"Completed (totally took {elapsed:.3f} s to {operation} this project.)"
+            (f"{operation.capitalize()} failed after {elapsed:.3f} s."
+             if failed else f"Completed (totally took {elapsed:.3f} s to {operation} this project.)")
         )
+        button = self._project_progress_close_button
+        if (self._project_progress_window is finished_window
+            and button is not None and button.winfo_exists()):
+            button.configure(state=tk.NORMAL)
+
+    def _on_project_load_execution_complete(self) -> None:
+        self._project_load_execution_done = True
+        self._finish_project_load_if_ready()
+
+    def _finish_project_load_if_ready(self) -> None:
+        if self._project_load_file_ready and self._project_load_execution_done:
+            self._finish_project_progress("load")
 
     def _load_graph(self, nodes_data: list[dict], links_data: list[dict]) -> list[str]:
         self._clear_graph()
@@ -2302,6 +2486,7 @@ class NodeEditorApp:
                 str(lk.get("dst_node", "")),
                 str(lk.get("dst_pin", "")),
                 trigger=False,
+                geometry=lk.get("geometry"),       # absent in older project files -> default curve
             )
             if not ok:
                 issues.append(
@@ -2311,9 +2496,7 @@ class NodeEditorApp:
                 )
 
         if getattr(self, "_project_progress_start", None) is not None:
-            self.engine.execution_complete_callback = (
-                lambda: self._finish_project_progress("load")
-            )
+            self.engine.execution_complete_callback = self._on_project_load_execution_complete
         self.engine.trigger_all()
         return issues
 
@@ -2345,6 +2528,8 @@ class NodeEditorApp:
 
         self.canvas_nodes = {}
         self.link_items = {}
+        self.link_geom = {}
+        self._link_edit = {"key": None, "drag": None, "moved": False}
         self._pin_id_by_key = {}
         self._pin_key_by_id = {}
         self._pin_id_counter = 1
@@ -2463,11 +2648,20 @@ class NodeEditorApp:
                     issues.append(canvas_size_issue)
                 issues.extend(list(meta.get("load_issues", [])) if isinstance(meta, dict) else [])
                 self._show_load_report(issues)
-                if self.engine.execution_complete_callback is None:
-                    self._finish_project_progress("load")
-            except (RuntimeError, ProjectFormatError, OSError, ValueError) as e:
+                if not self.canvas_nodes:
+                    # Nothing to execute, so no execution-complete callback
+                    # may ever arrive; do not wait for one.
+                    self._project_load_execution_done = True
+                self._project_load_file_ready = True
+                self._finish_project_load_if_ready()
+            except Exception as e:
+                # Any failure (not only the "expected" types) must end the
+                # progress run, otherwise Close stays disabled forever and
+                # the dialog cannot be dismissed.
+                if not isinstance(e, (RuntimeError, ProjectFormatError, OSError, ValueError)):
+                    traceback.print_exc()
                 self._append_project_progress(f"Load failed: {e}")
-                self._finish_project_progress("load")
+                self._finish_project_progress("load", failed=True)
                 self._set_project_path(previous_path)
                 messagebox.showerror("Load Failed", str(e), parent=self.root)
         finally:
@@ -2485,9 +2679,11 @@ class NodeEditorApp:
             self._set_clean()
             self._finish_project_progress("save")
             return True
-        except (RuntimeError, OSError, ValueError) as e:
+        except Exception as e:
+            if not isinstance(e, (RuntimeError, OSError, ValueError)):
+                traceback.print_exc()
             self._append_project_progress(f"Save failed: {e}")
-            self._finish_project_progress("save")
+            self._finish_project_progress("save", failed=True)
             messagebox.showerror("Save Failed", str(e), parent=self.root)
             return False
 
@@ -2537,4 +2733,3 @@ class NodeEditorApp:
         self._toolbox_register_category = category
         self._ensure_toolbox_category(category)
         self._refresh_toolbox_palette()
-    

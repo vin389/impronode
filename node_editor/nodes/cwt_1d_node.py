@@ -355,7 +355,7 @@ class Cwt1DNode(BaseNode):
 
         for ax in (self._ax_time, self._ax_map):
             self._pan_state[ax] = {
-                "active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None,
+                "active": False, "inv": None, "p0": None, "xlim0": None, "ylim0": None,
             }
 
         self._canvas_widget.mpl_connect("scroll_event", self._on_plot_scroll)
@@ -392,25 +392,52 @@ class Cwt1DNode(BaseNode):
 
     def _on_plot_press(self, event) -> None:
         ax = event.inaxes
-        if ax is None or event.button != 1 or event.xdata is None:
+        # .get(): the colorbar is also an Axes but is not in _pan_state.
+        state = self._pan_state.get(ax)
+        if state is None or event.button != 1 or event.x is None or event.y is None:
             return
-        self._pan_state[ax].update(
-            active=True, x0=event.xdata, y0=event.ydata,
+        # Pan must be measured against the view as it was at press time.
+        # Reading event.xdata/ydata during the drag (as before) converts
+        # the cursor position with the *current, already-shifted* limits,
+        # so every set_xlim/set_ylim changes the very quantity the next
+        # delta is computed from: the plot lags behind the cursor and
+        # jitters. Freezing the pixel->data transform and the start point
+        # in data space at press time removes that feedback loop.
+        inv = ax.transData.inverted()
+        state.update(
+            active=True, inv=inv,
+            p0=inv.transform((event.x, event.y)),
             xlim0=ax.get_xlim(), ylim0=ax.get_ylim(),
         )
 
+    @staticmethod
+    def _shift_limits(axis, lim0, a0: float, a1: float) -> tuple[float, float]:
+        """Shift lim0 so data point a1 lands where a0 was, in the axis' own
+        scale (linear shifts additively, log shifts multiplicatively)."""
+        tr = axis.get_transform()
+        shift = float(tr.transform(a1)) - float(tr.transform(a0))
+        lo, hi = tr.transform(np.asarray(lim0, dtype=float)) - shift
+        lo, hi = tr.inverted().transform(np.array([lo, hi]))
+        return float(lo), float(hi)
+
     def _on_plot_drag(self, event) -> None:
+        if event.x is None or event.y is None:
+            return
         for ax, state in self._pan_state.items():
             if not state["active"]:
                 continue
-            if event.xdata is None or event.inaxes is not ax:
+            # Pixel coordinates are always valid, so panning keeps working
+            # even when the cursor leaves the axes during the drag.
+            p1 = state["inv"].transform((event.x, event.y))
+            p0 = state["p0"]
+            if not (np.all(np.isfinite(p1)) and np.all(np.isfinite(p0))):
                 continue
-            dx = event.xdata - state["x0"]
-            dy = event.ydata - state["y0"]
-            x0, x1 = state["xlim0"]
-            y0, y1 = state["ylim0"]
-            ax.set_xlim(x0 - dx, x1 - dx)
-            ax.set_ylim(y0 - dy, y1 - dy)
+            new_x = self._shift_limits(ax.xaxis, state["xlim0"], p0[0], p1[0])
+            new_y = self._shift_limits(ax.yaxis, state["ylim0"], p0[1], p1[1])
+            if not (np.all(np.isfinite(new_x)) and np.all(np.isfinite(new_y))):
+                continue
+            ax.set_xlim(new_x)
+            ax.set_ylim(new_y)
             self._canvas_widget.draw_idle()
 
     def _on_plot_release(self, _event) -> None:

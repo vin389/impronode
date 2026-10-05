@@ -966,10 +966,15 @@ class StereoSyncNode(BaseNode):
         # time -- "Link horizontal axis" intentionally does not apply to
         # it (see _on_plot_scroll). _ax_scan's x-axis is candidate shift
         # values, not time either, so it is also excluded from linking.
+        # for ax in (self._ax_traj, self._ax_err_time, self._ax_point_summary, self._ax_scan):
+        #     self._pan_state[ax] = {
+        #         "active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None,
+        #     }
         for ax in (self._ax_traj, self._ax_err_time, self._ax_point_summary, self._ax_scan):
             self._pan_state[ax] = {
-                "active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None,
-            }
+                "active": False, "x_px": None, "y_px": None,
+                "xlim0": None, "ylim0": None, "x_scale": None, "y_scale": None,
+            }        
 
         self._canvas_widget.mpl_connect("scroll_event", self._on_plot_scroll)
         self._canvas_widget.mpl_connect("button_press_event", self._on_plot_press)
@@ -1012,21 +1017,74 @@ class StereoSyncNode(BaseNode):
 
         self._canvas_widget.draw_idle()
 
+    # def _on_plot_press(self, event) -> None:
+    #     ax = event.inaxes
+    #     if ax is None or event.button != 1 or event.xdata is None:
+    #         return
+    #     self._pan_state[ax].update(
+    #         active=True, x0=event.xdata, y0=event.ydata,
+    #         xlim0=ax.get_xlim(), ylim0=ax.get_ylim(),
+    #     )
     def _on_plot_press(self, event) -> None:
         ax = event.inaxes
-        if ax is None or event.button != 1 or event.xdata is None:
+        if ax is None or event.button != 1 or event.x is None:
             return
+        xlim0, ylim0 = ax.get_xlim(), ax.get_ylim()
+        bbox = ax.bbox
+        if bbox.width <= 0 or bbox.height <= 0:
+            return
+        # Scale (data units per pixel) is captured ONCE here and reused for
+        # the whole drag -- see _on_plot_drag's docstring for why this
+        # avoids a feedback loop that re-deriving it from event.xdata/ydata
+        # on every move would create.
         self._pan_state[ax].update(
-            active=True, x0=event.xdata, y0=event.ydata,
-            xlim0=ax.get_xlim(), ylim0=ax.get_ylim(),
+            active=True, x_px=event.x, y_px=event.y, xlim0=xlim0, ylim0=ylim0,
+            x_scale=(xlim0[1] - xlim0[0]) / bbox.width,
+            y_scale=(ylim0[1] - ylim0[0]) / bbox.height,
         )
 
+    # def _on_plot_drag(self, event) -> None:
+    #     for ax, state in self._pan_state.items():
+    #         if not state["active"] or event.xdata is None or event.inaxes is not ax:
+    #             continue
+    #         dx = event.xdata - state["x0"]
+    #         dy = event.ydata - state["y0"]
+    #         x0, x1 = state["xlim0"]
+    #         y0, y1 = state["ylim0"]
+    #         ax.set_xlim(x0 - dx, x1 - dx)
+    #         ax.set_ylim(y0 - dy, y1 - dy)
+    #         self._canvas_widget.draw_idle()
     def _on_plot_drag(self, event) -> None:
+        """Pan by PIXEL displacement, converted to data units with the scale
+        fixed at button-press time -- NOT by re-deriving a delta from
+        event.xdata/event.ydata on every move.
+
+        event.xdata/event.ydata are computed by matplotlib using the axes'
+        CURRENT transform, and this handler itself changes that transform on
+        every call (via set_xlim/set_ylim). Comparing a value computed under
+        the just-changed transform against a reference captured under the
+        ORIGINAL (press-time) transform produces an alternating-sign error
+        series: the applied shift both lags behind the mouse and visibly
+        jitters while dragging, since each step over/under-corrects for the
+        one before it. Pixel coordinates and the data-per-pixel scale stay
+        constant throughout a pure pan (only zooming changes the scale), so
+        converting displacement once with a scale fixed at press time avoids
+        that feedback loop entirely.
+
+        Uses event.x/event.y (figure-wide pixel coordinates) rather than
+        event.xdata/event.ydata, and does not require event.inaxes to still
+        match the panning axis -- so a pan started inside one of the 4
+        stacked subplots keeps tracking the mouse even if the cursor briefly
+        drifts outside that subplot's own bounding box (e.g. into the gap
+        between two stacked subplots), instead of freezing mid-drag.
+        """
+        if event.x is None or event.y is None:
+            return
         for ax, state in self._pan_state.items():
-            if not state["active"] or event.xdata is None or event.inaxes is not ax:
+            if not state["active"]:
                 continue
-            dx = event.xdata - state["x0"]
-            dy = event.ydata - state["y0"]
+            dx = (event.x - state["x_px"]) * state["x_scale"]
+            dy = (event.y - state["y_px"]) * state["y_scale"]
             x0, x1 = state["xlim0"]
             y0, y1 = state["ylim0"]
             ax.set_xlim(x0 - dx, x1 - dx)

@@ -236,13 +236,18 @@ def save_project(
         ws_nodes.append([row.get(c, "") for c in fixed_cols])
 
     ws_links = wb.create_sheet("Links")
-    ws_links.append(["src_node", "src_pin", "dst_node", "dst_pin"])
+    # geometry_json: optional curve edit points (see link_geometry.py); empty
+    # means the default curve. Files written before it existed have only the
+    # first four columns and load as default curves.
+    ws_links.append(["src_node", "src_pin", "dst_node", "dst_pin", "geometry_json"])
     for lk in links:
+        geometry = lk.get("geometry")
         ws_links.append([
             lk.get("src_node", ""),
             lk.get("src_pin", ""),
             lk.get("dst_node", ""),
             lk.get("dst_pin", ""),
+            json.dumps(geometry) if geometry else "",
         ])
 
     # Optional future-facing tables for large array-like data exports/imports.
@@ -399,12 +404,23 @@ def load_project(file_path: str | Path) -> tuple[list[dict[str, Any]], list[dict
             issues.append(
                 f"Links row {row_no}: references unknown node(s) '{src_node_str}' or '{dst_node_str}'."
             )
-        links.append({
+        link = {
             "src_node": src_node_str,
             "src_pin": str(src_pin),
             "dst_node": dst_node_str,
             "dst_pin": str(dst_pin),
-        })
+        }
+        geometry_text = row[4] if len(row) > 4 else None
+        if geometry_text not in (None, ""):
+            try:
+                geometry = json.loads(str(geometry_text))
+            except ValueError:
+                geometry = None
+            if isinstance(geometry, dict):
+                link["geometry"] = geometry
+            else:
+                issues.append(f"Links row {row_no}: unreadable geometry_json; default curve used.")
+        links.append(link)
 
     extra_tables: dict[str, list[dict[str, Any]]] = {}
     for sname in wb.sheetnames:

@@ -1,6 +1,7 @@
 # node_editor/nodes/scatter_plot_node.py
 
 import io
+import re
 import tkinter as tk
 from tkinter import ttk
 
@@ -17,39 +18,59 @@ from node_editor.execution import ExecutionMode
 
 
 _HELP_TEXT = (
-    "2D Scatter Plot Node\n\n"
+    "Scatter Plot 2D Node\n\n"
     "Purpose:\n"
-    "- Plot up to 4 independent curves, each an (n,2) array of [x,y]\n"
-    "  points. Curves may have different lengths. Renders with real\n"
+    "- Plot up to 4 independent curves, each a set of x/y points.\n"
+    "  Curves may have different lengths. Renders with real\n"
     "  matplotlib, both embedded in the inspector and via a standalone\n"
     "  popup window, and generates the equivalent matplotlib source code\n"
     "  live as you change settings.\n\n"
     "Input Pins:\n"
-    "- curve1 .. curve4 [ARRAY, optional]: each an (n,2) array of [x,y]\n"
-    "  points, or a flat array whose length is even (reshaped to (n,2)\n"
-    "  automatically). Pin input overrides that curve's inspector text\n"
-    "  box, same priority convention used elsewhere in this project.\n\n"
+    "- curve1 .. curve4 [ARRAY, optional]: any numpy array. What is\n"
+    "  plotted is decided by the x / y expressions of each curve (see\n"
+    "  below), so the arrays do not have to be (n,2).\n\n"
     "Output Pins:\n"
     "- (none) -- this is a terminal/visualization node.\n\n"
     "Inspector -- per-curve settings (left panel, one tab per curve):\n"
     "- Enabled: include this curve in the plot.\n"
-    "- Points text box: one point per line, \"x y\" or \"x,y\". Read-only\n"
-    "  and pin-driven (showing a preview) when the curve pin is connected.\n"
+    "- Data source (radio button):\n"
+    "    Data from pins cN   - x and y are extracted from the pin arrays\n"
+    "                          by two numpy expressions (x [ ] and y [ ]).\n"
+    "                          The text box below is disabled.\n"
+    "    Data from text box  - one point per line, \"x y\" or \"x,y\".\n"
+    "                          The x / y expression boxes are disabled.\n"
+    "- x / y expressions: ordinary Python/numpy expressions. The pin\n"
+    "  arrays are available as c1, c2, c3, c4 and numpy as np. Defaults\n"
+    "  for curve N are cN[:,0] and cN[:,1] (cN is an (n,2) array).\n"
+    "  Examples:\n"
+    "    c1[:,1] - c1[0,1]            displacement relative to first sample\n"
+    "    (c1[:,1] - c1[0,1]) * 25.4   ... converted from inch to mm\n"
+    "    np.arange(len(c1))           sample index as x\n"
+    "    c2[:,1]                      y of curve 1 taken from pin c2\n"
+    "- A label under the data source shows the number of points, or\n"
+    "  \"Invalid data\" (with a short reason) if an expression fails, x and y\n"
+    "  differ in length, or nothing is left to plot.\n"
     "- Legend name: label shown in the plot legend.\n"
     "- Marker: type, size, color.\n"
     "- Line: width, style, color. Set line width to 0 to hide the\n"
-    "  connecting line and show markers only (a pure scatter plot).\n"
-    "- Abs. / Rel.: Abs. plots y values as given. Rel. subtracts this\n"
-    "  curve's own first y value (y - y[0]) from every point of THIS\n"
-    "  curve before plotting, independently of the other curves -- useful\n"
-    "  for displacement curves where the first sample is the zero/\n"
-    "  reference state. x values are never altered by Rel. mode.\n\n"
+    "  connecting line and show markers only (a pure scatter plot).\n\n"
     "Inspector -- axes/grid settings:\n"
     "- X label / Y label / Title.\n"
+    "- Axis scale: x linear/log, y linear/log. On a log axis,\n"
+    "  non-positive values are not drawn.\n"
     "- Grid on/off, grid line style, grid line color.\n"
     "- Legend on/off, legend location.\n\n"
     "Inspector -- right panel:\n"
     "- Live embedded matplotlib plot, redrawn on every Apply/Compute.\n"
+    "  Mouse interaction on the embedded plot:\n"
+    "    Wheel        - zoom both axes about the cursor\n"
+    "    Ctrl+wheel   - zoom the x axis only\n"
+    "    Shift+wheel  - zoom the y axis only\n"
+    "    Left-drag    - pan\n"
+    "    Double-click - reset view to auto-fit the data\n"
+    "  A zoomed/panned view is kept when settings change or new data\n"
+    "  arrives, until you double-click to reset it (changing an axis\n"
+    "  scale also resets it).\n"
     "- Generated code box: a complete, runnable matplotlib script\n"
     "  reproducing the current plot exactly (data arrays are inlined\n"
     "  as literals), regenerated live whenever the plot is redrawn.\n"
@@ -82,6 +103,8 @@ _LEGEND_LOCATIONS = [
     "upper center", "center",
 ]
 
+_DEFAULT_POINTS_TEXT = "0 0\n1 1\n2 0\n1 -1\n0 -1\n-1 0"
+
 _DEFAULT_CURVE_COLORS = ["red", "blue", "green", "orange"]
 _DEFAULT_CURVE_MARKERS = ["o", "s", "^", "D"]
 
@@ -112,17 +135,67 @@ def _parse_point_block(text: str) -> tuple[np.ndarray | None, int]:
     return np.array(rows, dtype=np.float64), skipped
 
 
-def _coerce_curve_array(arr: np.ndarray, label: str) -> np.ndarray:
-    """Coerce to (n,2) float64, reshaping a flat even-length array."""
-    a = np.asarray(arr, dtype=np.float64)
-    if a.ndim == 1:
-        if a.size == 0 or a.size % 2 != 0:
-            raise ValueError(f"{label}: flat array length {a.size} is not even")
-        a = a.reshape(-1, 2)
-    if a.ndim != 2 or a.shape[1] != 2:
-        raise ValueError(f"{label}: expected shape (n,2), got {a.shape}")
-    finite_mask = np.isfinite(a).all(axis=1)
-    return a[finite_mask]
+# Names usable inside the x / y expressions, besides np and c1..c4.
+_EVAL_BUILTINS = {
+    "len": len, "min": min, "max": max, "abs": abs, "sum": sum,
+    "range": range, "float": float, "int": int, "round": round,
+    "pow": pow, "slice": slice, "zip": zip, "list": list,
+}
+
+_PIN_NAME_RE = re.compile(r"c[1-4]$")
+
+
+def _coerce_pin_array(raw) -> np.ndarray | None:
+    """Pin value -> float64 ndarray for use in expressions, or None."""
+    if raw is None:
+        return None
+    try:
+        a = np.asarray(raw, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    return a if a.size > 0 else None
+
+
+def _eval_pin_expr(expr: str, pins: dict) -> np.ndarray:
+    """Evaluate a numpy expression with c1..c4 bound to the pin arrays.
+    Returns a 1-D float64 array; raises on anything else."""
+    expr = expr.strip()
+    if not expr:
+        raise ValueError("empty expression")
+    env = {"__builtins__": _EVAL_BUILTINS, "np": np}
+    for k, arr in pins.items():
+        if arr is not None:
+            env[f"c{k}"] = arr
+    try:
+        with np.errstate(all="ignore"):
+            val = eval(expr, env)
+    except NameError as e:
+        name = getattr(e, "name", None)
+        if not name:
+            m = re.search(r"'(\w+)'", str(e))
+            name = m.group(1) if m else ""
+        if _PIN_NAME_RE.match(name):
+            raise ValueError(f"pin {name} has no data") from None
+        raise
+    a = np.asarray(val, dtype=np.float64)
+    if a.ndim != 1:
+        raise ValueError(f"expected a 1-D array, got shape {a.shape}")
+    return a
+
+
+def _short(e: Exception) -> str:
+    msg = str(e).strip() or type(e).__name__
+    return msg if len(msg) <= 70 else msg[:67] + "..."
+
+
+def _points_msg(n: int, dropped: int = 0, skipped: int = 0) -> str:
+    msg = f"{n} point" + ("" if n == 1 else "s")
+    notes = []
+    if dropped:
+        notes.append(f"{dropped} non-finite dropped")
+    if skipped:
+        notes.append(f"{skipped} bad line" + ("" if skipped == 1 else "s") + " skipped")
+    return msg + (f"  ({', '.join(notes)})" if notes else "")
 
 
 def _py_repr_array(arr: np.ndarray) -> str:
@@ -133,16 +206,16 @@ def _py_repr_array(arr: np.ndarray) -> str:
 
 class ScatterPlotNode(BaseNode):
     """
-    2D scatter/line plot node for up to 4 independently-styled curves,
-    each an (n,2) array of [x,y] points with independently settable
-    length. Renders with a real embedded matplotlib figure, generates
+    2D scatter/line plot node for up to 4 independently-styled curves.
+    Each curve's x/y data comes either from numpy expressions applied
+    to the pin arrays c1..c4, or from a manual text box of points. Renders with a real embedded matplotlib figure, generates
     equivalent matplotlib source code live, and can pop open a
     standalone matplotlib window built fresh from current settings.
     """
 
     EXECUTION_MODE = ExecutionMode.SYNC
     NODE_TYPE = "scatter_plot"
-    DISPLAY_NAME = "2D Scatter Plot"
+    DISPLAY_NAME = "Scatter Plot 2D"
     CATEGORY = "process"
     SEARCH_KEYWORDS = ("plot", "scatter", "chart", "curve", "matplotlib",
                        "graph", "line plot", "xy plot")
@@ -177,6 +250,14 @@ class ScatterPlotNode(BaseNode):
         self._grid_color_var = tk.StringVar(value="gray")
         self._legend_on_var = tk.BooleanVar(value=True)
         self._legend_loc_var = tk.StringVar(value="best")
+        self._xscale_var = tk.StringVar(value="linear")   # "linear" or "log"
+        self._yscale_var = tk.StringVar(value="linear")
+
+        # Last array received on each curve pin (None = nothing connected).
+        # Kept so x/y expressions can be re-evaluated while editing in the
+        # inspector, without waiting for the next graph execution.
+        self._pin_arrays: dict[int, np.ndarray | None] = {
+            i: None for i in range(1, self.MAX_CURVES + 1)}
 
         self._status_var = tk.StringVar(value="not plotted yet")
 
@@ -191,13 +272,18 @@ class ScatterPlotNode(BaseNode):
                 "line_width_var": tk.DoubleVar(value=1.5),
                 "line_style_var": tk.StringVar(value="-"),
                 "line_color_var": tk.StringVar(value=_DEFAULT_CURVE_COLORS[i - 1]),
-                "mode_var": tk.StringVar(value="abs"),   # "abs" or "rel"
-                "status_var": tk.StringVar(value="no data"),
-                "text_cache": "",
+                "source_var": tk.StringVar(value="pin"),   # "pin" or "text"
+                "x_expr_var": tk.StringVar(value=f"c{i}[:,0]"),
+                "y_expr_var": tk.StringVar(value=f"c{i}[:,1]"),
+                "points_var": tk.StringVar(value="no data"),
+                "text_cache": _DEFAULT_POINTS_TEXT,
                 "text_widget": None,
+                "x_entry": None,
+                "y_entry": None,
                 "pin_indicator": None,
+                "points_label": None,
                 "data": np.empty((0, 2), dtype=np.float64),
-                "from_pin": False,
+                "valid": False,
             }
 
         self._fig = None
@@ -205,6 +291,15 @@ class ScatterPlotNode(BaseNode):
         self._fig_canvas_widget: FigureCanvasTkAgg | None = None
         self._code_text_widget: tk.Text | None = None
         self._help_popup: tk.Toplevel | None = None
+
+        # Interactive view state for the embedded plot. _view_locked is
+        # True once the user has zoomed/panned; _redraw() then restores
+        # the user's limits instead of auto-fitting the data.
+        self._view_locked: bool = False
+        self._pan_state: dict = {
+            "active": False, "inv": None, "p0": None,
+            "xlim0": None, "ylim0": None,
+        }
 
     # ── body ──────────────────────────────────────────────────────
 
@@ -265,6 +360,7 @@ class ScatterPlotNode(BaseNode):
             win.minsize(min_w, min_h)
             win.geometry(f"{min_w}x{min_h}")
 
+        self._resolve_all_curves()
         self._redraw()
 
     def _make_scrollable(self, parent: tk.Frame) -> tk.Frame:
@@ -306,32 +402,58 @@ class ScatterPlotNode(BaseNode):
         tk.Entry(top_row, textvariable=cfg["legend_var"], width=16,
                  font=("Arial", 9)).pack(side="left")
 
-        pin_row = tk.Frame(inner)
-        pin_row.pack(fill="x", padx=8)
-        pin_ind = tk.Label(pin_row, text="●" if cfg["from_pin"] else "○", font=("Arial", 9),
-                          fg="#226600" if cfg["from_pin"] else "#aaaaaa", width=2)
-        pin_ind.pack(side="left")
-        cfg["pin_indicator"] = pin_ind
-        tk.Label(pin_row, text=f"curve{i}: one point per line \"x y\" or \"x,y\"",
-                font=("Arial", 8), fg="#555555").pack(side="left")
+        # ── data source: pins (numpy expressions) or manual text box ──
+        data_frame = tk.LabelFrame(inner, text="Data", font=("Arial", 9), **pad)
+        data_frame.pack(fill="x", **pad)
 
-        text_widget = tk.Text(inner, height=6, font=("Courier", 8), wrap=tk.NONE)
-        text_widget.pack(fill="x", padx=8)
+        pin_row = tk.Frame(data_frame)
+        pin_row.pack(fill="x")
+        tk.Radiobutton(pin_row, text=f"Data from pins c{i}", variable=cfg["source_var"],
+                      value="pin", font=("Arial", 9),
+                      command=lambda i=i: self._on_source_changed(i)).pack(side="left")
+        pin_ind = tk.Label(pin_row, text="○ pin empty", font=("Arial", 8), fg="#aaaaaa")
+        pin_ind.pack(side="left", padx=(8, 0))
+        cfg["pin_indicator"] = pin_ind
+
+        expr_row = tk.Frame(data_frame)
+        expr_row.pack(fill="x", padx=(24, 0), pady=(2, 0))
+        tk.Label(expr_row, text="x", font=("Arial", 9)).pack(side="left")
+        x_entry = tk.Entry(expr_row, textvariable=cfg["x_expr_var"], width=14,
+                           font=("Courier", 9))
+        x_entry.pack(side="left", fill="x", expand=True, padx=(3, 8))
+        tk.Label(expr_row, text="y", font=("Arial", 9)).pack(side="left")
+        y_entry = tk.Entry(expr_row, textvariable=cfg["y_expr_var"], width=14,
+                           font=("Courier", 9))
+        y_entry.pack(side="left", fill="x", expand=True, padx=(3, 0))
+        for entry in (x_entry, y_entry):
+            entry.bind("<KeyRelease>", lambda e: self._refresh_local())
+        cfg["x_entry"] = x_entry
+        cfg["y_entry"] = y_entry
+        tk.Label(data_frame,
+                text="numpy expressions using c1..c4 and np, e.g. (c1[:,1]-c1[0,1])*25.4",
+                font=("Arial", 7), fg="#888888", anchor="w").pack(fill="x", padx=(24, 0))
+
+        tk.Radiobutton(data_frame, text="Data from text box", variable=cfg["source_var"],
+                      value="text", font=("Arial", 9),
+                      command=lambda i=i: self._on_source_changed(i)
+                      ).pack(anchor="w", pady=(6, 0))
+        tk.Label(data_frame,
+                text=f"Curve {i}: one point per line \"x y\" or \"x,y\" (e.g. 0 0\\n  1,2\\n  2,3)",
+                font=("Arial", 8), fg="#555555", anchor="w").pack(fill="x", padx=(24, 0))
+
+        text_widget = tk.Text(data_frame, height=6, font=("Courier", 8), wrap=tk.NONE)
         text_widget.insert("1.0", cfg["text_cache"])
-        if cfg["from_pin"]:
-            text_widget.configure(state="disabled")
+        text_widget.pack(fill="x", padx=(24, 0), pady=(0, 2))
+        text_widget.bind("<KeyRelease>", lambda e: self._refresh_local())
         cfg["text_widget"] = text_widget
 
-        # ── mode: abs / rel ───────────────────────────────────────
-        mode_frame = tk.LabelFrame(inner, text="Y value mode", font=("Arial", 9), **pad)
-        mode_frame.pack(fill="x", **pad)
-        tk.Radiobutton(mode_frame, text="Abs. (plot y as given)",
-                      variable=cfg["mode_var"], value="abs", font=("Arial", 9),
-                      command=self._redraw).pack(anchor="w")
-        tk.Radiobutton(mode_frame,
-                      text="Rel. (plot y - y[0]; first point becomes 0, e.g. displacement)",
-                      variable=cfg["mode_var"], value="rel", font=("Arial", 9),
-                      command=self._redraw).pack(anchor="w")
+        points_lbl = tk.Label(data_frame, textvariable=cfg["points_var"],
+                              font=("Arial", 9, "bold"), anchor="w")
+        points_lbl.pack(fill="x", pady=(4, 0))
+        cfg["points_label"] = points_lbl
+
+        self._apply_source_ui(i)
+        self._update_curve_entry_ui(i)
 
         # ── marker ────────────────────────────────────────────────
         marker_frame = tk.LabelFrame(inner, text="Marker", font=("Arial", 9), **pad)
@@ -378,9 +500,6 @@ class ScatterPlotNode(BaseNode):
         for var in (cfg["marker_var"], cfg["line_style_var"]):
             var.trace_add("write", lambda *_a: self._redraw())
 
-        tk.Label(inner, textvariable=cfg["status_var"], font=("Arial", 8),
-                fg="#666666", anchor="w").pack(fill="x", padx=8, pady=(4, 0))
-
         tk.Button(inner, text="Apply (parse points / redraw)", font=("Arial", 9, "bold"),
                   bg="#446622", fg="white", activebackground="#557733", relief=tk.FLAT,
                   padx=10, pady=3, command=self._on_apply).pack(anchor="w", padx=8, pady=8)
@@ -399,6 +518,19 @@ class ScatterPlotNode(BaseNode):
             entry = tk.Entry(row, textvariable=var, font=("Arial", 9))
             entry.pack(side="left", fill="x", expand=True)
             entry.bind("<KeyRelease>", lambda e: self._redraw())
+
+        scale_frame = tk.LabelFrame(inner, text="Axis scale", font=("Arial", 9), **pad)
+        scale_frame.pack(fill="x", **pad)
+        for label, var in [("X axis:", self._xscale_var), ("Y axis:", self._yscale_var)]:
+            row = tk.Frame(scale_frame)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=label, font=("Arial", 9), width=10, anchor="w").pack(side="left")
+            for text, value in (("linear", "linear"), ("log", "log")):
+                tk.Radiobutton(row, text=text, variable=var, value=value,
+                              font=("Arial", 9), command=self._on_scale_changed
+                              ).pack(side="left", padx=(0, 10))
+        tk.Label(scale_frame, text="(log scale: non-positive values are not drawn)",
+                font=("Arial", 7), fg="#888888").pack(anchor="w")
 
         grid_frame = tk.LabelFrame(inner, text="Grid", font=("Arial", 9), **pad)
         grid_frame.pack(fill="x", **pad)
@@ -441,6 +573,13 @@ class ScatterPlotNode(BaseNode):
         self._fig_canvas_widget = FigureCanvasTkAgg(self._fig, master=plot_frame)
         self._fig_canvas_widget.get_tk_widget().pack(fill="both", expand=True)
 
+        self._view_locked = False
+        self._pan_state.update(active=False, inv=None, p0=None, xlim0=None, ylim0=None)
+        self._fig_canvas_widget.mpl_connect("scroll_event", self._on_plot_scroll)
+        self._fig_canvas_widget.mpl_connect("button_press_event", self._on_plot_press)
+        self._fig_canvas_widget.mpl_connect("motion_notify_event", self._on_plot_drag)
+        self._fig_canvas_widget.mpl_connect("button_release_event", self._on_plot_release)
+
         btn_row = tk.Frame(parent)
         btn_row.pack(fill="x", **pad)
         tk.Button(btn_row, text="Open in matplotlib window", font=("Arial", 9, "bold"),
@@ -467,8 +606,10 @@ class ScatterPlotNode(BaseNode):
     def _get_curve_text(self, i: int) -> str:
         cfg = self._curves[i]
         w = cfg.get("text_widget")
-        if w is not None and w.winfo_exists() and not cfg.get("from_pin", False):
-            cfg["text_cache"] = w.get("1.0", tk.END)
+        if w is not None and w.winfo_exists():
+            # get() works on a disabled Text too; "end-1c" drops Tk's
+            # implicit trailing newline so the text does not grow.
+            cfg["text_cache"] = w.get("1.0", "end-1c")
         return cfg["text_cache"]
 
     def _set_curve_text(self, i: int, text: str) -> None:
@@ -482,29 +623,45 @@ class ScatterPlotNode(BaseNode):
             w.insert("1.0", text)
             w.configure(state=state_before)
 
+    def _apply_source_ui(self, i: int) -> None:
+        """Enable/disable the x/y expression boxes and the points text box
+        according to the curve's data-source radio button."""
+        cfg = self._curves[i]
+        use_pin = cfg["source_var"].get() == "pin"
+        for key in ("x_entry", "y_entry"):
+            w = cfg.get(key)
+            if w is not None and w.winfo_exists():
+                w.configure(state="normal" if use_pin else "disabled")
+        tw = cfg.get("text_widget")
+        if tw is not None and tw.winfo_exists():
+            tw.configure(state="disabled" if use_pin else "normal")
+
     def _update_curve_entry_ui(self, i: int) -> None:
         cfg = self._curves[i]
+        has_pin = self._pin_arrays.get(i) is not None
         pin_lbl = cfg.get("pin_indicator")
         if pin_lbl is not None and pin_lbl.winfo_exists():
-            pin_lbl.configure(text="●" if cfg["from_pin"] else "○",
-                             fg="#226600" if cfg["from_pin"] else "#aaaaaa")
-        w = cfg.get("text_widget")
-        if w is None or not w.winfo_exists():
-            return
-        if cfg["from_pin"] and cfg["data"].shape[0] > 0:
-            lines = [f"{x:.6g}  {y:.6g}" for x, y in cfg["data"][:10]]
-            if cfg["data"].shape[0] > 10:
-                lines.append("...")
-            w.configure(state="normal")
-            w.delete("1.0", tk.END)
-            w.insert("1.0", "\n".join(lines))
-            w.configure(state="disabled")
-        else:
-            w.configure(state="normal")
-            current = w.get("1.0", tk.END)
-            if current.strip() != cfg["text_cache"].strip():
-                w.delete("1.0", tk.END)
-                w.insert("1.0", cfg["text_cache"])
+            pin_lbl.configure(text="● pin has data" if has_pin else "○ pin empty",
+                             fg="#226600" if has_pin else "#aaaaaa")
+        pts_lbl = cfg.get("points_label")
+        if pts_lbl is not None and pts_lbl.winfo_exists():
+            pts_lbl.configure(fg="#333333" if cfg["valid"] else "#cc0000")
+
+    def _on_source_changed(self, i: int) -> None:
+        self._apply_source_ui(i)
+        self._refresh_local()
+
+    def _on_scale_changed(self) -> None:
+        # Limits from a previous scale can be invalid on the new one
+        # (e.g. <= 0 on a log axis), so go back to auto-fit.
+        self._view_locked = False
+        self._redraw()
+
+    def _refresh_local(self) -> None:
+        """Re-resolve data from the current inspector settings and the last
+        pin values, then redraw. No graph execution is triggered."""
+        self._resolve_all_curves()
+        self._redraw()
 
     def _on_apply(self) -> None:
         if self._request_downstream:
@@ -519,7 +676,7 @@ class ScatterPlotNode(BaseNode):
             self._help_popup.lift()
             return
         popup = tk.Toplevel()
-        popup.title("2D Scatter Plot - Help")
+        popup.title("Scatter Plot 2D - Help")
         popup.geometry("700x600")
         popup.resizable(True, True)
         try:
@@ -546,54 +703,74 @@ class ScatterPlotNode(BaseNode):
     # ── plotted-data resolution (shared by compute / redraw / popup / code) ──
 
     def _resolve_all_curves(self, inputs: dict | None = None) -> None:
-        """Read pins (if inputs given) and/or text boxes into cfg['data'],
-        applying abs./rel. mode. Always updates status_var/pin indicator."""
+        """Refresh cached pin arrays (if inputs given), then rebuild every
+        curve's (n,2) data, points label and validity flag from its data
+        source (pin expressions or text box)."""
+        if inputs is not None:
+            for i in range(1, self.MAX_CURVES + 1):
+                self._pin_arrays[i] = _coerce_pin_array(inputs.get(f"curve{i}"))
+
         for i in range(1, self.MAX_CURVES + 1):
             cfg = self._curves[i]
-            raw = inputs.get(f"curve{i}") if inputs is not None else None
-            text = self._get_curve_text(i)
-
-            try:
-                if raw is not None and isinstance(raw, np.ndarray) and raw.size > 0:
-                    arr = _coerce_curve_array(raw, f"curve{i}")
-                    cfg["from_pin"] = True
-                    skipped = 0
-                else:
-                    parsed, skipped = _parse_point_block(text)
-                    arr = (_coerce_curve_array(parsed, f"curve{i}")
-                          if parsed is not None else np.empty((0, 2), dtype=np.float64))
-                    cfg["from_pin"] = False
-            except Exception as e:
-                arr = np.empty((0, 2), dtype=np.float64)
-                cfg["from_pin"] = False
-                skipped = 0
-                cfg["status_var"].set(f"error: {e}")
-                cfg["data"] = arr
-                self._update_curve_entry_ui(i)
-                continue
-
+            arr, msg, valid = self._resolve_curve(i)
             cfg["data"] = arr
-            if arr.shape[0] > 0:
-                cfg["status_var"].set(
-                    f"{arr.shape[0]} pts" + (f"  ({skipped} skipped)" if skipped else ""))
-            else:
-                cfg["status_var"].set("no data" if skipped == 0 else f"0 pts ({skipped} skipped)")
+            cfg["valid"] = valid
+            cfg["points_var"].set(msg)
             self._update_curve_entry_ui(i)
 
-    def _plotted_xy(self, i: int) -> tuple[np.ndarray, np.ndarray] | None:
+    def _resolve_curve(self, i: int) -> tuple[np.ndarray, str, bool]:
+        """Returns (data (n,2) float64, message for the points label, valid)."""
         cfg = self._curves[i]
-        data = cfg["data"]
+        empty = np.empty((0, 2), dtype=np.float64)
+
+        if cfg["source_var"].get() == "text":
+            parsed, skipped = _parse_point_block(self._get_curve_text(i))
+            if parsed is None:
+                extra = f" ({skipped} bad line{'s' if skipped != 1 else ''})" if skipped else ""
+                return empty, f"Invalid data: no valid points{extra}", False
+            good = np.isfinite(parsed).all(axis=1)
+            arr = parsed[good]
+            if arr.shape[0] == 0:
+                return empty, "Invalid data: no finite points", False
+            return arr, _points_msg(arr.shape[0], skipped=skipped), True
+
+        try:
+            x = _eval_pin_expr(cfg["x_expr_var"].get(), self._pin_arrays)
+        except Exception as e:
+            return empty, f"Invalid data: x: {_short(e)}", False
+        try:
+            y = _eval_pin_expr(cfg["y_expr_var"].get(), self._pin_arrays)
+        except Exception as e:
+            return empty, f"Invalid data: y: {_short(e)}", False
+
+        if x.size == 0 or y.size == 0:
+            return empty, "Invalid data: empty", False
+        if x.size != y.size:
+            return empty, f"Invalid data: x has {x.size} points, y has {y.size}", False
+
+        good = np.isfinite(x) & np.isfinite(y)
+        if not good.any():
+            return empty, "Invalid data: no finite points", False
+        arr = np.column_stack([x[good], y[good]])
+        return arr, _points_msg(arr.shape[0], dropped=int((~good).sum())), True
+
+    def _plotted_xy(self, i: int) -> tuple[np.ndarray, np.ndarray] | None:
+        data = self._curves[i]["data"]
         if data.shape[0] == 0:
             return None
-        x = data[:, 0]
-        y = data[:, 1]
-        if cfg["mode_var"].get() == "rel":
-            y = y - y[0]
-        return x, y
+        return data[:, 0], data[:, 1]
 
     # ── drawing (shared by embedded canvas + popup window) ───────────
 
     def _style_axes(self, ax) -> None:
+        if self._xscale_var.get() == "log":
+            ax.set_xscale("log", nonpositive="mask")
+        else:
+            ax.set_xscale("linear")
+        if self._yscale_var.get() == "log":
+            ax.set_yscale("log", nonpositive="mask")
+        else:
+            ax.set_yscale("linear")
         ax.set_xlabel(self._xlabel_var.get())
         ax.set_ylabel(self._ylabel_var.get())
         title = self._title_var.get().strip()
@@ -635,9 +812,101 @@ class ScatterPlotNode(BaseNode):
             ax.legend(loc=self._legend_loc_var.get())
         return any_drawn
 
+    # ── mouse wheel zoom / drag pan (embedded plot) ───────────────
+
+    @staticmethod
+    def _zoom_limits(axis, lim, center: float, factor: float) -> tuple[float, float]:
+        """Scale lim about `center` by `factor`, in the axis' own scale
+        (linear zooms additively, log multiplicatively, so limits stay > 0)."""
+        tr = axis.get_transform()
+        c = float(tr.transform(center))
+        lo, hi = (float(v) for v in tr.transform(np.asarray(lim, dtype=float)))
+        new = np.array([c - (c - lo) * factor, c - (c - hi) * factor])
+        new_lo, new_hi = tr.inverted().transform(new)
+        if not (np.isfinite(new_lo) and np.isfinite(new_hi)):
+            return tuple(lim)
+        return float(new_lo), float(new_hi)
+
+    @staticmethod
+    def _shift_limits(axis, lim0, a0: float, a1: float) -> tuple[float, float]:
+        """Shift lim0 so data point a1 lands where a0 was, in the axis' own
+        scale (linear shifts additively, log multiplicatively)."""
+        tr = axis.get_transform()
+        shift = float(tr.transform(a1)) - float(tr.transform(a0))
+        lo, hi = tr.transform(np.asarray(lim0, dtype=float)) - shift
+        new_lo, new_hi = tr.inverted().transform(np.array([lo, hi]))
+        if not (np.isfinite(new_lo) and np.isfinite(new_hi)):
+            return tuple(lim0)
+        return float(new_lo), float(new_hi)
+
+    def _on_plot_scroll(self, event) -> None:
+        ax = self._ax
+        if ax is None or event.inaxes is not ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        factor = 0.9 if event.button == "up" else 1.1
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        key = getattr(event, "key", None) or ""
+        # event.key can be a combination such as "ctrl+shift"
+        mods = set(key.split("+"))
+
+        # Ctrl+wheel: zoom x only. Shift+wheel: zoom y only.
+        # No modifier: zoom both axes together.
+        if mods & {"control", "ctrl"}:
+            ax.set_xlim(self._zoom_limits(ax.xaxis, xlim, event.xdata, factor))
+        elif "shift" in mods:
+            ax.set_ylim(self._zoom_limits(ax.yaxis, ylim, event.ydata, factor))
+        else:
+            ax.set_xlim(self._zoom_limits(ax.xaxis, xlim, event.xdata, factor))
+            ax.set_ylim(self._zoom_limits(ax.yaxis, ylim, event.ydata, factor))
+
+        self._view_locked = True
+        self._fig_canvas_widget.draw_idle()
+
+    def _on_plot_press(self, event) -> None:
+        ax = self._ax
+        if ax is None or event.inaxes is not ax or event.button != 1:
+            return
+        if getattr(event, "dblclick", False):
+            # Double-click: drop the user's view and auto-fit the data again.
+            self._view_locked = False
+            self._pan_state["active"] = False
+            self._redraw()
+            return
+        # Pan is computed in the data coordinates of the view at press
+        # time (fixed inverse transform), so the plot does not jitter as
+        # the limits change during the drag.
+        inv = ax.transData.inverted()
+        self._pan_state.update(
+            active=True, inv=inv,
+            p0=inv.transform((event.x, event.y)),
+            xlim0=ax.get_xlim(), ylim0=ax.get_ylim(),
+        )
+
+    def _on_plot_drag(self, event) -> None:
+        st = self._pan_state
+        ax = self._ax
+        if not st["active"] or ax is None or event.x is None or event.y is None:
+            return
+        p1 = st["inv"].transform((event.x, event.y))
+        p0 = st["p0"]
+        ax.set_xlim(self._shift_limits(ax.xaxis, st["xlim0"], p0[0], p1[0]))
+        ax.set_ylim(self._shift_limits(ax.yaxis, st["ylim0"], p0[1], p1[1]))
+        self._view_locked = True
+        self._fig_canvas_widget.draw_idle()
+
+    def _on_plot_release(self, _event) -> None:
+        self._pan_state["active"] = False
+
     def _redraw(self) -> None:
         if self._ax is None or self._fig_canvas_widget is None:
             return
+        # Keep the user's zoom/pan across redraws (setting changes, new
+        # pin data); ax.clear() would otherwise reset it to auto-fit.
+        saved_view = ((self._ax.get_xlim(), self._ax.get_ylim())
+                      if self._view_locked else None)
         self._ax.clear()
         any_drawn = self._plot_all_curves(self._ax)
         self._style_axes(self._ax)
@@ -645,6 +914,9 @@ class ScatterPlotNode(BaseNode):
             self._ax.text(0.5, 0.5, "No enabled curve has data",
                          ha="center", va="center", transform=self._ax.transAxes,
                          color="#888888")
+        if saved_view is not None and any_drawn:
+            self._ax.set_xlim(saved_view[0])
+            self._ax.set_ylim(saved_view[1])
         self._fig.tight_layout()
         self._fig_canvas_widget.draw_idle()
         self._status_var.set("plotted" if any_drawn else "no data to plot")
@@ -688,6 +960,9 @@ class ScatterPlotNode(BaseNode):
             x, y = xy
             arr = np.column_stack([x, y])
             var_name = f"curve{i}"
+            if cfg["source_var"].get() == "pin":
+                lines.append(f"# curve {i}: x = {cfg['x_expr_var'].get().strip()}"
+                             f"   y = {cfg['y_expr_var'].get().strip()}")
             lines.append(f"{var_name} = {_py_repr_array(arr)}")
             lines.append(f"{var_name}_x = [p[0] for p in {var_name}]")
             lines.append(f"{var_name}_y = [p[1] for p in {var_name}]")
@@ -710,6 +985,10 @@ class ScatterPlotNode(BaseNode):
             )
             lines.append("")
 
+        if self._xscale_var.get() == "log":
+            lines.append("ax.set_xscale('log', nonpositive='mask')")
+        if self._yscale_var.get() == "log":
+            lines.append("ax.set_yscale('log', nonpositive='mask')")
         lines.append(f"ax.set_xlabel({self._xlabel_var.get()!r})")
         lines.append(f"ax.set_ylabel({self._ylabel_var.get()!r})")
         title = self._title_var.get().strip()
@@ -758,7 +1037,9 @@ class ScatterPlotNode(BaseNode):
                 "line_width": float(cfg["line_width_var"].get()),
                 "line_style": cfg["line_style_var"].get(),
                 "line_color": cfg["line_color_var"].get(),
-                "mode": cfg["mode_var"].get(),
+                "source": cfg["source_var"].get(),
+                "x_expr": cfg["x_expr_var"].get(),
+                "y_expr": cfg["y_expr_var"].get(),
                 "text": cfg["text_cache"],
             })
         return {
@@ -770,6 +1051,8 @@ class ScatterPlotNode(BaseNode):
             "grid_color": self._grid_color_var.get(),
             "legend_on": bool(self._legend_on_var.get()),
             "legend_loc": self._legend_loc_var.get(),
+            "xscale": self._xscale_var.get(),
+            "yscale": self._yscale_var.get(),
             "curves": curves_params,
         }
 
@@ -783,6 +1066,10 @@ class ScatterPlotNode(BaseNode):
         self._grid_color_var.set(str(params.get("grid_color", "gray")))
         self._legend_on_var.set(bool(params.get("legend_on", True)))
         self._legend_loc_var.set(str(params.get("legend_loc", "best")))
+        xs = str(params.get("xscale", "linear"))
+        ys = str(params.get("yscale", "linear"))
+        self._xscale_var.set(xs if xs in ("linear", "log") else "linear")
+        self._yscale_var.set(ys if ys in ("linear", "log") else "linear")
 
         saved_curves = params.get("curves", [])
         for i in range(1, self.MAX_CURVES + 1):
@@ -796,14 +1083,25 @@ class ScatterPlotNode(BaseNode):
             cfg["line_width_var"].set(float(saved.get("line_width", 1.5)))
             cfg["line_style_var"].set(str(saved.get("line_style", "-")))
             cfg["line_color_var"].set(str(saved.get("line_color", _DEFAULT_CURVE_COLORS[i - 1])))
-            cfg["mode_var"].set(str(saved.get("mode", "abs")))
-            self._set_curve_text(i, str(saved.get("text", "")))
+            src = str(saved.get("source", "pin"))
+            cfg["source_var"].set(src if src in ("pin", "text") else "pin")
+            cfg["x_expr_var"].set(str(saved.get("x_expr", f"c{i}[:,0]")))
+            if "y_expr" in saved:
+                cfg["y_expr_var"].set(str(saved["y_expr"]))
+            elif saved.get("mode") == "rel":
+                # Older files had an "Rel." mode (y - y[0]); keep that result.
+                cfg["y_expr_var"].set(f"c{i}[:,1]-c{i}[0,1]")
+            else:
+                cfg["y_expr_var"].set(f"c{i}[:,1]")
+            self._set_curve_text(i, str(saved.get("text", _DEFAULT_POINTS_TEXT)))
+            self._apply_source_ui(i)
 
     def close_inspector(self) -> None:
         for i in range(1, self.MAX_CURVES + 1):
             self._get_curve_text(i)  # flush before losing the widget
-            self._curves[i]["text_widget"] = None
-            self._curves[i]["pin_indicator"] = None
+            for key in ("text_widget", "x_entry", "y_entry",
+                        "pin_indicator", "points_label"):
+                self._curves[i][key] = None
         if self._fig is not None:
             plt.close(self._fig)
         self._fig = None

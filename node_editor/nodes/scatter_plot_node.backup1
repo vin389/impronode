@@ -1,0 +1,821 @@
+# node_editor/nodes/scatter_plot_node.py
+
+import io
+import tkinter as tk
+from tkinter import ttk
+
+import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")  # backend for the embedded FigureCanvasTkAgg path below
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+from node_editor.base_node import BaseNode
+from node_editor.pin_types import PinSchema, PinDef, PinType
+from node_editor.execution import ExecutionMode
+
+
+_HELP_TEXT = (
+    "2D Scatter Plot Node\n\n"
+    "Purpose:\n"
+    "- Plot up to 4 independent curves, each an (n,2) array of [x,y]\n"
+    "  points. Curves may have different lengths. Renders with real\n"
+    "  matplotlib, both embedded in the inspector and via a standalone\n"
+    "  popup window, and generates the equivalent matplotlib source code\n"
+    "  live as you change settings.\n\n"
+    "Input Pins:\n"
+    "- curve1 .. curve4 [ARRAY, optional]: each an (n,2) array of [x,y]\n"
+    "  points, or a flat array whose length is even (reshaped to (n,2)\n"
+    "  automatically). Pin input overrides that curve's inspector text\n"
+    "  box, same priority convention used elsewhere in this project.\n\n"
+    "Output Pins:\n"
+    "- (none) -- this is a terminal/visualization node.\n\n"
+    "Inspector -- per-curve settings (left panel, one tab per curve):\n"
+    "- Enabled: include this curve in the plot.\n"
+    "- Points text box: one point per line, \"x y\" or \"x,y\". Read-only\n"
+    "  and pin-driven (showing a preview) when the curve pin is connected.\n"
+    "- Legend name: label shown in the plot legend.\n"
+    "- Marker: type, size, color.\n"
+    "- Line: width, style, color. Set line width to 0 to hide the\n"
+    "  connecting line and show markers only (a pure scatter plot).\n"
+    "- Abs. / Rel.: Abs. plots y values as given. Rel. subtracts this\n"
+    "  curve's own first y value (y - y[0]) from every point of THIS\n"
+    "  curve before plotting, independently of the other curves -- useful\n"
+    "  for displacement curves where the first sample is the zero/\n"
+    "  reference state. x values are never altered by Rel. mode.\n\n"
+    "Inspector -- axes/grid settings:\n"
+    "- X label / Y label / Title.\n"
+    "- Grid on/off, grid line style, grid line color.\n"
+    "- Legend on/off, legend location.\n\n"
+    "Inspector -- right panel:\n"
+    "- Live embedded matplotlib plot, redrawn on every Apply/Compute.\n"
+    "- Generated code box: a complete, runnable matplotlib script\n"
+    "  reproducing the current plot exactly (data arrays are inlined\n"
+    "  as literals), regenerated live whenever the plot is redrawn.\n"
+    "- \"Open in matplotlib window\" button: pops up a real, independent\n"
+    "  matplotlib figure window (plt.show(block=False)) built fresh from\n"
+    "  the current settings.\n\n"
+    "Keyboard Shortcut:\n"
+    "Ctrl-H / Ctrl-h - show this help window.\n"
+)
+
+_COMMON_COLORS = [
+    "red", "green", "blue", "black", "orange",
+    "purple", "brown", "magenta", "cyan", "gray",
+]
+
+_MATPLOTLIB_MARKERS = [
+    ("o", "circle"), ("s", "square"), ("^", "triangle up"),
+    ("v", "triangle down"), ("D", "diamond"), ("*", "star"),
+    ("+", "plus"), ("x", "x"), (".", "point"), ("None", "none"),
+]
+
+_LINE_STYLES = [
+    ("-", "solid"), ("--", "dashed"), ("-.", "dash-dot"),
+    (":", "dotted"), ("None", "none"),
+]
+
+_LEGEND_LOCATIONS = [
+    "best", "upper right", "upper left", "lower left", "lower right",
+    "right", "center left", "center right", "lower center",
+    "upper center", "center",
+]
+
+_DEFAULT_CURVE_COLORS = ["red", "blue", "green", "orange"]
+_DEFAULT_CURVE_MARKERS = ["o", "s", "^", "D"]
+
+
+def _parse_point_block(text: str) -> tuple[np.ndarray | None, int]:
+    """Parse an (n,2) array from pasted text: one point per line,
+    space/comma/tab separated. Blank lines and '#' comments are
+    skipped. Malformed lines are skipped individually. Returns
+    (array_or_None, skipped_line_count)."""
+    rows: list[list[float]] = []
+    skipped = 0
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.replace(",", " ").split()
+        try:
+            vals = [float(p) for p in parts]
+        except ValueError:
+            skipped += 1
+            continue
+        if len(vals) != 2:
+            skipped += 1
+            continue
+        rows.append(vals)
+    if not rows:
+        return None, skipped
+    return np.array(rows, dtype=np.float64), skipped
+
+
+def _coerce_curve_array(arr: np.ndarray, label: str) -> np.ndarray:
+    """Coerce to (n,2) float64, reshaping a flat even-length array."""
+    a = np.asarray(arr, dtype=np.float64)
+    if a.ndim == 1:
+        if a.size == 0 or a.size % 2 != 0:
+            raise ValueError(f"{label}: flat array length {a.size} is not even")
+        a = a.reshape(-1, 2)
+    if a.ndim != 2 or a.shape[1] != 2:
+        raise ValueError(f"{label}: expected shape (n,2), got {a.shape}")
+    finite_mask = np.isfinite(a).all(axis=1)
+    return a[finite_mask]
+
+
+def _py_repr_array(arr: np.ndarray) -> str:
+    """Render a (n,2) array as a compact Python literal for generated code."""
+    rows = ", ".join(f"[{x:.10g}, {y:.10g}]" for x, y in arr)
+    return f"[{rows}]"
+
+
+class ScatterPlotNode(BaseNode):
+    """
+    2D scatter/line plot node for up to 4 independently-styled curves,
+    each an (n,2) array of [x,y] points with independently settable
+    length. Renders with a real embedded matplotlib figure, generates
+    equivalent matplotlib source code live, and can pop open a
+    standalone matplotlib window built fresh from current settings.
+    """
+
+    EXECUTION_MODE = ExecutionMode.SYNC
+    NODE_TYPE = "scatter_plot"
+    DISPLAY_NAME = "2D Scatter Plot"
+    CATEGORY = "process"
+    SEARCH_KEYWORDS = ("plot", "scatter", "chart", "curve", "matplotlib",
+                       "graph", "line plot", "xy plot")
+    NODE_WIDTH = 210
+    NODE_HEIGHT = 120
+
+    HELP_TEXT = _HELP_TEXT
+
+    MAX_CURVES = 4
+
+    def get_pin_schema(self) -> PinSchema:
+        inputs = [
+            PinDef(f"curve{i}", PinType.ARRAY, f"c{i}", optional=True)
+            for i in range(1, self.MAX_CURVES + 1)
+        ]
+        return PinSchema(inputs=inputs, outputs=[])
+
+    def get_help_text(self) -> str:
+        return _HELP_TEXT
+
+    # ── state ─────────────────────────────────────────────────────
+
+    def _init_state(self) -> None:
+        if hasattr(self, "_curves"):
+            return
+
+        self._xlabel_var = tk.StringVar(value="x")
+        self._ylabel_var = tk.StringVar(value="y")
+        self._title_var = tk.StringVar(value="")
+        self._grid_on_var = tk.BooleanVar(value=True)
+        self._grid_style_var = tk.StringVar(value="--")
+        self._grid_color_var = tk.StringVar(value="gray")
+        self._legend_on_var = tk.BooleanVar(value=True)
+        self._legend_loc_var = tk.StringVar(value="best")
+
+        self._status_var = tk.StringVar(value="not plotted yet")
+
+        self._curves: dict[int, dict] = {}
+        for i in range(1, self.MAX_CURVES + 1):
+            self._curves[i] = {
+                "enabled_var": tk.BooleanVar(value=(i == 1)),
+                "legend_var": tk.StringVar(value=f"Curve {i}"),
+                "marker_var": tk.StringVar(value=_DEFAULT_CURVE_MARKERS[i - 1]),
+                "marker_size_var": tk.DoubleVar(value=6.0),
+                "marker_color_var": tk.StringVar(value=_DEFAULT_CURVE_COLORS[i - 1]),
+                "line_width_var": tk.DoubleVar(value=1.5),
+                "line_style_var": tk.StringVar(value="-"),
+                "line_color_var": tk.StringVar(value=_DEFAULT_CURVE_COLORS[i - 1]),
+                "mode_var": tk.StringVar(value="abs"),   # "abs" or "rel"
+                "status_var": tk.StringVar(value="no data"),
+                "text_cache": "",
+                "text_widget": None,
+                "pin_indicator": None,
+                "data": np.empty((0, 2), dtype=np.float64),
+                "from_pin": False,
+            }
+
+        self._fig = None
+        self._ax = None
+        self._fig_canvas_widget: FigureCanvasTkAgg | None = None
+        self._code_text_widget: tk.Text | None = None
+        self._help_popup: tk.Toplevel | None = None
+
+    # ── body ──────────────────────────────────────────────────────
+
+    def build_body(self) -> None:
+        self._init_state()
+        x, y, w, h = self.x, self.y, self.width, self.height
+
+        self._body_rect = self.canvas.create_rectangle(
+            x, y, x + w, y + h,
+            fill="#f0f4ff", outline="#5566bb", width=2,
+            tags=(self.node_id, "node_body"))
+        self._title_item = self.canvas.create_text(
+            x + w / 2, y + 13, text=self.DISPLAY_NAME,
+            font=("Arial", 9, "bold"), fill="#223377",
+            tags=(self.node_id,))
+
+        status_lbl = tk.Label(
+            self.canvas, textvariable=self._status_var,
+            font=("Arial", 8), bg="#f0f4ff", fg="#334477",
+            wraplength=w - 12, justify="center")
+        self.canvas.create_window(
+            x + w / 2, y + h // 2 + 8, window=status_lbl, tags=(self.node_id,))
+
+        self._canvas_items += [self._body_rect, self._title_item]
+        self.canvas.tag_bind(self.node_id, "<Double-Button-1>", lambda e: self.open_inspector())
+
+    # ── inspector ─────────────────────────────────────────────────
+
+    def build_inspector(self, parent: tk.Frame) -> None:
+        self._init_state()
+        for child in parent.winfo_children():
+            child.destroy()
+
+        win = self._inspector_win
+        if win is not None:
+            for seq in ("<Control-h>", "<Control-H>"):
+                win.bind(seq, lambda e: self._open_help())
+
+        pad = {"padx": 8, "pady": 4}
+
+        panes = tk.PanedWindow(parent, orient=tk.HORIZONTAL, sashwidth=6, showhandle=True)
+        panes.pack(fill="both", expand=True)
+
+        left = tk.Frame(panes, width=420, bg="#f7f7f7")
+        right = tk.Frame(panes, width=520, bg="#ffffff")
+        for f in (left, right):
+            f.pack_propagate(False)
+        panes.add(left, stretch="always")
+        panes.add(right, stretch="always")
+
+        self._build_left_panel(left, pad)
+        self._build_right_panel(right, pad)
+
+        if win is not None:
+            win.update_idletasks()
+            min_w = max(1080, win.winfo_reqwidth())
+            min_h = max(660, win.winfo_reqheight())
+            win.minsize(min_w, min_h)
+            win.geometry(f"{min_w}x{min_h}")
+
+        self._redraw()
+
+    def _make_scrollable(self, parent: tk.Frame) -> tk.Frame:
+        outer = tk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=e.width))
+        return inner
+
+    def _build_left_panel(self, parent: tk.Frame, pad: dict) -> None:
+        nb = ttk.Notebook(parent)
+        nb.pack(fill="both", expand=True)
+
+        for i in range(1, self.MAX_CURVES + 1):
+            tab = tk.Frame(nb)
+            nb.add(tab, text=f"Curve {i}")
+            self._build_curve_tab(tab, i, pad)
+
+        axes_tab = tk.Frame(nb)
+        nb.add(axes_tab, text="Axes / Grid / Legend")
+        self._build_axes_tab(axes_tab, pad)
+
+    def _build_curve_tab(self, parent: tk.Frame, i: int, pad: dict) -> None:
+        inner = self._make_scrollable(parent)
+        cfg = self._curves[i]
+
+        top_row = tk.Frame(inner)
+        top_row.pack(fill="x", **pad)
+        tk.Checkbutton(top_row, text="Enabled", variable=cfg["enabled_var"],
+                      font=("Arial", 9), command=self._on_apply).pack(side="left")
+        tk.Label(top_row, text="Legend:", font=("Arial", 9)).pack(side="left", padx=(12, 2))
+        tk.Entry(top_row, textvariable=cfg["legend_var"], width=16,
+                 font=("Arial", 9)).pack(side="left")
+
+        pin_row = tk.Frame(inner)
+        pin_row.pack(fill="x", padx=8)
+        pin_ind = tk.Label(pin_row, text="●" if cfg["from_pin"] else "○", font=("Arial", 9),
+                          fg="#226600" if cfg["from_pin"] else "#aaaaaa", width=2)
+        pin_ind.pack(side="left")
+        cfg["pin_indicator"] = pin_ind
+        tk.Label(pin_row, text=f"curve{i}: one point per line \"x y\" or \"x,y\" (e.g. 0 0\\n  1,2\\n  2,3)",
+                font=("Arial", 8), fg="#555555").pack(side="left")
+
+        text_widget = tk.Text(inner, height=6, font=("Courier", 8), wrap=tk.NONE)
+        text_widget.insert("1.0", "0 0\n1 1\n2 0\n1 -1\n0 -1\n-1 0")
+        text_widget.pack(fill="x", padx=8)
+        text_widget.insert("1.0", cfg["text_cache"])
+        if cfg["from_pin"]:
+            text_widget.configure(state="disabled")
+        cfg["text_widget"] = text_widget
+
+        # ── mode: abs / rel ───────────────────────────────────────
+        mode_frame = tk.LabelFrame(inner, text="Y value mode", font=("Arial", 9), **pad)
+        mode_frame.pack(fill="x", **pad)
+        tk.Radiobutton(mode_frame, text="Abs. (plot y as given)",
+                      variable=cfg["mode_var"], value="abs", font=("Arial", 9),
+                      command=self._redraw).pack(anchor="w")
+        tk.Radiobutton(mode_frame,
+                      text="Rel. (plot y - y[0]; first point becomes 0, e.g. displacement)",
+                      variable=cfg["mode_var"], value="rel", font=("Arial", 9),
+                      command=self._redraw).pack(anchor="w")
+
+        # ── marker ────────────────────────────────────────────────
+        marker_frame = tk.LabelFrame(inner, text="Marker", font=("Arial", 9), **pad)
+        marker_frame.pack(fill="x", **pad)
+        mrow = tk.Frame(marker_frame)
+        mrow.pack(fill="x")
+        tk.Label(mrow, text="Type:", font=("Arial", 8)).pack(side="left")
+        ttk.Combobox(mrow, textvariable=cfg["marker_var"],
+                    values=[m for m, _ in _MATPLOTLIB_MARKERS],
+                    width=6, state="readonly").pack(side="left", padx=(2, 8))
+        tk.Label(mrow, text="Size:", font=("Arial", 8)).pack(side="left")
+        tk.Spinbox(mrow, from_=1, to=30, increment=0.5, textvariable=cfg["marker_size_var"],
+                  width=5, font=("Arial", 8), command=self._redraw).pack(side="left", padx=(2, 8))
+        tk.Label(mrow, text="Color:", font=("Arial", 8)).pack(side="left")
+        color_combo = ttk.Combobox(mrow, textvariable=cfg["marker_color_var"],
+                                   values=_COMMON_COLORS, width=8)
+        color_combo.pack(side="left", padx=(2, 0))
+        color_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
+        color_combo.bind("<FocusOut>", lambda e: self._redraw())
+        color_combo.bind("<Return>", lambda e: self._redraw())
+
+        # ── line ──────────────────────────────────────────────────
+        line_frame = tk.LabelFrame(inner, text="Line", font=("Arial", 9), **pad)
+        line_frame.pack(fill="x", **pad)
+        lrow = tk.Frame(line_frame)
+        lrow.pack(fill="x")
+        tk.Label(lrow, text="Width:", font=("Arial", 8)).pack(side="left")
+        tk.Spinbox(lrow, from_=0.0, to=10.0, increment=0.5, textvariable=cfg["line_width_var"],
+                  width=5, font=("Arial", 8), command=self._redraw).pack(side="left", padx=(2, 8))
+        tk.Label(lrow, text="Style:", font=("Arial", 8)).pack(side="left")
+        ttk.Combobox(lrow, textvariable=cfg["line_style_var"],
+                    values=[s for s, _ in _LINE_STYLES], width=5,
+                    state="readonly").pack(side="left", padx=(2, 8))
+        tk.Label(lrow, text="Color:", font=("Arial", 8)).pack(side="left")
+        line_color_combo = ttk.Combobox(lrow, textvariable=cfg["line_color_var"],
+                                        values=_COMMON_COLORS, width=8)
+        line_color_combo.pack(side="left", padx=(2, 0))
+        line_color_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
+        line_color_combo.bind("<FocusOut>", lambda e: self._redraw())
+        line_color_combo.bind("<Return>", lambda e: self._redraw())
+        tk.Label(line_frame, text="(width 0 = markers only, no connecting line)",
+                font=("Arial", 7), fg="#888888").pack(anchor="w")
+
+        for var in (cfg["marker_var"], cfg["line_style_var"]):
+            var.trace_add("write", lambda *_a: self._redraw())
+
+        tk.Label(inner, textvariable=cfg["status_var"], font=("Arial", 8),
+                fg="#666666", anchor="w").pack(fill="x", padx=8, pady=(4, 0))
+
+        tk.Button(inner, text="Apply (parse points / redraw)", font=("Arial", 9, "bold"),
+                  bg="#446622", fg="white", activebackground="#557733", relief=tk.FLAT,
+                  padx=10, pady=3, command=self._on_apply).pack(anchor="w", padx=8, pady=8)
+
+    def _build_axes_tab(self, parent: tk.Frame, pad: dict) -> None:
+        inner = self._make_scrollable(parent)
+
+        labels_frame = tk.LabelFrame(inner, text="Labels", font=("Arial", 9), **pad)
+        labels_frame.pack(fill="x", **pad)
+        for label, var in [("X label:", self._xlabel_var),
+                           ("Y label:", self._ylabel_var),
+                           ("Title:", self._title_var)]:
+            row = tk.Frame(labels_frame)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=label, font=("Arial", 9), width=10, anchor="w").pack(side="left")
+            entry = tk.Entry(row, textvariable=var, font=("Arial", 9))
+            entry.pack(side="left", fill="x", expand=True)
+            entry.bind("<KeyRelease>", lambda e: self._redraw())
+
+        grid_frame = tk.LabelFrame(inner, text="Grid", font=("Arial", 9), **pad)
+        grid_frame.pack(fill="x", **pad)
+        tk.Checkbutton(grid_frame, text="Grid on", variable=self._grid_on_var,
+                      font=("Arial", 9), command=self._redraw).pack(anchor="w")
+        grow = tk.Frame(grid_frame)
+        grow.pack(fill="x", pady=2)
+        tk.Label(grow, text="Style:", font=("Arial", 8)).pack(side="left")
+        ttk.Combobox(grow, textvariable=self._grid_style_var,
+                    values=[s for s, _ in _LINE_STYLES], width=5,
+                    state="readonly").pack(side="left", padx=(2, 8))
+        tk.Label(grow, text="Color:", font=("Arial", 8)).pack(side="left")
+        grid_color_combo = ttk.Combobox(grow, textvariable=self._grid_color_var,
+                                        values=_COMMON_COLORS, width=8)
+        grid_color_combo.pack(side="left", padx=(2, 0))
+        grid_color_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
+        grid_color_combo.bind("<FocusOut>", lambda e: self._redraw())
+        self._grid_style_var.trace_add("write", lambda *_a: self._redraw())
+
+        legend_frame = tk.LabelFrame(inner, text="Legend", font=("Arial", 9), **pad)
+        legend_frame.pack(fill="x", **pad)
+        tk.Checkbutton(legend_frame, text="Legend on", variable=self._legend_on_var,
+                      font=("Arial", 9), command=self._redraw).pack(anchor="w")
+        lrow = tk.Frame(legend_frame)
+        lrow.pack(fill="x", pady=2)
+        tk.Label(lrow, text="Location:", font=("Arial", 8)).pack(side="left")
+        ttk.Combobox(lrow, textvariable=self._legend_loc_var, values=_LEGEND_LOCATIONS,
+                    width=14, state="readonly").pack(side="left", padx=(2, 0))
+        self._legend_loc_var.trace_add("write", lambda *_a: self._redraw())
+
+        tk.Button(inner, text="Help (Ctrl-H)", font=("Arial", 8),
+                  command=self._open_help).pack(anchor="e", padx=8, pady=8)
+
+    def _build_right_panel(self, parent: tk.Frame, pad: dict) -> None:
+        plot_frame = tk.LabelFrame(parent, text="Plot", font=("Arial", 9), **pad)
+        plot_frame.pack(fill="both", expand=True, **pad)
+
+        self._fig = plt.Figure(figsize=(5.5, 4.2), dpi=100)
+        self._ax = self._fig.add_subplot(111)
+        self._fig_canvas_widget = FigureCanvasTkAgg(self._fig, master=plot_frame)
+        self._fig_canvas_widget.get_tk_widget().pack(fill="both", expand=True)
+
+        btn_row = tk.Frame(parent)
+        btn_row.pack(fill="x", **pad)
+        tk.Button(btn_row, text="Open in matplotlib window", font=("Arial", 9, "bold"),
+                  bg="#334477", fg="white", activebackground="#445588", relief=tk.FLAT,
+                  padx=10, pady=3, command=self._on_open_popup).pack(side="left")
+
+        code_frame = tk.LabelFrame(parent, text="Equivalent matplotlib code",
+                                    font=("Arial", 9), **pad)
+        code_frame.pack(fill="both", expand=False, **pad)
+
+        self._code_text_widget = tk.Text(code_frame, height=14, font=("Courier", 8), wrap=tk.NONE)
+        code_vsb = ttk.Scrollbar(code_frame, orient="vertical",
+                                 command=self._code_text_widget.yview)
+        code_hsb = ttk.Scrollbar(code_frame, orient="horizontal",
+                                 command=self._code_text_widget.xview)
+        self._code_text_widget.configure(yscrollcommand=code_vsb.set,
+                                         xscrollcommand=code_hsb.set)
+        code_hsb.pack(side="bottom", fill="x")
+        code_vsb.pack(side="right", fill="y")
+        self._code_text_widget.pack(fill="both", expand=True)
+
+    # ── inspector <-> data sync helpers ──────────────────────────
+
+    def _get_curve_text(self, i: int) -> str:
+        cfg = self._curves[i]
+        w = cfg.get("text_widget")
+        if w is not None and w.winfo_exists() and not cfg.get("from_pin", False):
+            cfg["text_cache"] = w.get("1.0", tk.END)
+        return cfg["text_cache"]
+
+    def _set_curve_text(self, i: int, text: str) -> None:
+        cfg = self._curves[i]
+        cfg["text_cache"] = text
+        w = cfg.get("text_widget")
+        if w is not None and w.winfo_exists():
+            state_before = str(w.cget("state"))
+            w.configure(state="normal")
+            w.delete("1.0", tk.END)
+            w.insert("1.0", text)
+            w.configure(state=state_before)
+
+    def _update_curve_entry_ui(self, i: int) -> None:
+        cfg = self._curves[i]
+        pin_lbl = cfg.get("pin_indicator")
+        if pin_lbl is not None and pin_lbl.winfo_exists():
+            pin_lbl.configure(text="●" if cfg["from_pin"] else "○",
+                             fg="#226600" if cfg["from_pin"] else "#aaaaaa")
+        w = cfg.get("text_widget")
+        if w is None or not w.winfo_exists():
+            return
+        if cfg["from_pin"] and cfg["data"].shape[0] > 0:
+            lines = [f"{x:.6g}  {y:.6g}" for x, y in cfg["data"][:10]]
+            if cfg["data"].shape[0] > 10:
+                lines.append("...")
+            w.configure(state="normal")
+            w.delete("1.0", tk.END)
+            w.insert("1.0", "\n".join(lines))
+            w.configure(state="disabled")
+        else:
+            w.configure(state="normal")
+            current = w.get("1.0", tk.END)
+            if current.strip() != cfg["text_cache"].strip():
+                w.delete("1.0", tk.END)
+                w.insert("1.0", cfg["text_cache"])
+
+    def _on_apply(self) -> None:
+        if self._request_downstream:
+            self._request_downstream(self.node_id)
+        else:
+            self._redraw()
+
+    # ── help popup ────────────────────────────────────────────────
+
+    def _open_help(self) -> None:
+        if self._help_popup is not None and self._help_popup.winfo_exists():
+            self._help_popup.lift()
+            return
+        popup = tk.Toplevel()
+        popup.title("2D Scatter Plot - Help")
+        popup.geometry("700x600")
+        popup.resizable(True, True)
+        try:
+            px, py = self.canvas.winfo_pointerxy()
+            popup.geometry(f"+{px + 16}+{py + 16}")
+        except Exception:
+            pass
+        body = tk.Frame(popup, bg="#f8f8f8", padx=10, pady=8)
+        body.pack(fill="both", expand=True)
+        txt = tk.Text(body, font=("Courier", 9), bg="#f8f8f8", fg="#222222",
+                      wrap=tk.WORD, relief=tk.FLAT)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", _HELP_TEXT)
+        txt.configure(state="disabled")
+        tk.Button(body, text="Close", font=("Arial", 9), command=popup.destroy
+                 ).pack(anchor="e", pady=(8, 0))
+        popup.bind("<Escape>", lambda _e: popup.destroy())
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+        self._help_popup = popup
+
+    # ── plotted-data resolution (shared by compute / redraw / popup / code) ──
+
+    def _resolve_all_curves(self, inputs: dict | None = None) -> None:
+        """Read pins (if inputs given) and/or text boxes into cfg['data'],
+        applying abs./rel. mode. Always updates status_var/pin indicator."""
+        for i in range(1, self.MAX_CURVES + 1):
+            cfg = self._curves[i]
+            raw = inputs.get(f"curve{i}") if inputs is not None else None
+            text = self._get_curve_text(i)
+
+            try:
+                if raw is not None and isinstance(raw, np.ndarray) and raw.size > 0:
+                    arr = _coerce_curve_array(raw, f"curve{i}")
+                    cfg["from_pin"] = True
+                    skipped = 0
+                else:
+                    parsed, skipped = _parse_point_block(text)
+                    arr = (_coerce_curve_array(parsed, f"curve{i}")
+                          if parsed is not None else np.empty((0, 2), dtype=np.float64))
+                    cfg["from_pin"] = False
+            except Exception as e:
+                arr = np.empty((0, 2), dtype=np.float64)
+                cfg["from_pin"] = False
+                skipped = 0
+                cfg["status_var"].set(f"error: {e}")
+                cfg["data"] = arr
+                self._update_curve_entry_ui(i)
+                continue
+
+            cfg["data"] = arr
+            if arr.shape[0] > 0:
+                cfg["status_var"].set(
+                    f"{arr.shape[0]} pts" + (f"  ({skipped} skipped)" if skipped else ""))
+            else:
+                cfg["status_var"].set("no data" if skipped == 0 else f"0 pts ({skipped} skipped)")
+            self._update_curve_entry_ui(i)
+
+    def _plotted_xy(self, i: int) -> tuple[np.ndarray, np.ndarray] | None:
+        cfg = self._curves[i]
+        data = cfg["data"]
+        if data.shape[0] == 0:
+            return None
+        x = data[:, 0]
+        y = data[:, 1]
+        if cfg["mode_var"].get() == "rel":
+            y = y - y[0]
+        return x, y
+
+    # ── drawing (shared by embedded canvas + popup window) ───────────
+
+    def _style_axes(self, ax) -> None:
+        ax.set_xlabel(self._xlabel_var.get())
+        ax.set_ylabel(self._ylabel_var.get())
+        title = self._title_var.get().strip()
+        if title:
+            ax.set_title(title)
+        if self._grid_on_var.get():
+            ax.grid(True, linestyle=self._grid_style_var.get(),
+                   color=self._grid_color_var.get())
+        else:
+            ax.grid(False)
+
+    def _plot_all_curves(self, ax) -> bool:
+        """Returns True if at least one curve was actually drawn."""
+        any_drawn = False
+        for i in range(1, self.MAX_CURVES + 1):
+            cfg = self._curves[i]
+            if not cfg["enabled_var"].get():
+                continue
+            xy = self._plotted_xy(i)
+            if xy is None:
+                continue
+            x, y = xy
+            marker = cfg["marker_var"].get()
+            line_width = float(cfg["line_width_var"].get())
+            line_style = cfg["line_style_var"].get() if line_width > 0 else "None"
+            ax.plot(
+                x, y,
+                marker=marker if marker != "None" else None,
+                markersize=float(cfg["marker_size_var"].get()),
+                markerfacecolor=cfg["marker_color_var"].get(),
+                markeredgecolor=cfg["marker_color_var"].get(),
+                linewidth=line_width,
+                linestyle=line_style,
+                color=cfg["line_color_var"].get(),
+                label=cfg["legend_var"].get() or f"Curve {i}",
+            )
+            any_drawn = True
+        if any_drawn and self._legend_on_var.get():
+            ax.legend(loc=self._legend_loc_var.get())
+        return any_drawn
+
+    def _redraw(self) -> None:
+        if self._ax is None or self._fig_canvas_widget is None:
+            return
+        self._ax.clear()
+        any_drawn = self._plot_all_curves(self._ax)
+        self._style_axes(self._ax)
+        if not any_drawn:
+            self._ax.text(0.5, 0.5, "No enabled curve has data",
+                         ha="center", va="center", transform=self._ax.transAxes,
+                         color="#888888")
+        self._fig.tight_layout()
+        self._fig_canvas_widget.draw_idle()
+        self._status_var.set("plotted" if any_drawn else "no data to plot")
+        self._update_generated_code()
+
+    def _on_open_popup(self) -> None:
+        """Opens an independent matplotlib window, built fresh from
+        current settings. Does not reuse the embedded figure/canvas."""
+        popup_fig = plt.figure(figsize=(7, 5.5))
+        popup_ax = popup_fig.add_subplot(111)
+        self._plot_all_curves(popup_ax)
+        self._style_axes(popup_ax)
+        popup_fig.tight_layout()
+        plt.figure(popup_fig.number)
+        plt.show(block=False)
+
+    # ── generated matplotlib code ─────────────────────────────────
+
+    def _update_generated_code(self) -> None:
+        if self._code_text_widget is None or not self._code_text_widget.winfo_exists():
+            return
+        code = self._generate_code()
+        self._code_text_widget.configure(state="normal")
+        self._code_text_widget.delete("1.0", tk.END)
+        self._code_text_widget.insert("1.0", code)
+
+    def _generate_code(self) -> str:
+        lines = [
+            "import matplotlib.pyplot as plt",
+            "",
+            "fig, ax = plt.subplots(figsize=(7, 5.5))",
+            "",
+        ]
+        for i in range(1, self.MAX_CURVES + 1):
+            cfg = self._curves[i]
+            if not cfg["enabled_var"].get():
+                continue
+            xy = self._plotted_xy(i)
+            if xy is None:
+                continue
+            x, y = xy
+            arr = np.column_stack([x, y])
+            var_name = f"curve{i}"
+            lines.append(f"{var_name} = {_py_repr_array(arr)}")
+            lines.append(f"{var_name}_x = [p[0] for p in {var_name}]")
+            lines.append(f"{var_name}_y = [p[1] for p in {var_name}]")
+
+            marker = cfg["marker_var"].get()
+            marker_arg = "None" if marker == "None" else repr(marker)
+            line_width = float(cfg["line_width_var"].get())
+            line_style = cfg["line_style_var"].get() if line_width > 0 else "None"
+
+            lines.append(
+                f"ax.plot({var_name}_x, {var_name}_y, "
+                f"marker={marker_arg}, "
+                f"markersize={cfg['marker_size_var'].get():g}, "
+                f"markerfacecolor={cfg['marker_color_var'].get()!r}, "
+                f"markeredgecolor={cfg['marker_color_var'].get()!r}, "
+                f"linewidth={line_width:g}, "
+                f"linestyle={line_style!r}, "
+                f"color={cfg['line_color_var'].get()!r}, "
+                f"label={(cfg['legend_var'].get() or f'Curve {i}')!r})"
+            )
+            lines.append("")
+
+        lines.append(f"ax.set_xlabel({self._xlabel_var.get()!r})")
+        lines.append(f"ax.set_ylabel({self._ylabel_var.get()!r})")
+        title = self._title_var.get().strip()
+        if title:
+            lines.append(f"ax.set_title({title!r})")
+        if self._grid_on_var.get():
+            lines.append(
+                f"ax.grid(True, linestyle={self._grid_style_var.get()!r}, "
+                f"color={self._grid_color_var.get()!r})"
+            )
+        if self._legend_on_var.get():
+            lines.append(f"ax.legend(loc={self._legend_loc_var.get()!r})")
+        lines.append("")
+        lines.append("fig.tight_layout()")
+        lines.append("plt.show()")
+        return "\n".join(lines)
+
+    # ── compute ───────────────────────────────────────────────────
+
+    def compute(self, inputs: dict) -> dict:
+        self._init_state()
+        self._resolve_all_curves(inputs)
+        if self.is_inspector_open():
+            self._redraw()
+        else:
+            n_enabled = sum(
+                1 for i in range(1, self.MAX_CURVES + 1)
+                if self._curves[i]["enabled_var"].get() and self._curves[i]["data"].shape[0] > 0)
+            self._status_var.set(f"{n_enabled}/{self.MAX_CURVES} curves ready "
+                                 f"(open inspector to view plot)")
+        return {}
+
+    # ── serialization ─────────────────────────────────────────────
+
+    def get_params(self) -> dict:
+        curves_params = []
+        for i in range(1, self.MAX_CURVES + 1):
+            cfg = self._curves[i]
+            self._get_curve_text(i)  # flush widget -> cache if applicable
+            curves_params.append({
+                "enabled": bool(cfg["enabled_var"].get()),
+                "legend": cfg["legend_var"].get(),
+                "marker": cfg["marker_var"].get(),
+                "marker_size": float(cfg["marker_size_var"].get()),
+                "marker_color": cfg["marker_color_var"].get(),
+                "line_width": float(cfg["line_width_var"].get()),
+                "line_style": cfg["line_style_var"].get(),
+                "line_color": cfg["line_color_var"].get(),
+                "mode": cfg["mode_var"].get(),
+                "text": cfg["text_cache"],
+            })
+        return {
+            "xlabel": self._xlabel_var.get(),
+            "ylabel": self._ylabel_var.get(),
+            "title": self._title_var.get(),
+            "grid_on": bool(self._grid_on_var.get()),
+            "grid_style": self._grid_style_var.get(),
+            "grid_color": self._grid_color_var.get(),
+            "legend_on": bool(self._legend_on_var.get()),
+            "legend_loc": self._legend_loc_var.get(),
+            "curves": curves_params,
+        }
+
+    def set_params(self, params: dict) -> None:
+        self._init_state()
+        self._xlabel_var.set(str(params.get("xlabel", "x")))
+        self._ylabel_var.set(str(params.get("ylabel", "y")))
+        self._title_var.set(str(params.get("title", "")))
+        self._grid_on_var.set(bool(params.get("grid_on", True)))
+        self._grid_style_var.set(str(params.get("grid_style", "--")))
+        self._grid_color_var.set(str(params.get("grid_color", "gray")))
+        self._legend_on_var.set(bool(params.get("legend_on", True)))
+        self._legend_loc_var.set(str(params.get("legend_loc", "best")))
+
+        saved_curves = params.get("curves", [])
+        for i in range(1, self.MAX_CURVES + 1):
+            cfg = self._curves[i]
+            saved = saved_curves[i - 1] if i - 1 < len(saved_curves) else {}
+            cfg["enabled_var"].set(bool(saved.get("enabled", i == 1)))
+            cfg["legend_var"].set(str(saved.get("legend", f"Curve {i}")))
+            cfg["marker_var"].set(str(saved.get("marker", _DEFAULT_CURVE_MARKERS[i - 1])))
+            cfg["marker_size_var"].set(float(saved.get("marker_size", 6.0)))
+            cfg["marker_color_var"].set(str(saved.get("marker_color", _DEFAULT_CURVE_COLORS[i - 1])))
+            cfg["line_width_var"].set(float(saved.get("line_width", 1.5)))
+            cfg["line_style_var"].set(str(saved.get("line_style", "-")))
+            cfg["line_color_var"].set(str(saved.get("line_color", _DEFAULT_CURVE_COLORS[i - 1])))
+            cfg["mode_var"].set(str(saved.get("mode", "abs")))
+            self._set_curve_text(i, str(saved.get("text", "")))
+
+    def close_inspector(self) -> None:
+        for i in range(1, self.MAX_CURVES + 1):
+            self._get_curve_text(i)  # flush before losing the widget
+            self._curves[i]["text_widget"] = None
+            self._curves[i]["pin_indicator"] = None
+        if self._fig is not None:
+            plt.close(self._fig)
+        self._fig = None
+        self._ax = None
+        self._fig_canvas_widget = None
+        self._code_text_widget = None
+        super().close_inspector()
+
+    def on_destroy(self) -> None:
+        if self._help_popup is not None and self._help_popup.winfo_exists():
+            self._help_popup.destroy()
+        if self._fig is not None:
+            plt.close(self._fig)
+        super().on_destroy()

@@ -396,6 +396,8 @@ class CameraCalibNode(BaseNode):
                 PinDef("dvec",       PinType.ARRAY,  "dvec"),
                 PinDef("rvec",       PinType.ARRAY,  "rvec"),
                 PinDef("tvec",       PinType.ARRAY,  "tvec"),
+                PinDef("imgsize",    PinType.ARRAY,  "imgSize",
+                       shape=(2,), dtype="int64"),     # [width, height]
                 PinDef("image_pts",  PinType.ARRAY,  "imgPts"),
                 PinDef("object_pts", PinType.ARRAY,  "objPts"),
                 PinDef("proj_pts",   PinType.ARRAY,  "prjPts"),
@@ -1885,6 +1887,12 @@ class CameraCalibNode(BaseNode):
 
     # ── output pins ───────────────────────────────────────────────
 
+    def _image_size_array(self) -> np.ndarray:
+        """'imgsize' output: [width, height] from the image-size widgets
+        (kept in sync with incoming frames)."""
+        return np.array([int(self._img_w_var.get()),
+                         int(self._img_h_var.get())], dtype=np.int64)
+
     def _push_outputs(self) -> None:
         if self._result_cmat is None:
             return
@@ -1926,6 +1934,7 @@ class CameraCalibNode(BaseNode):
             "dvec":       self._result_dvec,
             "rvec":       rvec,
             "tvec":       tvec,
+            "imgsize":    self._image_size_array(),
             "image_pts":  ip,
             "object_pts": op,
             "proj_pts":   pp,
@@ -1978,6 +1987,7 @@ class CameraCalibNode(BaseNode):
         result: dict = {
             "cmat": self._result_cmat.copy(),
             "dvec": self._result_dvec.copy(),
+            "imgsize": self._image_size_array(),
             "rms":  float(
                 self._result_rms or 0.0),
             "done": self._done_counter,

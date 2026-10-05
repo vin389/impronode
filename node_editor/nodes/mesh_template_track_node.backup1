@@ -1,0 +1,1795 @@
+# node_editor/nodes/mesh_template_track_node.py
+"""
+Mesh template tracking node.
+
+Tracks a regular M x N mesh of points through an image sequence with the
+coarse-to-fine template matcher calcTemplateMatchPyr (the same function used
+by the Template Match node) and lets the user inspect how the mesh moves.
+
+Tracking strategy
+    Two reference styles are available, selected by the "Update template
+    every frame" checkbox:
+
+    * Fixed reference (checkbox off, the default). Every template is cut
+      from the START frame. For frame k the search is centred on the
+      point's last successfully tracked position (next_pts_init), so
+      "Search range" only has to cover the motion BETWEEN two consecutive
+      frames even though the template itself never changes. Errors do not
+      accumulate from frame to frame, but a point whose appearance has
+      drifted far from the start frame (large rotation, out-of-plane
+      deformation, lighting change) may fail to match at all.
+
+    * Incremental reference (checkbox on). Each point's template is re-cut,
+      every time that point is successfully tracked, from the frame it was
+      just found in and the position it was just found at -- so frame k+1
+      is matched against frame k's own appearance of that point, not the
+      original one. This is far more robust to appearance changes, at the
+      cost of small per-step sub-pixel interpolation differences that CAN
+      accumulate into drift over a long sequence. A point that fails keeps
+      its old template and last known position (exactly like the fixed
+      style) until it succeeds again.
+
+      For a rigid, appearance-preserving motion (pure translation, nothing
+      else changing), the patch compared against frame k+1 is pixel-for-
+      pixel identical whichever style is used -- mesh points are already
+      generally at sub-pixel positions in BOTH styles, so both already
+      require the same sub-pixel patch extraction capability -- so both
+      styles should recover essentially the same position at every frame.
+      They are only expected to diverge once the target's appearance
+      actually changes between frames.
+
+    A point that fails at frame k is NOT abandoned: it keeps whatever
+    template/position it last had and is retried against every following
+    frame, so it can reacquire tracking later.
+
+    Frame 0 (the start frame) is the reference itself: its result is the
+    mesh, status 1, confidence 1.
+
+Coordinates
+    Image coordinates follow OpenCV: (0, 0) is the CENTRE of the top-left
+    pixel, u is horizontal, v is vertical. Mesh points are the centres of the
+    M x N cells spanned by the top-left / lower-right corners.
+
+Result array
+    points: (num_steps, M, N, 2) with the last axis (u, v) in pixels.
+    Frame numbers are 1-based, inclusive.
+
+Threading
+    Tracking and preview decoding run on worker threads. Worker threads never
+    touch Tk or matplotlib; the Tk thread polls shared state with after().
+    In incremental-reference mode, more than one past frame may be held in
+    memory at once when some points are lagging behind (still referencing an
+    older frame because they have not re-succeeded yet); any cached frame no
+    longer referenced by any point is dropped immediately after each step.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import sys
+import threading
+import time
+import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+import cv2
+import numpy as np
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from PIL import Image, ImageTk
+
+from node_editor.base_node import BaseNode
+from node_editor.execution import ExecutionMode
+from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.project_context import get_project_directory
+
+# calcTemplateMatchPyr lives as a top-level script module (not inside the
+# node_editor package); make the repo root importable exactly like
+# template_match_node.py does. A failed import must not hide the node: viewing
+# and loading results still works, only "Run" is blocked.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+try:
+    from calcTemplateMatchPyr_codex import calcTemplateMatchPyr
+    _TRACKER_IMPORT_ERROR = None
+except Exception as _exc:
+    calcTemplateMatchPyr = None
+    _TRACKER_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+
+
+MATCH_METHODS = {
+    "TM_SQDIFF": cv2.TM_SQDIFF,
+    "TM_SQDIFF_NORMED": cv2.TM_SQDIFF_NORMED,
+    "TM_CCORR": cv2.TM_CCORR,
+    "TM_CCORR_NORMED": cv2.TM_CCORR_NORMED,
+    "TM_CCOEFF": cv2.TM_CCOEFF,
+    "TM_CCOEFF_NORMED": cv2.TM_CCOEFF_NORMED,
+}
+
+PREVIEW_MAX_SIDE = 2000          # longest side of the cached preview image (px)
+MAX_DRAWN_POINTS = 20000         # above this, dots are not drawn in the preview
+MAX_RESULT_ENTRIES = 20_000_000  # frames * M * N guard (~25 bytes per entry)
+POLL_MS = 250
+
+GRID_COLOR = "#22ccee"
+SELECT_COLOR = "#ff3d00"
+DOT_COLOR = "#ffe000"
+SELECT_DOT_COLOR = "#ff2d2d"
+OUTSIDE_DOT_COLOR = "#ff8c00"
+INVALID_FG = "#c62828"
+NORMAL_FG = "#111111"
+
+_SEPARATORS = re.compile(r"[,;\s]+")
+
+_HELP_TEXT = """\
+Mesh Template Track
+===================
+Tracks a regular mesh of points through an image sequence and shows how the
+mesh moves. Useful to understand object/camera motion and overall tracking
+quality before doing detailed analysis.
+
+INPUT PIN
+  files   STRING   list of image paths (the 'files' output of the Image
+                   Sequence node). Frame numbers are 1-based positions in it.
+
+OUTPUT PINS (after Run, or after a result was loaded)
+  points       (S, M, N, 2)  tracked (u, v) in pixels, NaN where tracking failed
+  status       (S, M, N)     1 = tracked (correlation >= min. correlation)
+  confidence   (S, M, N)     match quality score reported by the tracker
+  frames       (S,)          frame numbers (1-based)
+
+ALGORITHM
+  Two reference styles, chosen with 'Update template every frame':
+    off (default) - every template is cut from the START frame ('fixed'
+                    reference), so errors do not accumulate from frame to
+                    frame. The search in frame k is still centred on the
+                    point's last successfully tracked position, so 'Search
+                    range' only has to cover the motion between two
+                    consecutive frames.
+    on             - each point's template is re-cut, every time it is
+                    successfully tracked, from the frame and position it was
+                    just found at ('incremental' reference), so tracking
+                    follows the target's own most recent appearance rather
+                    than the original one. For pure rigid motion with no
+                    appearance change the two styles should give nearly the
+                    same result; they are mainly useful when the target's
+                    appearance itself changes over time (large rotation,
+                    out-of-plane deformation, lighting).
+  A point that fails is stored as NaN but is not abandoned: it keeps its old
+  template/position and is retried on every later frame.
+
+MESH SETTINGS
+  Cells        M N   cells along the vertical / horizontal image edge
+  Top-left     u v   corner of the mesh (pixels)
+  Lower-right  u v   corner of the mesh (pixels; filled from the image size)
+  One tracking point sits at the centre of every cell. Numbers may be
+  separated by space, tab or comma. Coordinates are OpenCV pixel coordinates:
+  (0, 0) is the centre of the top-left pixel.
+
+TRACKING SETTINGS
+  Same meaning as in the Template Match node. 'Auto (from mesh)' sets the
+  template size to the mesh cell size (rounded to the nearest integer,
+  minimum 3); the fields can still be edited afterwards. Start / End frame
+  are 1-based and inclusive (End defaults to the number of frames).
+  Invalid values are shown in red; Run stays disabled until all are valid.
+
+RUN / STOP
+  Run tracks in a background thread with a progress bar. Stop takes effect
+  after the frame currently being processed; the frames tracked so far are
+  kept (the rest is NaN).
+
+LOAD / SAVE AS
+  A .npz file holds the settings used for the result and the result itself.
+  The project file stores the settings plus the (relative) path of the last
+  saved/loaded result file and re-loads it when the project is opened. The
+  result is NOT embedded in the project file: save it to a file, otherwise a
+  long tracking run has to be repeated after re-opening the project.
+
+PREVIEW AND PLOT
+  Click a cell in the image to select its point (bold rectangle). The slider
+  changes the displayed frame (the image loads when the slider is released).
+  Dots show the tracked positions at the displayed frame (red = selected).
+  Orange dots: the template of that point would extend outside the image.
+  Plot: u and v of the selected point relative to the first frame. Drag to
+  pan, wheel to zoom; Ctrl+wheel zooms horizontally only, Shift+wheel
+  vertically only. If the mesh settings differ from the result's mesh, the
+  plot is disabled to avoid showing a different point.
+"""
+
+
+# ══ Helpers (pure functions, no Tk) ═══════════════════════════════════════
+
+def parse_numbers(text, count, integer=False):
+    """Parse exactly `count` numbers separated by space, tab, comma or ';'.
+    Returns a tuple, or None if the text is invalid (wrong count, not a
+    number, or not finite)."""
+    tokens = [t for t in _SEPARATORS.split((text or "").strip()) if t]
+    if len(tokens) != count:
+        return None
+    values = []
+    for token in tokens:
+        try:
+            value = int(token) if integer else float(token)
+        except ValueError:
+            return None
+        if not integer and not math.isfinite(value):
+            return None
+        values.append(value)
+    return tuple(values)
+
+
+def mesh_centers(M, N, u0, v0, u1, v1) -> np.ndarray:
+    """(M, N, 2) array of cell-centre points, last axis = (u, v)."""
+    us = u0 + (np.arange(N) + 0.5) * (u1 - u0) / N
+    vs = v0 + (np.arange(M) + 0.5) * (v1 - v0) / M
+    uu, vv = np.meshgrid(us, vs)
+    return np.stack([uu, vv], axis=-1)
+
+
+def read_rgb(path):
+    """Decode an image file to an RGB uint8 array (same convention as the
+    Image Sequence node). np.fromfile + imdecode also handles non-ASCII
+    paths on Windows. Returns None if the file cannot be read."""
+    try:
+        buf = np.fromfile(path, dtype=np.uint8)
+        if buf.size == 0:
+            return None
+        bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+    if bgr is None:
+        return None
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def _tracking_worker(job: dict, result: dict, state: dict) -> None:
+    """Background thread: track the mesh through all frames of the job.
+    Writes frame k into the preallocated result arrays and only THEN
+    advances state['done'], so the Tk thread can safely read frames < done.
+
+    Two reference styles, chosen by job["update_template"] -- see the module
+    docstring's "Tracking strategy" section for the full rationale:
+
+      * Fixed reference (update_template=False): every point's template
+        always comes from frame 0 at the original mesh position. Only ONE
+        image (frame 0) is ever needed as a template source, so this stays
+        as cheap and low-memory as the previous, single-reference version.
+      * Incremental reference (update_template=True): each point's template
+        is refreshed, every time that point is found, to the frame and
+        position it was just found at. Points differ in which past frame
+        they currently reference (most will share the same one -- typically
+        "the previous frame" -- but a point that has been failing keeps
+        pointing at whatever frame it last succeeded in), so points are
+        grouped by their current reference frame and matched in one batched
+        call per group. A small image cache holds only frames that are
+        still referenced by at least one point; anything else is dropped
+        immediately after each frame.
+    """
+    try:
+        files, cfg, update_template = job["files"], job["cfg"], job["update_template"]
+        S = len(files)
+        start_img = read_rgb(files[0])
+        if start_img is None:
+            raise RuntimeError(f"cannot read the start frame: {files[0]}")
+        mesh_pts = job["mesh_pts"]
+        M, N = mesh_pts.shape[:2]
+        P = M * N
+        pts0 = np.ascontiguousarray(mesh_pts.reshape(-1, 2), dtype=np.float64)
+
+        result["points"][0] = mesh_pts
+        result["status"][0] = 1
+        result["confidence"][0] = 1.0
+        state["done"] = 1
+
+        # template_frame[p] / template_pos[p]: which frame, and which
+        # sub-pixel position within it, point p's template is cut from.
+        # search_center[p]: current best guess of point p's location, used
+        # as next_pts_init -- this always advances to the latest successful
+        # match in BOTH reference styles; only template_frame/template_pos
+        # are held back (never updated) in the fixed style.
+        template_frame = np.zeros(P, dtype=np.int64)
+        template_pos = pts0.copy()
+        search_center = pts0.copy()
+        image_cache: dict[int, np.ndarray] = {0: start_img}
+
+        for k in range(1, S):
+            if state["cancel"].is_set():
+                break
+            img = read_rgb(files[k])
+            if img is None:            # one bad frame must not kill a long run
+                state["bad_frames"] += 1
+                state["done"] = k + 1
+                continue
+
+            nxt_all = np.full((P, 2), np.nan)
+            status_all = np.zeros(P, dtype=np.uint8)
+            conf_all = np.full(P, np.nan)
+
+            # Group points by their current template-source frame -- in the
+            # common case (no failures, incremental or fixed) this is a
+            # single group and costs exactly one call, same as before.
+            for frame_idx in np.unique(template_frame):
+                mask = template_frame == frame_idx
+                prev_img = image_cache[int(frame_idx)]
+                group_pts = template_pos[mask]
+                ctime = np.full((group_pts.shape[0], cfg["num_levels"]), np.nan, dtype=np.float64)
+                nxt, st, cf = job["func"](
+                    prev_img, img, group_pts,
+                    template_size=cfg["template_size"], search_range=cfg["search_range"],
+                    num_levels=cfg["num_levels"], match_method=cfg["match_method"],
+                    subpixel=cfg["subpixel"], min_correlation=cfg["min_correlation"],
+                    fine_search_radius=cfg["fine_search_radius"],
+                    sidelobe_exclusion_radius=cfg["sidelobe_exclusion_radius"],
+                    next_pts_init=search_center[mask].copy(), ctime=ctime,
+                )
+                group_idx = np.nonzero(mask)[0]
+                nxt_all[group_idx] = np.asarray(nxt, dtype=np.float64).reshape(-1, 2)
+                status_all[group_idx] = np.asarray(st).reshape(-1).astype(np.uint8)
+                conf_all[group_idx] = np.asarray(cf, dtype=np.float64).reshape(-1)
+
+            good = (status_all != 0) & np.isfinite(nxt_all).all(axis=1)
+            search_center[good] = nxt_all[good]
+            if update_template:
+                template_frame[good] = k
+                template_pos[good] = nxt_all[good]
+                image_cache[k] = img
+                referenced = set(int(v) for v in template_frame)
+                for cached_idx in list(image_cache):
+                    if cached_idx not in referenced:
+                        del image_cache[cached_idx]
+            # In fixed-reference mode template_frame/template_pos never
+            # change, so image_cache keeps holding only frame 0 forever --
+            # identical memory/compute profile to the single-reference
+            # version this generalizes.
+
+            out = np.where(good[:, None], nxt_all, np.nan)
+            result["points"][k] = out.reshape(M, N, 2)
+            result["status"][k] = good.reshape(M, N).astype(np.uint8)
+            result["confidence"][k] = conf_all.reshape(M, N)
+            state["done"] = k + 1
+    except Exception as e:              # reported to the UI thread by the poller
+        state["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        state["finished"] = True
+
+
+# ══ Node ══════════════════════════════════════════════════════════════════
+
+class MeshTemplateTrackNode(BaseNode):
+    """Track a regular mesh of points through an image sequence. See the
+    module docstring and _HELP_TEXT."""
+
+    EXECUTION_MODE = ExecutionMode.SYNC
+    NODE_TYPE = "mesh_template_track"
+    DISPLAY_NAME = "Mesh Template Track"
+    CATEGORY = "process"
+    SEARCH_KEYWORDS = ("mesh", "grid", "template", "match", "track", "tracking",
+                       "image sequence", "displacement", "dic", "camera motion")
+    NODE_WIDTH = 240
+    NODE_HEIGHT = 110
+    HELP_TEXT = _HELP_TEXT
+
+    # (StringVar attribute, key in saved settings, key in _defaults())
+    _SETTING_KEYS = (
+        ("_cells_var", "cells", "cells"), ("_tl_var", "top_left", "tl"),
+        ("_lr_var", "lower_right", "lr"),
+        ("_tmpl_w_var", "template_w", "tmpl_w"), ("_tmpl_h_var", "template_h", "tmpl_h"),
+        ("_search_w_var", "search_w", "search_w"), ("_search_h_var", "search_h", "search_h"),
+        ("_levels_var", "num_levels", "levels"), ("_method_var", "match_method", "method"),
+        ("_mincorr_var", "min_correlation", "min_corr"),
+        ("_fine_w_var", "fine_w", "fine_w"), ("_fine_h_var", "fine_h", "fine_h"),
+        ("_sidelobe_var", "sidelobe", "sidelobe"),
+        ("_start_var", "start_frame", "start"), ("_end_var", "end_frame", "end"),
+    )
+    _FIELD_LABELS = {
+        "cells": "cells (M, N)", "tl": "top-left corner", "lr": "lower-right corner",
+        "tmpl_w": "template width", "tmpl_h": "template height",
+        "search_w": "search range width", "search_h": "search range height",
+        "levels": "number of levels", "min_corr": "min. correlation",
+        "fine_w": "fine radius width", "fine_h": "fine radius height",
+        "sidelobe": "sidelobe radius", "start": "start frame", "end": "end frame",
+    }
+
+    def __init__(self, node_id: str, canvas: tk.Canvas):
+        super().__init__(node_id, canvas)
+        # Plain Python state only. The toolbox instantiates throw-away nodes
+        # while dragging, so Tk variables are created lazily in _init_state().
+        self._files = None
+        self._result = None            # dict, see _new_result()
+        self._result_path = ""
+        self._result_saved = True
+        self._result_error = ""
+        self._running = False
+        self._run_state = None
+        self._poll_id = None
+        self._outputs_dirty = True
+        self._destroyed = False
+        self._status_item = None
+        self._lr_auto = True           # lower-right follows the image size until edited
+        self._end_auto = True          # end frame follows the sequence length until edited
+        self._sel = (0, 0)             # selected cell (row, column)
+        self._view_frame = 1
+        self._preview_rgb = None
+        self._image_size = None        # (W, H) of the full-resolution image
+        self._preview_frame = None
+        self._preview_msg = ""
+        self._image_serial = 0
+        self._preview_token = 0
+        self._preview_req = None
+        self._preview_poll_id = None
+        self._preview_debounce_id = None
+        self._preview_executor = None
+        self._photo = None
+        self._photo_key = None
+        self._view = None              # (ox, oy, scale) image -> canvas mapping
+        self._series_user_view = False
+        self._last_plot_done = 0
+        self._series_match_state = None
+        self._suspend_validate = False
+        self._programmatic = False
+        self._reset_widget_refs()
+
+    def _reset_widget_refs(self) -> None:
+        self._entries = {}
+        self._c_img = None
+        self._slider = None
+        self._fig = self._ax = self._canvas_mpl = None
+#        self._pan = {"active": False, "x0": None, "y0": None, "xlim0": None, "ylim0": None}
+        self._pan = {"active": False, "x_px": None, "y_px": None,
+                     "xlim0": None, "ylim0": None, "x_scale": None, "y_scale": None}
+        self._progress = None
+        self._summary_label = self._result_label = None
+        self._btn_run = self._btn_stop = self._btn_load = self._btn_save = None
+        self._help_popup = None
+
+    @staticmethod
+    def _defaults() -> dict:
+        return {"cells": "6 8", "tl": "0 0", "lr": "", "tmpl_w": "31", "tmpl_h": "31",
+                "search_w": "48", "search_h": "48", "levels": "3",
+                "method": "TM_CCOEFF_NORMED", "min_corr": "0.5",
+                "fine_w": "4", "fine_h": "4", "sidelobe": "2", "start": "1", "end": ""}
+
+    def _init_state(self) -> None:
+        if hasattr(self, "_cells_var"):
+            return
+        d = self._defaults()
+        self._cells_var = tk.StringVar(value=d["cells"])
+        self._tl_var = tk.StringVar(value=d["tl"])
+        self._lr_var = tk.StringVar(value=d["lr"])
+        self._tmpl_w_var = tk.StringVar(value=d["tmpl_w"])
+        self._tmpl_h_var = tk.StringVar(value=d["tmpl_h"])
+        self._search_w_var = tk.StringVar(value=d["search_w"])
+        self._search_h_var = tk.StringVar(value=d["search_h"])
+        self._levels_var = tk.StringVar(value=d["levels"])
+        self._method_var = tk.StringVar(value=d["method"])
+        self._subpixel_var = tk.BooleanVar(value=True)
+        self._update_template_var = tk.BooleanVar(value=False)
+        self._mincorr_var = tk.StringVar(value=d["min_corr"])
+        self._fine_w_var = tk.StringVar(value=d["fine_w"])
+        self._fine_h_var = tk.StringVar(value=d["fine_h"])
+        self._sidelobe_var = tk.StringVar(value=d["sidelobe"])
+        self._start_var = tk.StringVar(value=d["start"])
+        self._end_var = tk.StringVar(value=d["end"])
+        self._show_tracked_var = tk.BooleanVar(value=True)
+        self._files_info_var = tk.StringVar(value="No image sequence connected.")
+        self._summary_var = tk.StringVar(value="")
+        self._mesh_info_var = tk.StringVar(value="")
+        self._result_info_var = tk.StringVar(value="")
+        self._progress_var = tk.StringVar(value="Idle")
+        self._frame_label_var = tk.StringVar(value="")
+        self._slider_var = tk.IntVar(value=1)
+        for attr, _saved, _key in self._SETTING_KEYS:
+            if attr not in ("_lr_var", "_end_var"):
+                getattr(self, attr).trace_add("write", self._on_var_written)
+        self._subpixel_var.trace_add("write", self._on_var_written)
+        self._update_template_var.trace_add("write", self._on_var_written)
+        self._lr_var.trace_add("write", self._on_lr_written)
+        self._end_var.trace_add("write", self._on_end_written)
+        self._show_tracked_var.trace_add("write", lambda *_a: self._redraw_preview())
+
+    # ── variable helpers ────────────────────────────────────────────────
+    def _set_var(self, var, value) -> None:
+        """Programmatic write. Writes that do NOT go through here are user
+        edits (used to switch the two 'auto' fields to manual)."""
+        self._programmatic = True
+        try:
+            var.set(value)
+        finally:
+            self._programmatic = False
+
+    def _on_var_written(self, *_args) -> None:
+        self._validate_all()
+
+    def _on_lr_written(self, *_args) -> None:
+        if not self._programmatic:
+            self._lr_auto = False
+        self._validate_all()
+
+    def _on_end_written(self, *_args) -> None:
+        if not self._programmatic:
+            self._end_auto = False
+        self._validate_all()
+
+    # ── pins ────────────────────────────────────────────────────────────
+    def get_pin_schema(self) -> PinSchema:
+        return PinSchema(
+            inputs=[PinDef("files", PinType.STRING, "files", optional=True)],
+            outputs=[
+                PinDef("points", PinType.ARRAY, "points", shape=(-1, -1, -1, 2), dtype="float64"),
+                PinDef("status", PinType.ARRAY, "status", shape=(-1, -1, -1), dtype="uint8"),
+                PinDef("confidence", PinType.ARRAY, "conf", shape=(-1, -1, -1), dtype="float64"),
+                PinDef("frames", PinType.ARRAY, "frames", shape=(-1,), dtype="float64"),
+            ],
+        )
+
+    @staticmethod
+    def _coerce_files(value):
+        if value is None:
+            return None
+        if isinstance(value, (str, os.PathLike)):
+            items = [str(value)]
+        else:
+            try:
+                items = [str(v) for v in list(value)]
+            except TypeError:
+                return None
+        items = [p for p in items if p.strip()]
+        return items or None
+
+    def compute(self, inputs: dict) -> dict:
+        self._init_state()
+        files = self._coerce_files(inputs.get("files"))
+        if files != self._files:
+            self._files = files
+            self._on_files_changed()
+        # Do not push partial data downstream while tracking, and do not
+        # re-push unchanged results when only the (unchanged) input file list
+        # is re-delivered (e.g. on every frame emitted by an Image Sequence).
+        if self._running or not self._outputs_dirty:
+            return {"_skip_downstream": True, "_preserve_cache": True}
+        self._outputs_dirty = False
+        return self._outputs()
+
+    def _outputs(self) -> dict:
+        r = self._result
+        if r is None or r["n_done"] <= 0:
+            return {}
+        S = r["points"].shape[0]
+        return {"points": r["points"], "status": r["status"], "confidence": r["confidence"],
+                "frames": (r["start"] + np.arange(S)).astype(np.float64)}
+
+    def _notify_result_changed(self) -> None:
+        self._outputs_dirty = True
+        if self._request_downstream is not None:
+            self._request_downstream(self.node_id)
+
+    # ── serialization ───────────────────────────────────────────────────
+    def _settings_dict(self) -> dict:
+        self._init_state()
+        s = {saved: getattr(self, attr).get() for attr, saved, _k in self._SETTING_KEYS}
+        s.update(subpixel=bool(self._subpixel_var.get()), show_tracked=bool(self._show_tracked_var.get()),
+                 update_template=bool(self._update_template_var.get()),
+                 lr_auto=bool(self._lr_auto), end_auto=bool(self._end_auto))
+        return s
+
+    def _apply_settings(self, s: dict, from_file: bool) -> None:
+        self._init_state()
+        d = self._defaults()
+        self._suspend_validate = True
+        try:
+            for attr, saved, key in self._SETTING_KEYS:
+                self._set_var(getattr(self, attr), str(s.get(saved, d[key])))
+            self._set_var(self._subpixel_var, bool(s.get("subpixel", True)))
+            self._set_var(self._show_tracked_var, bool(s.get("show_tracked", True)))
+            self._set_var(self._update_template_var, bool(s.get("update_template", False)))
+        finally:
+            self._suspend_validate = False
+        # Values loaded from a result file are explicit: never overwritten by
+        # the current sequence's image size / length.
+        self._lr_auto = False if from_file else bool(s.get("lr_auto", False))
+        self._end_auto = False if from_file else bool(s.get("end_auto", False))
+        self._validate_all()
+
+    def get_params(self) -> dict:
+        base = self._get_project_base()
+        path = self._result_path
+        rel = self._to_relative(self._to_absolute(path, base), base) if path else ""
+        return {"settings": self._settings_dict(), "result_file": rel}
+
+    def set_params(self, params: dict) -> None:
+        self._init_state()
+        self._apply_settings(params.get("settings", {}) or {}, from_file=False)
+        path = str(params.get("result_file", "") or "")
+        if path:
+            abs_path = self._to_absolute(path, self._get_project_base())
+            try:
+                _settings, result = self._read_track_file(abs_path)
+                if result is not None:
+                    self._result, self._result_path = result, abs_path
+                    self._result_saved, self._result_error = True, ""
+                    self._outputs_dirty = True
+            except Exception as e:      # missing/corrupt file must not break project loading
+                self._result_error = f"Result file could not be loaded:\n{abs_path}\n({e})"
+        self._update_result_info()
+        self._update_status_item()
+
+    @staticmethod
+    def _get_project_base():
+        return get_project_directory()
+
+    @staticmethod
+    def _to_relative(path: str, base) -> str:
+        if not path or base is None:
+            return path
+        try:
+            return os.path.relpath(str(path), str(base))
+        except Exception:
+            return path
+
+    @staticmethod
+    def _to_absolute(path: str, base) -> str:
+        p = Path(path)
+        if p.is_absolute() or base is None:
+            return str(p)
+        return str((Path(base) / p).resolve())
+
+    # ── node face ───────────────────────────────────────────────────────
+    def _status_text(self) -> str:
+        if self._running and self._run_state is not None:
+            return f"tracking {self._run_state['done']}/{self._run_state['total']}"
+        r = self._result
+        if r is None:
+            return "result file error" if self._result_error else "idle"
+        S, M, N = r["points"].shape[:3]
+        tag = " (partial)" if r["n_done"] < S else ""
+        return f"{r['n_done']} frames, {M}x{N} pts{tag}"
+
+    def _update_status_item(self) -> None:
+        if self._status_item is not None:
+            try:
+                self.canvas.itemconfig(self._status_item, text=self._status_text())
+            except tk.TclError:
+                pass
+
+    def build_body(self) -> None:
+        self._init_state()
+        x, y, w, h = self.x, self.y, self.width, self.height
+        self._body_rect = self.canvas.create_rectangle(
+            x, y, x + w, y + h, fill="#eef3fb", outline="#3f6db3", width=2,
+            tags=(self.node_id, "node_body"))
+        self._title_item = self.canvas.create_text(
+            x + w / 2, y + 13, text=self.get_canvas_title(), font=("Arial", 9, "bold"),
+            fill="#1c3a6b", tags=(self.node_id,))
+        hint = self.canvas.create_text(
+            x + w / 2, y + 42, text="files -> tracked mesh points", font=("Arial", 8),
+            fill="#35507d", tags=(self.node_id,))
+        self._status_item = self.canvas.create_text(
+            x + w / 2, y + h - 14, text=self._status_text(), font=("Arial", 7),
+            fill="#456", width=w - 12, tags=(self.node_id,))
+        self._canvas_items += [self._body_rect, self._title_item, hint, self._status_item]
+
+    def on_resize(self, old_width, old_height, new_width, new_height) -> None:
+        if self._status_item is not None:
+            self.canvas.coords(self._status_item, self.x + new_width / 2, self.y + new_height - 14)
+
+    def get_help_text(self) -> str:
+        return _HELP_TEXT
+
+    # ══ Validation ═══════════════════════════════════════════════════════
+    def _collect(self):
+        """Parse every setting. Returns (cfg, bad): cfg holds the parsed
+        values (None where invalid or still pending), bad is the set of
+        field keys with invalid text."""
+        self._init_state()
+        bad: set = set()
+        cfg: dict = {}
+
+        def int_of(var, key, minimum):
+            v = parse_numbers(var.get(), 1, integer=True)
+            if v is None or v[0] < minimum:
+                bad.add(key)
+                return None
+            return v[0]
+
+        cells = parse_numbers(self._cells_var.get(), 2, integer=True)
+        if cells is None or cells[0] < 1 or cells[1] < 1:
+            bad.add("cells")
+            cells = None
+        cfg["cells"] = cells
+
+        tl = parse_numbers(self._tl_var.get(), 2)
+        if tl is None:
+            bad.add("tl")
+        cfg["tl"] = tl
+
+        lr_text = self._lr_var.get().strip()
+        if not lr_text and self._lr_auto:
+            lr = None                                # pending: image size unknown yet
+        else:
+            lr = parse_numbers(lr_text, 2)
+            if lr is None:
+                bad.add("lr")
+        cfg["lr"] = lr
+        if tl is not None and lr is not None and (lr[0] <= tl[0] or lr[1] <= tl[1]):
+            bad.update(("tl", "lr"))
+
+        def pair(vw, vh, kw, kh, minimum):
+            w, h = int_of(vw, kw, minimum), int_of(vh, kh, minimum)
+            return (w, h) if w is not None and h is not None else None
+
+        cfg["template"] = pair(self._tmpl_w_var, self._tmpl_h_var, "tmpl_w", "tmpl_h", 3)
+        cfg["search"] = pair(self._search_w_var, self._search_h_var, "search_w", "search_h", 1)
+        cfg["levels"] = int_of(self._levels_var, "levels", 1)
+        cfg["fine"] = pair(self._fine_w_var, self._fine_h_var, "fine_w", "fine_h", 0)
+        cfg["sidelobe"] = int_of(self._sidelobe_var, "sidelobe", 0)
+
+        mc = parse_numbers(self._mincorr_var.get(), 1)
+        if mc is None or not (0.0 <= mc[0] <= 1.0):
+            bad.add("min_corr")
+            cfg["min_corr"] = None
+        else:
+            cfg["min_corr"] = mc[0]
+
+        cfg["method"] = self._method_var.get()
+        cfg["subpixel"] = bool(self._subpixel_var.get())
+        cfg["update_template"] = bool(self._update_template_var.get())
+
+        start = int_of(self._start_var, "start", 1)
+        if not self._end_var.get().strip() and self._end_auto:
+            end = None                               # pending: sequence length unknown yet
+        else:
+            end = int_of(self._end_var, "end", 1)
+        if start is not None and end is not None and start > end:
+            bad.update(("start", "end"))
+        if self._files:
+            n = len(self._files)
+            if start is not None and start > n:
+                bad.add("start")
+            if end is not None and end > n:
+                bad.add("end")
+        cfg["start"], cfg["end"] = start, end
+        return cfg, bad
+
+    @staticmethod
+    def _mesh_from_cfg(cfg, bad):
+        if any(k in bad for k in ("cells", "tl", "lr")):
+            return None
+        if cfg["cells"] is None or cfg["tl"] is None or cfg["lr"] is None:
+            return None
+        (M, N), (u0, v0), (u1, v1) = cfg["cells"], cfg["tl"], cfg["lr"]
+        return (M, N, u0, v0, u1, v1)
+
+    @staticmethod
+    def _result_matches(res, mesh) -> bool:
+        if res is None or mesh is None:
+            return False
+        rm = res["mesh"]
+        return (int(rm[0]) == mesh[0] and int(rm[1]) == mesh[1]
+                and bool(np.allclose(rm[2:], mesh[2:], rtol=0.0, atol=1e-9)))
+
+    def _run_blocker(self, cfg, bad):
+        """Return why Run is not possible right now, or None."""
+        if calcTemplateMatchPyr is None:
+            return f"calcTemplateMatchPyr could not be imported: {_TRACKER_IMPORT_ERROR}"
+        if not self._files:
+            return "Waiting for the image sequence ('files' input)."
+        if bad:
+            return "Fix the values shown in red."
+        if cfg["lr"] is None:
+            return "Image size not known yet; enter the lower-right corner."
+        if cfg["end"] is None:
+            return "End frame is not set."
+        return None
+
+    def _outside_mask(self, mesh, cfg):
+        """Bool (M, N): points whose template would extend outside the image."""
+        size, tmpl = self._image_size, cfg["template"]
+        if size is None or tmpl is None:
+            return None
+        W, H = size
+        tw, th = tmpl
+        c = mesh_centers(*mesh)
+        u, v = c[..., 0], c[..., 1]
+        return ((u - tw / 2.0 < -0.5) | (u + tw / 2.0 > W - 0.5)
+                | (v - th / 2.0 < -0.5) | (v + th / 2.0 > H - 0.5))
+
+    def _validate_all(self) -> None:
+        if self._suspend_validate:
+            return
+        cfg, bad = self._collect()
+        for key, entries in self._entries.items():
+            color = INVALID_FG if key in bad else NORMAL_FG
+            for ent in entries:
+                try:
+                    ent.configure(fg=color)
+                except tk.TclError:
+                    pass
+        blocker = self._run_blocker(cfg, bad)
+        if bad:
+            text, color = "Invalid: " + ", ".join(self._FIELD_LABELS[k] for k in sorted(bad)), INVALID_FG
+        elif blocker:
+            text, color = blocker, "#b36b00"
+        else:
+            text, color = "Settings OK - ready to run.", "#1a7a1a"
+        self._summary_var.set(text)
+        if self._summary_label is not None:
+            try:
+                self._summary_label.configure(fg=color)
+            except tk.TclError:
+                pass
+        self._update_mesh_info(cfg, bad)
+        self._set_state(self._btn_run, tk.NORMAL if (blocker is None and not self._running) else tk.DISABLED)
+        self._sync_slider(cfg, bad)
+        self._redraw_preview()
+        match = self._result_matches(self._result, self._mesh_from_cfg(cfg, bad))
+        if match != self._series_match_state:
+            self._series_match_state = match
+            self._redraw_series()
+
+    @staticmethod
+    def _set_state(widget, state) -> None:
+        if widget is not None:
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _update_mesh_info(self, cfg, bad) -> None:
+        mesh = self._mesh_from_cfg(cfg, bad)
+        if mesh is None:
+            self._mesh_info_var.set("Waiting for valid cells and corners.")
+            return
+        M, N, u0, v0, u1, v1 = mesh
+        text = f"{M} x {N} = {M * N} points; cell {(u1 - u0) / N:.2f} x {(v1 - v0) / M:.2f} px"
+        outside = self._outside_mask(mesh, cfg)
+        if outside is not None and outside.any():
+            text += (f"\nWARNING: {int(outside.sum())} point(s) have a template extending outside "
+                     "the image (orange in the preview); they may fail to track.")
+        if M * N > MAX_DRAWN_POINTS:
+            text += "\nToo many points: dots are not drawn in the preview."
+        self._mesh_info_var.set(text)
+
+    # ══ Files / preview image ════════════════════════════════════════════
+    def _on_files_changed(self) -> None:
+        n = len(self._files) if self._files else 0
+        if n:
+            self._files_info_var.set(f"{n} image files\nfirst: {os.path.basename(self._files[0])}\n"
+                                     f"last:  {os.path.basename(self._files[-1])}")
+            if self._end_auto:
+                self._set_var(self._end_var, str(n))
+        else:
+            self._files_info_var.set("No image sequence connected.\n"
+                                     "Connect the 'files' output of an Image Sequence node.")
+        self._update_result_info()
+        self._validate_all()
+        self._schedule_preview(60)
+
+    def _frame_text(self, f: int) -> str:
+        files = self._files
+        name = os.path.basename(files[f - 1]) if files and 1 <= f <= len(files) else ""
+        end = self._end_var.get().strip()
+        text = f"Frame {f}" + (f" / {end}" if end.isdigit() else "")
+        return text + (f"   {name}" if name else "")
+
+    def _sync_slider(self, cfg, bad) -> None:
+        sl = self._slider
+        if sl is None:
+            return
+        s, e = cfg["start"], cfg["end"]
+        if s is None or e is None or "start" in bad or "end" in bad or not self._files:
+            self._set_state(sl, tk.DISABLED)
+            self._frame_label_var.set("Frame range not valid yet")
+            return
+        try:
+            sl.configure(state=tk.NORMAL, from_=s, to=e)
+        except tk.TclError:
+            return
+        f = min(max(self._view_frame, s), e)
+        if f != self._view_frame:
+            self._view_frame = f
+            self._schedule_preview()
+        if self._slider_var.get() != f:
+            self._slider_var.set(f)
+        self._frame_label_var.set(self._frame_text(f))
+
+    def _on_slider_moved(self, value) -> None:
+        try:
+            f = int(float(value))
+        except ValueError:
+            return
+        self._frame_label_var.set(self._frame_text(f))     # cheap: label only while dragging
+
+    def _on_slider_released(self, _event=None) -> None:
+        f = int(self._slider_var.get())
+        if f == self._view_frame and self._preview_frame == f:
+            return
+        self._view_frame = f
+        self._request_preview()
+        self._redraw_series()                               # moves the frame marker
+
+    def _schedule_preview(self, delay: int = 300) -> None:
+        if self._c_img is None:
+            return
+        if self._preview_debounce_id is not None:
+            try:
+                self.canvas.after_cancel(self._preview_debounce_id)
+            except tk.TclError:
+                pass
+        self._preview_debounce_id = self.canvas.after(delay, self._request_preview)
+
+    def _request_preview(self) -> None:
+        self._preview_debounce_id = None
+        if self._c_img is None or self._destroyed:
+            return
+        files, f = self._files, self._view_frame
+        if not files or not (1 <= f <= len(files)):
+            self._preview_rgb = self._image_size = None
+            self._preview_msg = ""
+            self._photo_key = None
+            self._redraw_preview()
+            return
+        self._preview_token += 1
+        req = {"token": self._preview_token, "frame": f, "path": files[f - 1],
+               "image": None, "size": None, "error": None, "done": False}
+        self._preview_req = req
+        self._frame_label_var.set(self._frame_text(f) + "   (loading ...)")
+        if self._preview_executor is None:
+            self._preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mtt-preview")
+        self._preview_executor.submit(self._preview_worker, req)
+        self._schedule_preview_poll()
+
+    def _preview_worker(self, req: dict) -> None:
+        """Worker thread: decode + downscale. Never touches Tk."""
+        try:
+            if req["token"] != self._preview_token:          # superseded before it started
+                return
+            rgb = read_rgb(req["path"])
+            if rgb is None:
+                req["error"] = "cannot read image"
+                return
+            h, w = rgb.shape[:2]
+            longest = max(h, w)
+            if longest > PREVIEW_MAX_SIDE:
+                f = PREVIEW_MAX_SIDE / longest
+                rgb = cv2.resize(rgb, (max(1, round(w * f)), max(1, round(h * f))),
+                                 interpolation=cv2.INTER_AREA)
+            req["image"], req["size"] = rgb, (w, h)
+        except Exception as e:
+            req["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            req["done"] = True
+
+    def _schedule_preview_poll(self) -> None:
+        if self._preview_poll_id is None:
+            try:
+                self._preview_poll_id = self.canvas.after(40, self._poll_preview)
+            except tk.TclError:
+                pass
+
+    def _poll_preview(self) -> None:
+        self._preview_poll_id = None
+        req = self._preview_req
+        if req is None or self._destroyed:
+            return
+        if not req["done"]:
+            self._schedule_preview_poll()
+            return
+        self._preview_req = None
+        self._apply_preview(req)
+
+    def _apply_preview(self, req: dict) -> None:
+        if req["error"] or req["image"] is None:
+            self._preview_rgb = self._image_size = None
+            self._preview_frame = None
+            self._preview_msg = f"Cannot read frame {req['frame']}:\n{os.path.basename(req['path'])}"
+        else:
+            self._preview_rgb, self._image_size = req["image"], req["size"]
+            self._preview_frame, self._preview_msg = req["frame"], ""
+            self._image_serial += 1
+            if self._lr_auto:
+                W, H = req["size"]
+                text = f"{W - 1} {H - 1}"
+                if self._lr_var.get() != text:
+                    self._set_var(self._lr_var, text)        # -> validation + redraw
+        self._frame_label_var.set(self._frame_text(self._view_frame))
+        self._validate_all()
+        self._redraw_series()
+
+    # ══ Inspector ════════════════════════════════════════════════════════
+    def build_inspector(self, parent: tk.Frame) -> None:
+        self._init_state()
+        self._reset_widget_refs()
+        win = self._inspector_win
+        if win is not None:
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            win.geometry(f"{min(1500, sw - 80)}x{min(820, sh - 120)}")
+            win.minsize(min(1000, sw - 80), min(560, sh - 120))
+            for seq in ("<Control-h>", "<Control-H>"):
+                win.bind(seq, lambda _e: self._open_help())
+        panes = tk.PanedWindow(parent, orient=tk.HORIZONTAL, sashwidth=6, sashrelief=tk.RAISED)
+        panes.pack(fill="both", expand=True)
+        left, right = tk.Frame(panes), tk.Frame(panes)
+        panes.add(left, width=400, minsize=300)
+        panes.add(right, minsize=460)
+        inner, cv = self._make_scrollable(left)
+        self._build_settings_panel(inner)
+        self._bind_wheel_recursive(left, cv)
+        self._build_right_panel(right)
+        self._set_running_ui(self._running)
+        self._update_result_info()
+        self._validate_all()
+        self._request_preview()
+
+    @staticmethod
+    def _make_scrollable(parent):
+        outer = tk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+        cv = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+        hsb = ttk.Scrollbar(outer, orient="horizontal", command=cv.xview)
+        cv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        cv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        inner = tk.Frame(cv)
+        cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        return inner, cv
+
+    @staticmethod
+    def _wheel_steps(e) -> int:
+        if getattr(e, "num", None) == 4:
+            return 1
+        if getattr(e, "num", None) == 5:
+            return -1
+        d = getattr(e, "delta", 0)
+        return int(d / 120) if abs(d) >= 120 else (1 if d > 0 else -1 if d < 0 else 0)
+
+    def _bind_wheel_recursive(self, widget, cv) -> None:
+        """Wheel scrolls the settings panel (Shift = horizontal). Bound per
+        widget (not bind_all) so the editor's own wheel bindings stay intact;
+        returning "break" stops comboboxes changing value on scroll."""
+        def on_wheel(e):
+            steps = self._wheel_steps(e)
+            (cv.xview_scroll if e.state & 0x0001 else cv.yview_scroll)(-steps * 3, "units")
+            return "break"
+
+        def bind(w):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                w.bind(seq, on_wheel, add="+")
+            for child in w.winfo_children():
+                bind(child)
+        bind(widget)
+
+    def _grid_row(self, parent, row, text, fields) -> None:
+        tk.Label(parent, text=text, font=("Arial", 8), anchor="w").grid(
+            row=row, column=0, sticky="w", padx=(0, 6), pady=2)
+        for col, (var, key, width) in enumerate(fields, start=1):
+            ent = tk.Entry(parent, textvariable=var, width=width, justify="center", font=("Arial", 9))
+            ent.grid(row=row, column=col, sticky="w", padx=(0 if col == 1 else 4, 0), pady=2)
+            self._entries.setdefault(key, []).append(ent)
+
+    def _build_settings_panel(self, f: tk.Frame) -> None:
+        pad = {"padx": 6, "pady": 4}
+
+        box = tk.LabelFrame(f, text="Input", font=("Arial", 9), padx=6, pady=4)
+        box.pack(fill="x", **pad)
+        tk.Label(box, textvariable=self._files_info_var, font=("Arial", 8), anchor="w",
+                 justify="left", wraplength=340).pack(fill="x")
+
+        box = tk.LabelFrame(f, text="Mesh settings", font=("Arial", 9), padx=6, pady=4)
+        box.pack(fill="x", **pad)
+        self._grid_row(box, 0, "Cells (M rows, N columns)", [(self._cells_var, "cells", 16)])
+        self._grid_row(box, 1, "Top-left corner (u v)", [(self._tl_var, "tl", 16)])
+        self._grid_row(box, 2, "Lower-right corner (u v)", [(self._lr_var, "lr", 16)])
+        tk.Label(box, text="Separate numbers with space, tab or comma.\n"
+                           "One tracking point sits at the centre of each cell.",
+                 font=("Arial", 8), fg="#666666", anchor="w", justify="left").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        tk.Label(box, textvariable=self._mesh_info_var, font=("Arial", 8), fg="#334477",
+                 anchor="w", justify="left", wraplength=340).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        box = tk.LabelFrame(f, text="Tracking settings", font=("Arial", 9), padx=6, pady=4)
+        box.pack(fill="x", **pad)
+
+        # Template size row, with an "Auto (from mesh)" button that fills it
+        # from the current cell size -- users can still edit it afterwards.
+        tk.Label(box, text="Template size (w,h)", font=("Arial", 8), anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 6), pady=2)
+        tmpl_w_entry = tk.Entry(box, textvariable=self._tmpl_w_var, width=6, justify="center", font=("Arial", 9))
+        tmpl_w_entry.grid(row=0, column=1, sticky="w", pady=2)
+        tmpl_h_entry = tk.Entry(box, textvariable=self._tmpl_h_var, width=6, justify="center", font=("Arial", 9))
+        tmpl_h_entry.grid(row=0, column=2, sticky="w", padx=(4, 0), pady=2)
+        self._entries.setdefault("tmpl_w", []).append(tmpl_w_entry)
+        self._entries.setdefault("tmpl_h", []).append(tmpl_h_entry)
+        tk.Button(box, text="Auto (from mesh)", font=("Arial", 8),
+                  command=self._on_auto_window_size).grid(row=0, column=3, sticky="w", padx=(8, 0), pady=2)
+
+        self._grid_row(box, 1, "Search range (w,h)",
+                       [(self._search_w_var, "search_w", 6), (self._search_h_var, "search_h", 6)])
+        self._grid_row(box, 2, "Num levels", [(self._levels_var, "levels", 6)])
+        tk.Label(box, text="Match method", font=("Arial", 8), anchor="w").grid(
+            row=3, column=0, sticky="w", padx=(0, 6), pady=2)
+        ttk.Combobox(box, textvariable=self._method_var, values=list(MATCH_METHODS),
+                     width=18, state="readonly").grid(row=3, column=1, columnspan=2, sticky="w", pady=2)
+        tk.Checkbutton(box, text="Subpixel refinement", variable=self._subpixel_var,
+                       font=("Arial", 8)).grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
+        tk.Checkbutton(box, text="Update template every frame (else: fixed reference = start frame)",
+                       variable=self._update_template_var, font=("Arial", 8)).grid(
+            row=5, column=0, columnspan=4, sticky="w", pady=2)
+        self._grid_row(box, 6, "Min correlation (0-1)", [(self._mincorr_var, "min_corr", 6)])
+        self._grid_row(box, 7, "Fine search radius (w,h)",
+                       [(self._fine_w_var, "fine_w", 6), (self._fine_h_var, "fine_h", 6)])
+        self._grid_row(box, 8, "Sidelobe exclusion radius", [(self._sidelobe_var, "sidelobe", 6)])
+        self._grid_row(box, 9, "Start frame", [(self._start_var, "start", 6)])
+        self._grid_row(box, 10, "End frame", [(self._end_var, "end", 6)])
+        tk.Button(box, text="Reset tracking defaults", font=("Arial", 8),
+                  command=self._reset_tracking_defaults).grid(
+            row=11, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        box = tk.LabelFrame(f, text="Run", font=("Arial", 9), padx=6, pady=4)
+        box.pack(fill="x", **pad)
+        row = tk.Frame(box)
+        row.pack(fill="x")
+        self._btn_run = tk.Button(row, text="Run", width=10, font=("Arial", 9, "bold"),
+                                  bg="#33558a", fg="white", command=self._on_run)
+        self._btn_run.pack(side="left")
+        self._btn_stop = tk.Button(row, text="Stop", width=10, command=self._on_stop, state=tk.DISABLED)
+        self._btn_stop.pack(side="left", padx=6)
+        tk.Button(row, text="Help", command=self._open_help).pack(side="right")
+        self._progress = ttk.Progressbar(box, mode="determinate", length=300)
+        self._progress.pack(fill="x", pady=(6, 2))
+        tk.Label(box, textvariable=self._progress_var, font=("Arial", 8), anchor="w",
+                 justify="left", wraplength=340).pack(fill="x")
+        self._summary_label = tk.Label(box, textvariable=self._summary_var, font=("Arial", 8, "bold"),
+                                       anchor="w", justify="left", wraplength=340)
+        self._summary_label.pack(fill="x", pady=(4, 0))
+
+        box = tk.LabelFrame(f, text="Data", font=("Arial", 9), padx=6, pady=4)
+        box.pack(fill="x", **pad)
+        row = tk.Frame(box)
+        row.pack(fill="x")
+        self._btn_load = tk.Button(row, text="Load ...", width=10, command=self._on_load)
+        self._btn_load.pack(side="left")
+        self._btn_save = tk.Button(row, text="Save as ...", width=10, command=self._on_save_as)
+        self._btn_save.pack(side="left", padx=6)
+        self._result_label = tk.Label(box, textvariable=self._result_info_var, font=("Arial", 8),
+                                      anchor="w", justify="left", wraplength=340)
+        self._result_label.pack(fill="x", pady=(4, 0))
+
+        box = tk.LabelFrame(f, text="Display", font=("Arial", 9), padx=6, pady=4)
+        box.pack(fill="x", **pad)
+        tk.Checkbutton(box, text="Show tracked positions at the displayed frame",
+                       variable=self._show_tracked_var, font=("Arial", 8)).pack(anchor="w")
+
+    def _build_right_panel(self, right: tk.Frame) -> None:
+        rp = tk.PanedWindow(right, orient=tk.VERTICAL, sashwidth=6, sashrelief=tk.RAISED)
+        rp.pack(fill="both", expand=True)
+        top = tk.LabelFrame(rp, text="Image preview (click a cell to select its point)", font=("Arial", 9))
+        bottom = tk.LabelFrame(rp, text="Selected point: displacement relative to the first frame",
+                               font=("Arial", 9))
+        rp.add(top, minsize=220, stretch="always")
+        rp.add(bottom, height=280, minsize=160, stretch="never")
+
+        self._c_img = tk.Canvas(top, bg="#202020", highlightthickness=0)
+        self._c_img.pack(fill="both", expand=True)
+        self._c_img.bind("<Configure>", lambda _e: self._redraw_preview())
+        self._c_img.bind("<Button-1>", self._on_image_click)
+
+        srow = tk.Frame(top)
+        srow.pack(fill="x")
+        self._slider = tk.Scale(srow, from_=1, to=1, orient=tk.HORIZONTAL, resolution=1,
+                                showvalue=False, variable=self._slider_var,
+                                command=self._on_slider_moved, state=tk.DISABLED)
+        self._slider.pack(fill="x", padx=6)
+        self._slider.bind("<ButtonRelease-1>", self._on_slider_released)
+        self._slider.bind("<KeyRelease>", self._on_slider_released)
+        tk.Label(srow, textvariable=self._frame_label_var, font=("Arial", 9), anchor="w").pack(
+            fill="x", padx=6, pady=(0, 2))
+        self._build_series_plot(bottom)
+
+    # ══ Preview drawing / selection ══════════════════════════════════════
+    def _redraw_preview(self) -> None:
+        c = self._c_img
+        if c is None:
+            return
+        try:
+            cw, ch = c.winfo_width(), c.winfo_height()
+        except tk.TclError:
+            return
+        if cw < 30 or ch < 30:
+            return
+        rgb, size = self._preview_rgb, self._image_size
+        if rgb is None or size is None:
+            c.delete("all")
+            self._photo_key, self._view = None, None
+            c.create_text(cw / 2, ch / 2, fill="#999999", justify="center", width=cw - 40,
+                          text=self._preview_msg or
+                          "No image available.\nConnect an image sequence to the 'files' input.")
+            return
+        W, H = size
+        margin = 6
+        fit = min((cw - 2 * margin) / W, (ch - 2 * margin) / H)
+        dw, dh = max(1, int(round(W * fit))), max(1, int(round(H * fit)))
+        ox, oy = (cw - dw) / 2.0, (ch - dh) / 2.0
+        s = dw / float(W)
+        self._view = (ox, oy, s)
+        key = (self._image_serial, dw, dh)
+        if key != self._photo_key:
+            interp = cv2.INTER_AREA if dw < rgb.shape[1] else cv2.INTER_LINEAR
+            small = cv2.resize(rgb, (dw, dh), interpolation=interp)
+            self._photo = ImageTk.PhotoImage(Image.fromarray(small))
+            self._photo_key = key
+            c.delete("all")
+            c.create_image(ox, oy, anchor="nw", image=self._photo, tags="img")
+        else:
+            c.coords("img", ox, oy)
+            c.delete("overlay")
+        self._draw_overlay(c, ox, oy, s)
+
+    def _draw_overlay(self, c, ox, oy, s) -> None:
+        cfg, bad = self._collect()
+        mesh = self._mesh_from_cfg(cfg, bad)
+        if mesh is None:
+            c.create_text(8, 8, anchor="nw", fill="#ff5252", tags="overlay",
+                          text="Mesh settings are not valid yet.")
+            return
+        M, N, u0, v0, u1, v1 = mesh
+        X = lambda u: ox + (u + 0.5) * s          # OpenCV pixel-centre convention
+        Y = lambda v: oy + (v + 0.5) * s
+        for i in range(M + 1):
+            v = v0 + i * (v1 - v0) / M
+            c.create_line(X(u0), Y(v), X(u1), Y(v), fill=GRID_COLOR, width=1, tags="overlay")
+        for j in range(N + 1):
+            u = u0 + j * (u1 - u0) / N
+            c.create_line(X(u), Y(v0), X(u), Y(v1), fill=GRID_COLOR, width=1, tags="overlay")
+
+        si, sj = min(self._sel[0], M - 1), min(self._sel[1], N - 1)
+        self._sel = (si, sj)
+        cu0, cu1 = u0 + sj * (u1 - u0) / N, u0 + (sj + 1) * (u1 - u0) / N
+        cv0, cv1 = v0 + si * (v1 - v0) / M, v0 + (si + 1) * (v1 - v0) / M
+        c.create_rectangle(X(cu0), Y(cv0), X(cu1), Y(cv1), outline=SELECT_COLOR, width=3, tags="overlay")
+
+        if M * N > MAX_DRAWN_POINTS:
+            return
+        pos, tracked = mesh_centers(*mesh), False
+        res = self._result
+        if self._show_tracked_var.get() and self._result_matches(res, mesh):
+            idx = self._view_frame - res["start"]
+            if 0 <= idx < res["n_done"]:
+                pos, tracked = res["points"][idx], True
+        outside = None if tracked else self._outside_mask(mesh, cfg)
+        for i in range(M):
+            for j in range(N):
+                x, y = pos[i, j]
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue
+                selected = (i, j) == (si, sj)
+                color = SELECT_DOT_COLOR if selected else (
+                    OUTSIDE_DOT_COLOR if outside is not None and outside[i, j] else DOT_COLOR)
+                r = 4.5 if selected else 2.5
+                px, py = X(x), Y(y)
+                c.create_oval(px - r, py - r, px + r, py + r, fill=color, outline="", tags="overlay")
+
+    def _on_image_click(self, event) -> None:
+        if self._view is None:
+            return
+        cfg, bad = self._collect()
+        mesh = self._mesh_from_cfg(cfg, bad)
+        if mesh is None:
+            return
+        ox, oy, s = self._view
+        u, v = (event.x - ox) / s - 0.5, (event.y - oy) / s - 0.5
+        M, N, u0, v0, u1, v1 = mesh
+        j = int(math.floor((u - u0) / (u1 - u0) * N))
+        i = int(math.floor((v - v0) / (v1 - v0) * M))
+        if 0 <= i < M and 0 <= j < N and (i, j) != self._sel:
+            self._sel = (i, j)
+            self._series_user_view = False           # new point -> autoscale
+            self._redraw_preview()
+            self._redraw_series()
+
+    # ══ Series plot ══════════════════════════════════════════════════════
+    def _build_series_plot(self, parent: tk.Frame) -> None:
+        bar = tk.Frame(parent)
+        bar.pack(fill="x")
+        tk.Button(bar, text="Reset zoom", font=("Arial", 8), command=self._reset_series_view).pack(side="left")
+        self._fig = Figure(figsize=(5, 2.6), dpi=100)
+        self._fig.subplots_adjust(left=0.09, right=0.985, top=0.88, bottom=0.2)
+        self._ax = self._fig.add_subplot(111)
+        self._canvas_mpl = FigureCanvasTkAgg(self._fig, master=parent)
+        self._canvas_mpl.get_tk_widget().pack(fill="both", expand=True)
+        self._canvas_mpl.mpl_connect("scroll_event", self._on_series_scroll)
+        self._canvas_mpl.mpl_connect("button_press_event", self._on_series_press)
+        self._canvas_mpl.mpl_connect("motion_notify_event", self._on_series_drag)
+        self._canvas_mpl.mpl_connect("button_release_event", self._on_series_release)
+
+    def _reset_series_view(self) -> None:
+        self._series_user_view = False
+        self._redraw_series()
+
+    def _on_series_scroll(self, event) -> None:
+        ax = self._ax
+        if ax is None or event.inaxes is not ax or event.xdata is None or event.ydata is None:
+            return
+        factor = 0.9 if event.button == "up" else 1.1
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        key = getattr(event, "key", None)
+        # Ctrl+wheel: horizontal zoom only; Shift+wheel: vertical only; else both.
+        if key in ("control", "ctrl"):
+            ax.set_xlim([event.xdata - (event.xdata - v) * factor for v in xlim])
+        elif key == "shift":
+            ax.set_ylim([event.ydata - (event.ydata - v) * factor for v in ylim])
+        else:
+            ax.set_xlim([event.xdata - (event.xdata - v) * factor for v in xlim])
+            ax.set_ylim([event.ydata - (event.ydata - v) * factor for v in ylim])
+        self._series_user_view = True
+        self._canvas_mpl.draw_idle()
+
+#    def _on_series_press(self, event) -> None:
+#        if self._ax is None or event.inaxes is not self._ax or event.button != 1 or event.xdata is None:
+#            return
+#        self._pan.update(active=True, x0=event.xdata, y0=event.ydata,
+#                         xlim0=self._ax.get_xlim(), ylim0=self._ax.get_ylim())
+    def _on_series_press(self, event) -> None:
+        if self._ax is None or event.inaxes is not self._ax or event.button != 1 or event.x is None:
+            return
+        xlim0, ylim0 = self._ax.get_xlim(), self._ax.get_ylim()
+        bbox = self._ax.bbox
+        if bbox.width <= 0 or bbox.height <= 0:
+            return
+        # Scale (data units per pixel) is captured ONCE here and reused for
+        # the whole drag -- see _on_series_drag's docstring for why this
+        # avoids a feedback loop that re-deriving it from event.xdata/ydata
+        # on every move would create.
+        self._pan.update(
+            active=True, x_px=event.x, y_px=event.y, xlim0=xlim0, ylim0=ylim0,
+            x_scale=(xlim0[1] - xlim0[0]) / bbox.width,
+            y_scale=(ylim0[1] - ylim0[0]) / bbox.height,
+        )
+
+
+    # def _on_series_drag(self, event) -> None:
+    #    if not self._pan["active"] or self._ax is None or event.inaxes is not self._ax or event.xdata is None:
+    #        return
+    #    dx, dy = event.xdata - self._pan["x0"], event.ydata - self._pan["y0"]
+    #    x0, x1 = self._pan["xlim0"]
+    #    y0, y1 = self._pan["ylim0"]
+    #    self._ax.set_xlim(x0 - dx, x1 - dx)
+    #    self._ax.set_ylim(y0 - dy, y1 - dy)
+    #    self._series_user_view = True
+    #    self._canvas_mpl.draw_idle()
+    def _on_series_drag(self, event) -> None:
+        """Pan by PIXEL displacement, converted to data units with the scale
+        fixed at button-press time -- NOT by re-deriving a delta from
+        event.xdata/event.ydata on every move.
+
+        event.xdata/event.ydata are computed by matplotlib using the axes'
+        CURRENT transform, and this handler itself changes that transform on
+        every call (via set_xlim/set_ylim). Comparing a value computed under
+        the just-changed transform against a reference captured under the
+        ORIGINAL (press-time) transform produces an alternating-sign error
+        series: the applied shift both lags behind the mouse and visibly
+        jitters while dragging, since each step over/under-corrects for the
+        one before it. Pixel coordinates and the data-per-pixel scale stay
+        constant throughout a pure pan (only zooming changes the scale), so
+        converting displacement once with a scale fixed at press time avoids
+        that feedback loop entirely.
+        """
+        if not self._pan["active"] or self._ax is None or event.x is None:
+            return
+        dx = (event.x - self._pan["x_px"]) * self._pan["x_scale"]
+        dy = (event.y - self._pan["y_px"]) * self._pan["y_scale"]
+        x0, x1 = self._pan["xlim0"]
+        y0, y1 = self._pan["ylim0"]
+        self._ax.set_xlim(x0 - dx, x1 - dx)
+        self._ax.set_ylim(y0 - dy, y1 - dy)
+        self._series_user_view = True
+        self._canvas_mpl.draw_idle()
+
+    def _on_series_release(self, _event) -> None:
+        self._pan["active"] = False
+
+    def _redraw_series(self) -> None:
+        ax = self._ax
+        if ax is None or self._canvas_mpl is None:
+            return
+        keep = self._series_user_view and bool(ax.lines)
+        xlim, ylim = (ax.get_xlim(), ax.get_ylim()) if keep else (None, None)
+        ax.clear()
+        cfg, bad = self._collect()
+        mesh = self._mesh_from_cfg(cfg, bad)
+        res = self._result
+        message = "No tracking result yet.\nPress Run, or load a result file."
+        if res is not None and res["n_done"] > 0:
+            if not self._result_matches(res, mesh):
+                message = ("The mesh settings differ from the tracking result.\n"
+                           "Run again, or restore the mesh settings used for the result.")
+            else:
+                M, N = res["points"].shape[1:3]
+                i, j = min(self._sel[0], M - 1), min(self._sel[1], N - 1)
+                n = res["n_done"]
+                frames = res["start"] + np.arange(n)
+                xy = res["points"][:n, i, j, :]
+                for k, (label, color) in enumerate((("u", "#1f77b4"), ("v", "#d62728"))):
+                    series = xy[:, k].copy()
+                    finite = np.isfinite(series)
+                    if finite.any():
+                        series = series - series[int(np.argmax(finite))]   # relative to first valid
+                    ax.plot(frames, series, color=color, linewidth=1.3, label=label)
+                ax.legend(loc="upper right", fontsize=8)
+                if frames[0] <= self._view_frame <= frames[-1]:
+                    ax.axvline(self._view_frame, color="#888888", linestyle="--", linewidth=1)
+                valid = int(np.isfinite(xy[:, 0]).sum())
+                ax.set_title(f"cell (row {i + 1}, col {j + 1}); valid {valid}/{n} frames", fontsize=8)
+                ax.set_xlabel("frame", fontsize=8)
+                ax.set_ylabel("displacement (px)", fontsize=8)
+                ax.tick_params(labelsize=8)
+                ax.grid(True, alpha=0.3)
+                message = None
+        if message is not None:
+            # Leave the axes' default (0..1) autoscale range and ticks in
+            # place here, matching ifft_1d_node.py and the other plot-based
+            # nodes: this is what lets a user test panning/zooming on the
+            # plot before any tracking result exists, instead of an axis
+            # with no ticks at all to grab onto.
+            ax.set_xlabel("frame", fontsize=8)
+            ax.set_ylabel("displacement (px)", fontsize=8)
+            ax.text(0.5, 0.5, message, transform=ax.transAxes, ha="center", va="center",
+                    color="#777777", fontsize=9)
+        if keep:
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+        self._canvas_mpl.draw_idle()
+        
+    # ══ Run / stop ═══════════════════════════════════════════════════════
+    def _dlg_parent(self):
+        return self._inspector_win if self.is_inspector_open() else None
+
+    def _reset_tracking_defaults(self) -> None:
+        d = self._defaults()
+        for attr, key in (("_tmpl_w_var", "tmpl_w"), ("_tmpl_h_var", "tmpl_h"),
+                          ("_search_w_var", "search_w"), ("_search_h_var", "search_h"),
+                          ("_levels_var", "levels"), ("_method_var", "method"),
+                          ("_mincorr_var", "min_corr"), ("_fine_w_var", "fine_w"),
+                          ("_fine_h_var", "fine_h"), ("_sidelobe_var", "sidelobe")):
+            self._set_var(getattr(self, attr), d[key])
+        self._set_var(self._subpixel_var, True)
+        self._set_var(self._update_template_var, False)
+
+    def _on_auto_window_size(self) -> None:
+        """Set the template size to the mesh cell size (rounded to the
+        nearest integer, minimum 3), computed from the current cells (M, N)
+        and corners. The fields remain freely editable afterwards.
+        """
+        cfg, bad = self._collect()
+        mesh = self._mesh_from_cfg(cfg, bad)
+        if mesh is None:
+            messagebox.showwarning(
+                "Auto window size",
+                "Cells and corners must be valid before the window size can be computed.",
+                parent=self._dlg_parent(),
+            )
+            return
+        M, N, u0, v0, u1, v1 = mesh
+        tmpl_w = max(3, int(round((u1 - u0) / N)))
+        tmpl_h = max(3, int(round((v1 - v0) / M)))
+        self._set_var(self._tmpl_w_var, str(tmpl_w))
+        self._set_var(self._tmpl_h_var, str(tmpl_h))
+
+    def _on_run(self) -> None:
+        if self._running:
+            return
+        cfg, bad = self._collect()
+        problem = self._run_blocker(cfg, bad)
+        if problem:
+            messagebox.showwarning("Run", problem, parent=self._dlg_parent())
+            return
+        start, end = cfg["start"], cfg["end"]
+        M, N = cfg["cells"]
+        (u0, v0), (u1, v1) = cfg["tl"], cfg["lr"]
+        S = end - start + 1
+        if S * M * N > MAX_RESULT_ENTRIES:
+            messagebox.showerror("Run", f"Too many results ({S} frames x {M * N} points). "
+                                        "Reduce the number of frames or cells.", parent=self._dlg_parent())
+            return
+        if self._result is not None and not self._result_saved and not messagebox.askokcancel(
+                "Run", "The current tracking result has not been saved to a file.\n"
+                       "Running again will replace it. Continue?", parent=self._dlg_parent()):
+            return
+
+        mesh_pts = mesh_centers(M, N, u0, v0, u1, v1)
+        result = {
+            "points": np.full((S, M, N, 2), np.nan), "status": np.zeros((S, M, N), np.uint8),
+            "confidence": np.full((S, M, N), np.nan), "start": start, "end": end, "n_done": 0,
+            "mesh": (M, N, u0, v0, u1, v1), "bad_frames": 0, "n_files": len(self._files),
+            "settings": self._settings_dict(),        # snapshot: saved together with the result
+        }
+        job = {"files": list(self._files[start - 1:end]), "mesh_pts": mesh_pts, "func": calcTemplateMatchPyr,
+               "update_template": cfg["update_template"],
+               "cfg": {"template_size": cfg["template"], "search_range": cfg["search"],
+                       "num_levels": cfg["levels"], "match_method": MATCH_METHODS[cfg["method"]],
+                       "subpixel": cfg["subpixel"], "min_correlation": cfg["min_corr"],
+                       "fine_search_radius": cfg["fine"], "sidelobe_exclusion_radius": cfg["sidelobe"]}}
+        state = {"cancel": threading.Event(), "done": 0, "total": S, "finished": False,
+                 "error": None, "bad_frames": 0, "t0": time.time()}
+        self._result, self._run_state, self._running = result, state, True
+        self._result_path, self._result_saved, self._result_error = "", True, ""
+        self._last_plot_done = 0
+        self._series_user_view = False
+        self._set_running_ui(True)
+        self._update_result_info()
+        self._update_status_item()
+        self._redraw_series()
+        threading.Thread(target=_tracking_worker, args=(job, result, state),
+                         daemon=True, name="mesh-track").start()
+        self._poll_id = self.canvas.after(POLL_MS, self._poll_run)
+
+    def _on_stop(self) -> None:
+        st = self._run_state
+        if st is not None and not st["finished"]:
+            st["cancel"].set()
+            self._progress_var.set("Stopping after the current frame ...")
+
+    def _set_running_ui(self, running: bool) -> None:
+        self._set_state(self._btn_stop, tk.NORMAL if running else tk.DISABLED)
+        self._set_state(self._btn_load, tk.DISABLED if running else tk.NORMAL)
+        self._set_state(self._btn_save, tk.DISABLED if running else tk.NORMAL)
+        if running:
+            self._set_state(self._btn_run, tk.DISABLED)
+        else:
+            cfg, bad = self._collect()
+            self._set_state(self._btn_run, tk.NORMAL if self._run_blocker(cfg, bad) is None else tk.DISABLED)
+
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60:d}:{seconds % 60:02d}"
+
+    def _update_progress_ui(self) -> None:
+        st = self._run_state
+        if self._progress is None or st is None:
+            return
+        try:
+            total, done = max(1, st["total"]), st["done"]
+            self._progress.configure(maximum=total, value=done)
+            elapsed = time.time() - st["t0"]
+            eta = "estimating ..." if done <= 1 else self._fmt_time(elapsed * (total - done) / (done - 1))
+            self._progress_var.set(f"Frame {done}/{total} ({100 * done // total}%)   "
+                                   f"elapsed {self._fmt_time(elapsed)}   ETA {eta}")
+        except tk.TclError:
+            pass
+
+    def _poll_run(self) -> None:
+        """Tk-thread poller: progress, live plot, completion."""
+        self._poll_id = None
+        st = self._run_state
+        if st is None or self._destroyed:
+            return
+        res = self._result
+        done = st["done"]
+        if res is not None:
+            res["n_done"] = done
+        self._update_progress_ui()
+        self._update_status_item()
+        if done != self._last_plot_done:
+            prev = self._last_plot_done
+            self._last_plot_done = done
+            self._redraw_series()
+            if res is not None and prev <= self._view_frame - res["start"] < done:
+                self._redraw_preview()               # displayed frame just became available
+        if st["finished"]:
+            self._finish_run(st)
+            return
+        try:
+            self._poll_id = self.canvas.after(POLL_MS, self._poll_run)
+        except tk.TclError:
+            pass
+
+    def _finish_run(self, st: dict) -> None:
+        res = self._result
+        self._running, self._run_state = False, None
+        if res is not None:
+            res["n_done"], res["bad_frames"] = st["done"], st["bad_frames"]
+        if st["done"] == 0:                           # not even the start frame: nothing to keep
+            self._result = None
+        self._result_saved = self._result is None
+        if st["error"]:
+            msg = "Failed: " + st["error"]
+        elif st["cancel"].is_set():
+            msg = f"Stopped by user after {st['done']}/{st['total']} frames."
+        else:
+            msg = f"Finished: {st['done']} frames."
+        if st["bad_frames"]:
+            msg += f" {st['bad_frames']} frame(s) could not be read."
+        self._progress_var.set(msg)
+        self._set_running_ui(False)
+        self._update_result_info()
+        self._update_status_item()
+        self._redraw_series()
+        self._redraw_preview()
+        self._notify_result_changed()
+        if st["error"]:
+            messagebox.showerror("Mesh Template Track", st["error"], parent=self._dlg_parent())
+
+    # ══ Load / save ══════════════════════════════════════════════════════
+    def _update_result_info(self) -> None:
+        res = self._result
+        if res is None:
+            text = "No tracking result."
+            if self._result_error:
+                text += "\n" + self._result_error
+            color = INVALID_FG if self._result_error else "#555555"
+        else:
+            S, M, N = res["points"].shape[:3]
+            text = (f"Result: {res['n_done']}/{S} frames (frames {res['start']}-{res['end']}), "
+                    f"{M} x {N} points")
+            if res["n_done"] < S:
+                text += " (partial)"
+            if res.get("bad_frames"):
+                text += f", {res['bad_frames']} unreadable frame(s)"
+            if self._running:
+                text += "\nTracking in progress ..."
+            elif self._result_path:
+                text += f"\nFile: {self._result_path}"
+            else:
+                text += "\nNOT saved to a file yet."
+            if self._files and res.get("n_files") and res["n_files"] != len(self._files):
+                text += (f"\nNote: the result was computed for a sequence of {res['n_files']} files; "
+                         f"the current input has {len(self._files)}.")
+            color = "#b36b00" if (not self._result_saved and not self._running) else "#334477"
+        self._result_info_var.set(text)
+        if self._result_label is not None:
+            try:
+                self._result_label.configure(fg=color)
+            except tk.TclError:
+                pass
+
+    @staticmethod
+    def _read_track_file(path: str):
+        """Returns (settings dict, result dict or None)."""
+        with np.load(path, allow_pickle=False) as data:
+            names = set(data.files)
+            settings = json.loads(str(data["settings_json"])) if "settings_json" in names else {}
+            result = None
+            if "points" in names:
+                pts = np.array(data["points"], dtype=np.float64)
+                if pts.ndim != 4 or pts.shape[-1] != 2:
+                    raise ValueError("'points' must have shape (frames, M, N, 2)")
+                S, M, N, _ = pts.shape
+                status = (np.array(data["status"]).astype(np.uint8) if "status" in names
+                          else np.zeros((S, M, N), np.uint8))
+                conf = (np.array(data["confidence"], dtype=np.float64) if "confidence" in names
+                        else np.full((S, M, N), np.nan))
+                if status.shape != (S, M, N) or conf.shape != (S, M, N):
+                    raise ValueError("'status' / 'confidence' shapes do not match 'points'")
+                meta = json.loads(str(data["meta_json"])) if "meta_json" in names else {}
+                mesh = meta.get("mesh")
+                if mesh is None or len(mesh) != 6:
+                    raise ValueError("the file has no mesh description")
+                start = int(meta.get("start", 1))
+                result = {"points": pts, "status": status, "confidence": conf, "start": start,
+                          "end": start + S - 1, "n_done": int(min(max(meta.get("n_done", S), 0), S)),
+                          "mesh": (int(mesh[0]), int(mesh[1])) + tuple(float(v) for v in mesh[2:]),
+                          "bad_frames": int(meta.get("bad_frames", 0)),
+                          "n_files": int(meta.get("n_files", 0)), "settings": settings}
+        return settings, result
+
+    def _on_load(self) -> None:
+        if self._running:
+            return
+        path = filedialog.askopenfilename(
+            parent=self._inspector_win, title="Load mesh tracking settings and result",
+            filetypes=[("Mesh tracking files", "*.npz"), ("All files", "*.*")])
+        if not path:
+            return
+        if self._result is not None and not self._result_saved and not messagebox.askokcancel(
+                "Load", "The current tracking result has not been saved and will be replaced. Continue?",
+                parent=self._dlg_parent()):
+            return
+        try:
+            settings, result = self._read_track_file(path)
+        except Exception as e:
+            messagebox.showerror("Load", f"Cannot load the file:\n{e}", parent=self._dlg_parent())
+            return
+        self._apply_settings(settings, from_file=True)
+        self._result, self._result_path = result, os.path.abspath(path)
+        self._result_saved, self._result_error = True, ""
+        self._sel, self._series_user_view = (0, 0), False
+        if result is not None:
+            self._progress_var.set(f"Loaded {result['n_done']} frames from file.")
+        self._update_result_info()
+        self._update_status_item()
+        self._validate_all()
+        self._redraw_series()
+        self._notify_result_changed()
+
+    def _on_save_as(self) -> None:
+        if self._running:
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self._inspector_win, title="Save mesh tracking settings and result",
+            defaultextension=".npz", initialfile="mesh_tracking.npz",
+            filetypes=[("Mesh tracking files", "*.npz")])
+        if not path:
+            return
+        res = self._result
+        # A result is saved with the settings that produced it, so the file is
+        # self-consistent even if the UI was edited after the run.
+        settings = res["settings"] if (res is not None and res.get("settings")) else self._settings_dict()
+        arrays = {"settings_json": np.array(json.dumps(settings))}
+        if res is not None:
+            S = res["points"].shape[0]
+            mesh = res["mesh"]
+            meta = {"version": 1, "start": int(res["start"]), "end": int(res["end"]),
+                    "n_done": int(res["n_done"]), "mesh": [int(mesh[0]), int(mesh[1])] + [float(v) for v in mesh[2:]],
+                    "bad_frames": int(res.get("bad_frames", 0)), "n_files": int(res.get("n_files", 0))}
+            arrays.update(points=res["points"], status=res["status"], confidence=res["confidence"],
+                          frames=(res["start"] + np.arange(S)), meta_json=np.array(json.dumps(meta)))
+        try:
+            np.savez_compressed(path, **arrays)
+        except Exception as e:
+            messagebox.showerror("Save as", f"Cannot save the file:\n{e}", parent=self._dlg_parent())
+            return
+        final = path if path.lower().endswith(".npz") else path + ".npz"
+        self._result_path, self._result_saved = os.path.abspath(final), True
+        self._update_result_info()
+        self._progress_var.set("Saved: " + final)
+
+    # ══ Help / lifecycle ═════════════════════════════════════════════════
+    def _open_help(self) -> None:
+        if self._help_popup is not None and self._help_popup.winfo_exists():
+            self._help_popup.lift()
+            return
+        popup = tk.Toplevel(self._inspector_win)
+        popup.title("Mesh Template Track - Help")
+        popup.geometry("720x600")
+        body = tk.Frame(popup, padx=8, pady=8)
+        body.pack(fill="both", expand=True)
+        txt = tk.Text(body, font=("Courier", 9), wrap=tk.WORD, relief=tk.FLAT)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", _HELP_TEXT)
+        txt.configure(state="disabled")
+        popup.bind("<Escape>", lambda _e: popup.destroy())
+        self._help_popup = popup
+
+    def _cancel_after(self, attr: str) -> None:
+        after_id = getattr(self, attr)
+        if after_id is not None:
+            try:
+                self.canvas.after_cancel(after_id)
+            except tk.TclError:
+                pass
+            setattr(self, attr, None)
+
+    def close_inspector(self) -> None:
+        if self._help_popup is not None:
+            try:
+                self._help_popup.destroy()
+            except tk.TclError:
+                pass
+        self._cancel_after("_preview_debounce_id")
+        super().close_inspector()
+        self._reset_widget_refs()     # widgets are gone; a running job keeps going
+
+    def on_destroy(self) -> None:
+        self._destroyed = True
+        if self._run_state is not None:
+            self._run_state["cancel"].set()
+        for attr in ("_poll_id", "_preview_poll_id", "_preview_debounce_id"):
+            self._cancel_after(attr)
+        if self._preview_executor is not None:
+            self._preview_executor.shutdown(wait=False)
+        super().on_destroy()
