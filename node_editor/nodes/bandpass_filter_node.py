@@ -809,15 +809,19 @@ class BandpassFilterNode(BaseNode):
             return
         if event.button != 1:
             return
-        state.update(active=True, x0=xdata, y0=ydata,
+        # Pan is computed in the data coordinates of the view at press time
+        # (fixed inverse transform, as in scatter_plot_node). Converting each
+        # drag position with the CURRENT transform -- which this handler keeps
+        # changing by moving the limits -- made the plot vibrate.
+        state.update(active=True, inv=ax.transData.inverted(), x0=xdata, y0=ydata,
                       xlim0=ax.get_xlim(), ylim0=ax.get_ylim())
 
     def _on_plot_drag(self, event, ax, state, canvas) -> None:
-        if not state["active"] or ax is None:
+        if not state["active"] or ax is None or event.x is None or event.y is None:
             return
-        xdata, ydata = self._event_data_coords(event, ax)
-        if xdata is None:
-            return
+        # The frozen transform also keeps the pan going when the cursor
+        # leaves the axes during the drag.
+        xdata, ydata = state["inv"].transform((event.x, event.y))
         dx = xdata - state["x0"]
         dy = ydata - state["y0"]
         x0, x1 = state["xlim0"]

@@ -294,16 +294,24 @@ class SignalGeneratorNode(BaseNode):
     def _on_plot_press(self, event) -> None:
         if event.button != 1 or event.xdata is None or self._ax is None:
             return
+        # Pan is computed in the data coordinates of the view at press time
+        # (fixed inverse transform, as in scatter_plot_node). Re-reading
+        # event.xdata during the drag uses the CURRENT limits, which this
+        # handler keeps changing -- that feedback made the plot vibrate.
+        inv = self._ax.transData.inverted()
+        x0, y0 = inv.transform((event.x, event.y))
         self._pan_state.update(
-            active=True, x0=event.xdata, y0=event.ydata,
+            active=True, inv=inv, x0=x0, y0=y0,
             xlim0=self._ax.get_xlim(), ylim0=self._ax.get_ylim(),
         )
 
     def _on_plot_drag(self, event) -> None:
-        if not self._pan_state["active"] or event.xdata is None or self._ax is None:
+        if (not self._pan_state["active"] or self._ax is None
+                or event.x is None or event.y is None):
             return
-        dx = event.xdata - self._pan_state["x0"]
-        dy = event.ydata - self._pan_state["y0"]
+        x1, y1 = self._pan_state["inv"].transform((event.x, event.y))
+        dx = x1 - self._pan_state["x0"]
+        dy = y1 - self._pan_state["y0"]
         x0, x1 = self._pan_state["xlim0"]
         y0, y1 = self._pan_state["ylim0"]
         self._ax.set_xlim(x0 - dx, x1 - dx)

@@ -57,15 +57,36 @@ def test_plain_wheel_scales_both_axes():
     assert node._ax.get_ylim() == pytest.approx((-1.8, 1.8))
 
 
+def _mouse_event(ax, x, y, **extra):
+    """Fake mouse event at data point (x, y): pixel position plus xdata/ydata,
+    as matplotlib provides them (pan uses the pixel position)."""
+    px, py = ax.transData.transform((x, y))
+    return type("E", (), {"x": px, "y": py, "xdata": x, "ydata": y, **extra})()
+
+
 def test_drag_pans_both_axes_and_release_stops_pan():
     node = _make_node()
     node._pan_state = {"active": False}
-    node._on_plot_press(type("E", (), {"button": 1, "xdata": 5.0, "ydata": 0.0})())
-    drag = type("E", (), {"xdata": 6.0, "ydata": 0.5})()
+    node._on_plot_press(_mouse_event(node._ax, 5.0, 0.0, button=1))
+    drag = _mouse_event(node._ax, 6.0, 0.5)
     node._on_plot_drag(drag)
-    assert node._ax.get_xlim() == (-1.0, 9.0)
-    assert node._ax.get_ylim() == (-2.5, 1.5)
+    assert node._ax.get_xlim() == pytest.approx((-1.0, 9.0))
+    assert node._ax.get_ylim() == pytest.approx((-2.5, 1.5))
     node._on_plot_release(drag)
     node._on_plot_drag(drag)
     assert not node._pan_state["active"]
-    assert node._ax.get_xlim() == (-1.0, 9.0)
+    assert node._ax.get_xlim() == pytest.approx((-1.0, 9.0))
+
+
+def test_drag_uses_view_at_press_time_so_pan_does_not_vibrate():
+    """Regression test for the pan-vibration bug: a drag measured with the
+    CURRENT transform (which the drag itself keeps changing) oscillated.
+    Re-sending the same mouse position must not move the view again."""
+    node = _make_node()
+    node._pan_state = {"active": False}
+    node._on_plot_press(_mouse_event(node._ax, 5.0, 0.0, button=1))
+    drag = _mouse_event(node._ax, 6.0, 0.5)    # pixel position fixed from here on
+    for _ in range(5):
+        node._on_plot_drag(drag)
+    assert node._ax.get_xlim() == pytest.approx((-1.0, 9.0))
+    assert node._ax.get_ylim() == pytest.approx((-2.5, 1.5))
