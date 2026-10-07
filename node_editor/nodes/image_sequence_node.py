@@ -14,7 +14,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
-from node_editor.project_context import get_project_directory
+from node_editor.project_context import get_project_directory, get_project_file_path
 
 
 class ImageSequenceNode(BaseNode):
@@ -153,8 +153,10 @@ class ImageSequenceNode(BaseNode):
         self._batch_end_var = tk.StringVar(value="0")
         self._batch_step_var = tk.StringVar(value="1")
         self._batch_current_var = tk.StringVar(value="1")
-        self._batch_frame_1_var = tk.StringVar(value="i")
-        self._batch_frame_2_var = tk.StringVar(value="i+1")
+        # Default pair: frame 1 fixed at the first frame (reference), frame 2
+        # walks through the sequence (i = 1 .. number of frames).
+        self._batch_frame_1_var = tk.StringVar(value="1")
+        self._batch_frame_2_var = tk.StringVar(value="i")
         self._batch_mode_var = tk.StringVar(value="Timer mode: advances at FPS")
         self._loop_entries: dict[str, tk.Entry] = {}
         self._trigger_linked = False
@@ -969,12 +971,13 @@ class ImageSequenceNode(BaseNode):
 
         n = len(normalized)
         self._batch_start_var.set("1")
-        # The default pair i / i+1 needs one following frame available.
-        self._batch_end_var.set(str(max(1, n - 1)))
+        # Default pair 1 / i: frame 1 is the first frame, frame 2 runs over
+        # every frame, so End is the last frame.
+        self._batch_end_var.set(str(max(1, n)))
         self._batch_step_var.set("1")
         self._batch_current_var.set("1")
-        self._batch_frame_1_var.set("i")
-        self._batch_frame_2_var.set("i+1")
+        self._batch_frame_1_var.set("1")
+        self._batch_frame_2_var.set("i")
         if self._slider is not None and self._slider.winfo_exists():
             self._slider.configure(from_=0, to=max(0, n - 1))
         self._slider_var.set(0)
@@ -985,8 +988,8 @@ class ImageSequenceNode(BaseNode):
         self._idx_var.set("1")
         self._fname_var.set("")
         self._size_var.set("")
-        # Publish the configured pair immediately (Frame 1=i, Frame 2=i+1
-        # by default), so the two output pins carry different frames.
+        # Publish the configured pair immediately (Frame 1=1, Frame 2=i by
+        # default; at i=1 both pins carry frame 1, the reference frame).
         if self._validate_loop_fields():
             self._emit_batch_frames(1)
         else:
@@ -1479,31 +1482,96 @@ class ImageSequenceNode(BaseNode):
             return path
         if base is None:
             return path
-        try:
-            return os.path.relpath(str(path), str(base))
-        except Exception:
-            return path
+        # relpath is computed once per FOLDER and the file name appended:
+        # a sequence has thousands of files in a few folders, and calling
+        # os.path.relpath per file cost ~2 s per project load/save.
+        folder, name = os.path.split(str(path))
+        cache = self.__dict__.setdefault("_relpath_cache", {})
+        key = (folder, str(base))
+        rel_folder = cache.get(key)
+        if rel_folder is None:
+            try:
+                rel_folder = os.path.relpath(folder, str(base)) if folder else ""
+            except Exception:
+                return path            # e.g. a different drive on Windows
+            if len(cache) > 1000:
+                cache.clear()
+            cache[key] = rel_folder
+        return os.path.join(rel_folder, name) if rel_folder not in ("", ".") else name
 
     def _to_absolute(self, path: str,
                      base: Path | None) -> str:
-        """Resolve relative path against base."""
+        """Resolve relative path against base.
+
+        Pure string work (join + normpath, which also folds '..'). It used
+        Path.resolve(), which on Windows asks the FILE SYSTEM for every
+        path's final name -- with thousands of files per sequence, converted
+        several times per load/save and on every frame emit, that was ~80k
+        disk queries and 10-17 s per project load/save (worse on slow or
+        external drives)."""
         p = Path(path)
         if p.is_absolute():
             return str(p)
         if base is None:
             return str(p)
-        return str((base / p).resolve())
+        return os.path.normpath(os.path.join(str(base), str(p)))
 
     def _get_project_base(self) -> Path | None:
         return get_project_directory()
 
     def _absolute_file_paths(self) -> list[str]:
-        """Return the full file list as absolute paths, same order as the inspector's file list."""
+        """Return the full file list as absolute paths, same order as the inspector's file list.
+
+        Called on every frame emit, so the converted list is cached and only
+        rebuilt when the file list or the project folder changes."""
         base = self._get_project_base()
-        return [self._to_absolute(p, base) for p in self._file_paths]
+        key = (str(base), tuple(self._file_paths))
+        cache = getattr(self, "_abs_paths_cache", None)
+        if cache is None or cache[0] != key:
+            cache = (key, [self._to_absolute(p, base) for p in self._file_paths])
+            self._abs_paths_cache = cache
+        return list(cache[1])
 
     def get_help_text(self) -> str:
         return self.HELP_TEXT
+
+    _INLINE_FILE_LIST_MAX = 12000   # longer lists go to a side file (Excel cell limit)
+
+    def _project_sidecar_filename(self) -> str | None:
+        """'<project>.<node_id>.image_sequence_files.txt' next to the project
+        file, or None while the project has no file yet."""
+        project_path = get_project_file_path()
+        if project_path is None:
+            return None
+        safe_node_id = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in self.node_id)
+        return f"{project_path.stem}.{safe_node_id}.image_sequence_files.txt"
+
+    def _write_file_list_sidecar(self, filename: str, paths: list[str]) -> bool:
+        """One project-relative path per line, UTF-8; written atomically."""
+        project_dir = get_project_directory()
+        if project_dir is None:
+            return False
+        path = project_dir / filename
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text("\n".join(paths) + "\n", encoding="utf-8")
+            tmp.replace(path)
+            return True
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False
+
+    def _read_file_list_sidecar(self, filename: str) -> str | None:
+        project_dir = get_project_directory()
+        if project_dir is None or Path(filename).name != filename:
+            return None
+        try:
+            return (project_dir / filename).read_text(encoding="utf-8")
+        except OSError:
+            return None
 
     def get_params(self) -> dict:
         base  = self._get_project_base()
@@ -1524,11 +1592,20 @@ class ImageSequenceNode(BaseNode):
                     folder_value = self._to_relative(inferred, base)
 
         file_list_text = "\n".join(paths)
-        # Excel cell text has practical limits; a very long file list can be
-        # truncated and break params_json on reload. In folder mode, the
-        # folder path is enough to reconstruct the list.
-        if method == "folder" and len(file_list_text) > 12000:
-            file_list_text = ""
+        # All params of a node are stored as JSON in ONE Excel cell (max
+        # 32,767 characters), so a long file list cannot stay inline. It is
+        # written to a side file next to the project instead (same scheme as
+        # the Array Viewer's .npy side file) and set_params reads it back.
+        # Previously a long list was simply dropped in folder mode, and the
+        # project reload re-scanned the folder -- so files the user had
+        # removed from the list came back (the saved edit was lost).
+        file_list_file = ""
+        if len(file_list_text) > self._INLINE_FILE_LIST_MAX:
+            sidecar = self._project_sidecar_filename()
+            if sidecar is not None and self._write_file_list_sidecar(sidecar, paths):
+                file_list_file, file_list_text = sidecar, ""
+            elif method == "folder":
+                file_list_text = ""          # last resort: the folder re-scan
 
         return {
             "method":        method,
@@ -1538,6 +1615,7 @@ class ImageSequenceNode(BaseNode):
             "pattern_wait":  self._pattern_wait_var.get(),
             "folder":        folder_value or "(no folder)",
             "file_list":     file_list_text,
+            "file_list_file": file_list_file,
             "current_index": self._current_index,
             "fps":           self._fps_var.get(),
             "batch_start":   self._batch_start_var.get(),
@@ -1576,8 +1654,14 @@ class ImageSequenceNode(BaseNode):
         except (TypeError, ValueError):
             self._fps_var.set("5")
 
-        # Restore file list first. This is the most explicit source of truth.
+        # Restore file list first. This is the most explicit source of truth:
+        # inline, or (long lists) from the side file written by get_params.
         file_list = params.get("file_list", "")
+        sidecar = str(params.get("file_list_file", "") or "").strip()
+        sidecar_missing = False
+        if not file_list and sidecar:
+            file_list = self._read_file_list_sidecar(sidecar) or ""
+            sidecar_missing = not file_list
         if file_list:
             paths = [
                 self._to_relative(self._to_absolute(p.strip(), base), base)
@@ -1607,6 +1691,10 @@ class ImageSequenceNode(BaseNode):
                         self._set_file_paths(paths)
                         idx = int(params.get("current_index", 0))
                         self._load_and_push(idx)
+                        if sidecar_missing:
+                            # Set after loading, which resets the status to "ready".
+                            self._status_var.set(f"saved file list {sidecar} not found: "
+                                                 "re-scanned the whole folder")
                     else:
                         self._status_var.set("folder restored but no readable images")
                 else:
@@ -1620,6 +1708,9 @@ class ImageSequenceNode(BaseNode):
         self._batch_step_var.set(str(params.get("batch_step", "1")))
         self._batch_current_var.set(str(params.get(
             "batch_current", self._batch_start_var.get())))
+        # Fallbacks keep the behaviour of projects saved before the batch
+        # fields existed (Frame 1 = current frame, Frame 2 = the next one).
+        # New file lists get the 1 / i defaults from _set_file_paths().
         self._batch_frame_1_var.set(str(params.get("batch_frame_1", "i")))
         self._batch_frame_2_var.set(str(params.get("batch_frame_2", "i+1")))
         if self._validate_loop_fields() and self._file_paths:

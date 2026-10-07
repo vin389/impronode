@@ -2433,16 +2433,18 @@ class NodeEditorApp:
         self._project_progress_start = None
         self.engine.node_compute_callback = None
         self.engine.execution_complete_callback = None
-        finished_window = self._project_progress_window
         elapsed = time.perf_counter() - progress_start
+        # Enable Close BEFORE appending the final line: appending pumps the Tk
+        # event loop (window.update()), which runs every queued callback (e.g.
+        # nodes publishing their first frames) before returning -- the button
+        # used to stay disabled for seconds after "Completed" was shown.
+        button = self._project_progress_close_button
+        if button is not None and button.winfo_exists():
+            button.configure(state=tk.NORMAL)
         self._append_project_progress(
             (f"{operation.capitalize()} failed after {elapsed:.3f} s."
              if failed else f"Completed (totally took {elapsed:.3f} s to {operation} this project.)")
         )
-        button = self._project_progress_close_button
-        if (self._project_progress_window is finished_window
-            and button is not None and button.winfo_exists()):
-            button.configure(state=tk.NORMAL)
 
     def _on_project_load_execution_complete(self) -> None:
         self._project_load_execution_done = True

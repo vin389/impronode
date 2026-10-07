@@ -88,16 +88,18 @@ class Ifft1DNode(BaseNode):
 
     def get_pin_schema(self) -> PinSchema:
         return PinSchema(
+            # Pin order: sampling step, axis (freq / t), then the data --
+            # the same order as the FFT 1D node, so the two line up.
             inputs=[
+                PinDef(name="dt", type=PinType.SCALAR, label="dt", optional=True),
+                PinDef(name="freq", type=PinType.ARRAY, label="freq", optional=True),
                 PinDef(name="magnitude", type=PinType.ARRAY, label="magnitude"),
                 PinDef(name="phase", type=PinType.ARRAY, label="phase"),
-                PinDef(name="freq", type=PinType.ARRAY, label="freq", optional=True),
-                PinDef(name="dt", type=PinType.SCALAR, label="dt", optional=True),
             ],
             outputs=[
+                PinDef(name="dt", type=PinType.SCALAR, label="dt"),
                 PinDef(name="t", type=PinType.ARRAY, label="t"),
                 PinDef(name="signal", type=PinType.ARRAY, label="signal"),
-                PinDef(name="dt", type=PinType.SCALAR, label="dt"),
             ],
         )
 

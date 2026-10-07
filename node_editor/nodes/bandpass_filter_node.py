@@ -34,14 +34,14 @@ and response shape.
 
 INPUTS
 ------
-signal   1-D (length nt) or 2-D (ns x nt, ns independent signals sharing
-         one time axis) array to filter. Required.
+dt       (optional) scalar sample interval, used only when t is NOT
+         connected. Ignored if t is connected.
 t        (optional) 1-D timestamp array, length nt. If given, dt is
          estimated as the median sample spacing (assumes roughly uniform
          sampling -- this is an FFT-based filter, which is only exact for
          uniformly sampled data).
-dt       (optional) scalar sample interval, used only when t is NOT
-         connected. Ignored if t is connected.
+signal   1-D (length nt) or 2-D (ns x nt, ns independent signals sharing
+         one time axis) array to filter. Required.
 
 OUTPUTS
 -------
@@ -230,6 +230,9 @@ def _run_filter(signal: np.ndarray, dt: float, params: dict):
     return (y[0] if was_1d else y), freqs, H
 
 
+RESPONSE_YLIM = (-0.05, 1.05)   # default y-range of the H(f) response axis (frequency plot)
+
+
 class BandpassFilterNode(BaseNode):
     """General low/high/band-pass/band-stop FFT-domain filter. Outputs
     (dt, t, signal) update only on Apply."""
@@ -294,10 +297,11 @@ class BandpassFilterNode(BaseNode):
 
     def get_pin_schema(self) -> PinSchema:
         return PinSchema(
+            # Pin order: sampling step, time axis, then the data (same as the outputs).
             inputs=[
-                PinDef(name="signal", type=PinType.ARRAY, label="signal", optional=False),
-                PinDef(name="t", type=PinType.ARRAY, label="t", optional=True),
                 PinDef(name="dt", type=PinType.SCALAR, label="dt", optional=True),
+                PinDef(name="t", type=PinType.ARRAY, label="t", optional=True),
+                PinDef(name="signal", type=PinType.ARRAY, label="signal", optional=False),
             ],
             outputs=[
                 PinDef(name="dt", type=PinType.SCALAR, label="dt"),
@@ -449,16 +453,30 @@ class BandpassFilterNode(BaseNode):
             for seq in ("<Control-h>", "<Control-H>"):
                 win.bind(seq, lambda e: self._open_help())
 
-        t_frame = tk.LabelFrame(right, text="Time series  (drag=pan, wheel=zoom, "
+        # The two plots share the right side in a vertical PanedWindow, so the
+        # separator between them can be dragged to give either plot more room.
+        plots = tk.PanedWindow(right, orient=tk.VERTICAL, sashwidth=6,
+                               sashrelief=tk.RAISED, showhandle=True)
+        plots.pack(fill="both", expand=True)
+
+        t_frame = tk.LabelFrame(plots, text="Time series  (drag=pan, wheel=zoom, "
                                              "ctrl=zoom X, shift=zoom Y, dbl-click=reset)",
                                  font=("Arial", 9), padx=4, pady=4)
-        t_frame.pack(fill="both", expand=True, pady=(0, 4))
+        plots.add(t_frame, minsize=120, stretch="always")
         self._build_time_plot(t_frame)
 
-        f_frame = tk.LabelFrame(right, text="Frequency spectrum  (same controls)",
+        f_frame = tk.LabelFrame(plots, text="Frequency spectrum  (same controls)",
                                  font=("Arial", 9), padx=4, pady=4)
-        f_frame.pack(fill="both", expand=True)
+        plots.add(f_frame, minsize=120, stretch="always")
         self._build_freq_plot(f_frame)
+
+        # Start with an even split once the pane has its real height.
+        def _split_evenly(_event=None):
+            h = plots.winfo_height()
+            if h > 1:
+                plots.sash_place(0, 0, h // 2)
+                plots.unbind("<Map>")
+        plots.bind("<Map>", lambda e: plots.after_idle(_split_evenly))
 
         self._redraw_plots()
 
@@ -770,6 +788,24 @@ class BandpassFilterNode(BaseNode):
             return None, None
         return float(xdata), float(ydata)
 
+    @staticmethod
+    def _wheel_zoom_mode(event) -> str:
+        """'x' (Ctrl held), 'y' (Shift held) or 'both'.
+
+        Read from event.modifiers -- the Ctrl/Shift state carried by the
+        wheel event itself -- rather than event.key. matplotlib fills
+        event.key from key presses that the plot canvas received, which
+        needs keyboard focus; with two plot canvases only the focused one
+        saw Ctrl/Shift, so the modifiers silently did nothing on the other
+        (the frequency plot)."""
+        mods = getattr(event, "modifiers", None) or frozenset()
+        key = getattr(event, "key", None) or ""
+        if "ctrl" in mods or "control" in mods or key in ("control", "ctrl"):
+            return "x"
+        if "shift" in mods or key == "shift":
+            return "y"
+        return "both"
+
     def _on_plot_scroll(self, event, ax, canvas) -> None:
         if ax is None:
             return
@@ -778,12 +814,12 @@ class BandpassFilterNode(BaseNode):
             return
         factor = 0.9 if event.button == "up" else 1.1
         xlim, ylim = ax.get_xlim(), ax.get_ylim()
-        key = getattr(event, "key", None)
+        mode = self._wheel_zoom_mode(event)
 
-        if key in ("control", "ctrl"):
+        if mode == "x":
             new_xlim = [xdata - (xdata - v) * factor for v in xlim]
             ax.set_xlim(new_xlim)
-        elif key == "shift":
+        elif mode == "y":
             new_ylim = [ydata - (ydata - v) * factor for v in ylim]
             ax.set_ylim(new_ylim)
         else:
@@ -791,6 +827,12 @@ class BandpassFilterNode(BaseNode):
             new_ylim = [ydata - (ydata - v) * factor for v in ylim]
             ax.set_xlim(new_xlim)
             ax.set_ylim(new_ylim)
+        if mode != "x":
+            # Zoom the twin y-axis (H(f) response) about the same screen point,
+            # so the response curve stays registered with the amplitude curves.
+            for twin in self._twin_y_axes(ax):
+                ty = twin.transData.inverted().transform((event.x, event.y))[1]
+                twin.set_ylim([ty - (ty - v) * factor for v in twin.get_ylim()])
 
         canvas.draw_idle()
 
@@ -805,6 +847,8 @@ class BandpassFilterNode(BaseNode):
                 (x0, x1), (y0, y1) = extent
                 ax.set_xlim(x0, x1)
                 ax.set_ylim(y0, y1)
+                for twin in self._twin_y_axes(ax):
+                    twin.set_ylim(*RESPONSE_YLIM)
                 canvas.draw_idle()
             return
         if event.button != 1:
@@ -813,8 +857,12 @@ class BandpassFilterNode(BaseNode):
         # (fixed inverse transform, as in scatter_plot_node). Converting each
         # drag position with the CURRENT transform -- which this handler keeps
         # changing by moving the limits -- made the plot vibrate.
+        twins = []
+        for twin in self._twin_y_axes(ax):
+            tinv = twin.transData.inverted()
+            twins.append((twin, tinv, tinv.transform((event.x, event.y))[1], twin.get_ylim()))
         state.update(active=True, inv=ax.transData.inverted(), x0=xdata, y0=ydata,
-                      xlim0=ax.get_xlim(), ylim0=ax.get_ylim())
+                      xlim0=ax.get_xlim(), ylim0=ax.get_ylim(), twins=twins)
 
     def _on_plot_drag(self, event, ax, state, canvas) -> None:
         if not state["active"] or ax is None or event.x is None or event.y is None:
@@ -828,7 +876,17 @@ class BandpassFilterNode(BaseNode):
         y0, y1 = state["ylim0"]
         ax.set_xlim(x0 - dx, x1 - dx)
         ax.set_ylim(y0 - dy, y1 - dy)
+        # The twin y-axis (H(f) response) shares x with `ax`, so it already
+        # follows horizontally; move it vertically by the same screen distance.
+        for twin, tinv, ty0, (t0, t1) in state.get("twins") or ():
+            tdy = tinv.transform((event.x, event.y))[1] - ty0
+            twin.set_ylim(t0 - tdy, t1 - tdy)
         canvas.draw_idle()
+
+    def _twin_y_axes(self, ax) -> list:
+        """Axes overlaid on `ax` with their own y-scale (the frequency plot's
+        H(f) response axis), which pan / zoom / reset must move with `ax`."""
+        return [self._ax_f2] if ax is self._ax_f and self._ax_f2 is not None else []
 
     def _on_plot_release(self, _event, state) -> None:
         state["active"] = False
@@ -916,7 +974,7 @@ class BandpassFilterNode(BaseNode):
         ax_f.plot(freq_axis, y_filt, color="#d62728", linewidth=1.1, label="filtered")
         ax_f2.plot(freqs, H, color="#2ca02c", linewidth=1.0, linestyle="--", alpha=0.7,
                    label="response H(f)")
-        ax_f2.set_ylim(-0.05, 1.05)
+        ax_f2.set_ylim(*RESPONSE_YLIM)
         ax_f2.set_ylabel("response", color="#2ca02c")
         ax_f2.tick_params(axis="y", colors="#2ca02c")
 

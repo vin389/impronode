@@ -193,26 +193,12 @@ RUN / STOP
   after the frame currently being processed; the frames tracked so far are
   kept (the rest is NaN).
 
-  Speed: frames are tracked in order (each frame starts from the previous
-  frame's result), but the cells of one frame are split over several worker
-  PROCESSES, each matching one horizontal band of the mesh. The number of
-  processes is chosen automatically: the first frames try 1, 2, 4, ... and
-  the fastest is used for the rest of the run (small meshes stay at 1).
-  The next frame is decoded while the current one is matched. Results are
-  the same as with a single process. The read-only "Tracking details" box
-  shows the processes in use, the auto-tune timings and the time per frame.
-
 LOAD / SAVE AS
   A .npz file holds the settings used for the result and the result itself.
   The project file stores the settings plus the (relative) path of the last
   saved/loaded result file and re-loads it when the project is opened. The
   result is NOT embedded in the project file: save it to a file, otherwise a
   long tracking run has to be repeated after re-opening the project.
-  The result-file path is a property of the node: the "File" field in the
-  Data group shows it (and how the project stores it, relative to the
-  project file). It is kept after a new Run (the note then says the current
-  result is not saved in it yet) and when the file is missing at project
-  load. Load / Save as open in that file's folder.
 
 PREVIEW AND PLOT
   Image preview: drag to pan, wheel to zoom (like a normal image viewer); a
@@ -286,7 +272,8 @@ def _tracking_worker(job: dict, result: dict, state: dict) -> None:
 
       * Fixed reference (update_template=False): every point's template
         always comes from frame 0 at the original mesh position. Only ONE
-        image (frame 0) is ever needed as a template source.
+        image (frame 0) is ever needed as a template source, so this stays
+        as cheap and low-memory as the previous, single-reference version.
       * Incremental reference (update_template=True): each point's template
         is refreshed, every time that point is found, to the frame and
         position it was just found at. Points differ in which past frame
@@ -294,31 +281,15 @@ def _tracking_worker(job: dict, result: dict, state: dict) -> None:
         "the previous frame" -- but a point that has been failing keeps
         pointing at whatever frame it last succeeded in), so points are
         grouped by their current reference frame and matched in one batched
-        call per group. A small frame cache holds only frames that are
-        still referenced by at least one point.
-
-    Speed-up (see node_editor/mesh_track_parallel.py):
-      * each frame's points are split over several worker PROCESSES (frames
-        must stay in order: frame k starts from frame k-1's result);
-      * frames are passed to the workers through shared memory;
-      * the next frame is decoded in a helper thread while the current one
-        is being matched;
-      * the number of processes is AUTO-TUNED on the first frames: 1, 2,
-        4, ... processes are tried on one frame each, stopping when it gets
-        slower, and the fastest count is used for the rest of the run.
-    state["info"] carries what the Run panel shows (processes, timings).
+        call per group. A small image cache holds only frames that are
+        still referenced by at least one point; anything else is dropped
+        immediately after each frame.
     """
-    from node_editor import mesh_track_parallel as mtp
-
-    info = state["info"]
-    frames: dict = {}                      # template-source frame index -> SharedFrame
-    matcher = None
-    prefetch = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mtt-read")
     try:
         files, cfg, update_template = job["files"], job["cfg"], job["update_template"]
         S = len(files)
-        gray0 = mtp.read_gray(files[0])
-        if gray0 is None:
+        start_img = read_rgb(files[0])
+        if start_img is None:
             raise RuntimeError(f"cannot read the start frame: {files[0]}")
         mesh_pts = job["mesh_pts"]
         M, N = mesh_pts.shape[:2]
@@ -330,17 +301,6 @@ def _tracking_worker(job: dict, result: dict, state: dict) -> None:
         result["confidence"][0] = 1.0
         state["done"] = 1
 
-        candidates = mtp.candidate_counts(P, job.get("max_processes") or mtp.max_processes())
-        info.update(points=P, image=f"{gray0.shape[1]} x {gray0.shape[0]}", cpus=os.cpu_count(),
-                    candidates=candidates, tune={}, processes=candidates[0],
-                    phase="starting worker processes" if len(candidates) > 1 else "running")
-        matcher = mtp.ParallelMatcher(max(candidates))
-        matcher.warm_up()
-        n_now, tuning, tune_pos = candidates[0], len(candidates) > 1, 0
-        if tuning:
-            info["phase"] = "auto-tuning"
-        frames[0] = mtp.SharedFrame(gray0)
-
         # template_frame[p] / template_pos[p]: which frame, and which
         # sub-pixel position within it, point p's template is cut from.
         # search_center[p]: current best guess of point p's location, used
@@ -350,89 +310,66 @@ def _tracking_worker(job: dict, result: dict, state: dict) -> None:
         template_frame = np.zeros(P, dtype=np.int64)
         template_pos = pts0.copy()
         search_center = pts0.copy()
-        # Per-frame timings (seconds) for the Run panel: total wall-clock time
-        # of the frame step, image read+decode (done in the read-ahead thread,
-        # overlapping the previous frame's matching), and template matching.
-        times = {"total": [], "read": [], "tm": []}
+        image_cache: dict[int, np.ndarray] = {0: start_img}
 
-        pending = prefetch.submit(mtp.read_gray_timed, files[1]) if S > 1 else None
         for k in range(1, S):
             if state["cancel"].is_set():
                 break
-            t_frame = time.perf_counter()
-            gray, t_read = pending.result()
-            pending = prefetch.submit(mtp.read_gray_timed, files[k + 1]) if k + 1 < S else None
-            if gray is None:            # one bad frame must not kill a long run
+            img = read_rgb(files[k])
+            if img is None:            # one bad frame must not kill a long run
                 state["bad_frames"] += 1
                 state["done"] = k + 1
                 continue
-            cur = mtp.SharedFrame(gray)
-            alive = {f.shm.name for f in frames.values()} | {cur.shm.name}
 
             nxt_all = np.full((P, 2), np.nan)
             status_all = np.zeros(P, dtype=np.uint8)
             conf_all = np.full(P, np.nan)
 
-            t_match = time.perf_counter()
             # Group points by their current template-source frame -- in the
             # common case (no failures, incremental or fixed) this is a
-            # single group and costs exactly one (parallel) call.
+            # single group and costs exactly one call, same as before.
             for frame_idx in np.unique(template_frame):
                 mask = template_frame == frame_idx
-                nxt, st, cf = matcher.match(frames[int(frame_idx)], cur, template_pos[mask],
-                                            search_center[mask].copy(), cfg, n_now, alive)
+                prev_img = image_cache[int(frame_idx)]
+                group_pts = template_pos[mask]
+                ctime = np.full((group_pts.shape[0], cfg["num_levels"]), np.nan, dtype=np.float64)
+                nxt, st, cf = job["func"](
+                    prev_img, img, group_pts,
+                    template_size=cfg["template_size"], search_range=cfg["search_range"],
+                    num_levels=cfg["num_levels"], match_method=cfg["match_method"],
+                    subpixel=cfg["subpixel"], min_correlation=cfg["min_correlation"],
+                    fine_search_radius=cfg["fine_search_radius"],
+                    sidelobe_exclusion_radius=cfg["sidelobe_exclusion_radius"],
+                    next_pts_init=search_center[mask].copy(), ctime=ctime,
+                )
                 group_idx = np.nonzero(mask)[0]
                 nxt_all[group_idx] = np.asarray(nxt, dtype=np.float64).reshape(-1, 2)
                 status_all[group_idx] = np.asarray(st).reshape(-1).astype(np.uint8)
                 conf_all[group_idx] = np.asarray(cf, dtype=np.float64).reshape(-1)
-            dt = time.perf_counter() - t_match
-
-            if tuning:
-                info["tune"][n_now] = dt
-                best = min(info["tune"], key=info["tune"].get)
-                tune_pos += 1
-                # Stop at the end of the list, or as soon as more processes got
-                # clearly slower (beyond that point it only gets worse).
-                if tune_pos >= len(candidates) or (n_now != best and dt > 1.05 * info["tune"][best]):
-                    tuning, n_now = False, best
-                    info["phase"] = "running"
-                else:
-                    n_now = candidates[tune_pos]
-            info["processes"] = n_now
 
             good = (status_all != 0) & np.isfinite(nxt_all).all(axis=1)
             search_center[good] = nxt_all[good]
             if update_template:
                 template_frame[good] = k
                 template_pos[good] = nxt_all[good]
-                frames[k] = cur
+                image_cache[k] = img
                 referenced = set(int(v) for v in template_frame)
-                for cached_idx in [i for i in frames if i not in referenced]:
-                    frames.pop(cached_idx).release()
-            else:
-                # Fixed reference: frame 0 is the only template source, so the
-                # current frame is not needed after this step.
-                cur.release()
+                for cached_idx in list(image_cache):
+                    if cached_idx not in referenced:
+                        del image_cache[cached_idx]
+            # In fixed-reference mode template_frame/template_pos never
+            # change, so image_cache keeps holding only frame 0 forever --
+            # identical memory/compute profile to the single-reference
+            # version this generalizes.
 
             out = np.where(good[:, None], nxt_all, np.nan)
             result["points"][k] = out.reshape(M, N, 2)
             result["status"][k] = good.reshape(M, N).astype(np.uint8)
             result["confidence"][k] = conf_all.reshape(M, N)
             state["done"] = k + 1
-
-            for key, value in (("total", time.perf_counter() - t_frame), ("read", t_read), ("tm", dt)):
-                times[key].append(value)
-                info[f"avg_{key}_ms"] = 1000.0 * float(np.mean(times[key][-20:]))   # last 20 frames
-            info["last_total_ms"] = 1000.0 * times["total"][-1]
     except Exception as e:              # reported to the UI thread by the poller
         state["error"] = f"{type(e).__name__}: {e}"
     finally:
-        prefetch.shutdown(wait=True, cancel_futures=True)
-        if matcher is not None:
-            matcher.shutdown()
-        for f in frames.values():
-            f.release()
-        info["phase"] = "finished"
         state["finished"] = True
 
 
@@ -479,7 +416,6 @@ class MeshTemplateTrackNode(BaseNode):
         # while dragging, so Tk variables are created lazily in _init_state().
         self._files = None
         self._result = None            # dict, see _new_result()
-        self._run_info_last = "Not run yet. Press Run: the number of worker processes\nis chosen automatically on the first frames."
         self._result_path = ""
         self._result_saved = True
         self._result_error = ""
@@ -515,7 +451,6 @@ class MeshTemplateTrackNode(BaseNode):
 
     def _reset_widget_refs(self) -> None:
         self._entries = {}
-        self._run_info_text = None
         self._c_img = None
         self._slider = None
         self._fig = self._ax = self._canvas_mpl = None
@@ -572,8 +507,6 @@ class MeshTemplateTrackNode(BaseNode):
         self._summary_var = tk.StringVar(value="")
         self._mesh_info_var = tk.StringVar(value="")
         self._result_info_var = tk.StringVar(value="")
-        self._result_file_var = tk.StringVar(value="")       # read-only "File" field in the Data group
-        self._result_file_note_var = tk.StringVar(value="")
         self._progress_var = tk.StringVar(value="Idle")
         self._frame_label_var = tk.StringVar(value="")
         self._sel_info_var = tk.StringVar(value="")
@@ -642,9 +575,8 @@ class MeshTemplateTrackNode(BaseNode):
         self._init_state()
         files = self._coerce_files(inputs.get("files"))
         if files != self._files:
-            old_n = len(self._files) if self._files else 0
             self._files = files
-            self._on_files_changed(old_n)
+            self._on_files_changed()
         # Do not push partial data downstream while tracking, and do not
         # re-push unchanged results when only the (unchanged) input file list
         # is re-delivered (e.g. on every frame emitted by an Image Sequence).
@@ -709,9 +641,6 @@ class MeshTemplateTrackNode(BaseNode):
         path = str(params.get("result_file", "") or "")
         if path:
             abs_path = self._to_absolute(path, self._get_project_base())
-            # The path is the node's property: keep it even when the file is
-            # missing or unreadable, so saving the project does not drop it.
-            self._result_path = abs_path
             try:
                 _settings, result = self._read_track_file(abs_path)
                 if result is not None:
@@ -745,25 +674,14 @@ class MeshTemplateTrackNode(BaseNode):
 
     # ── node face ───────────────────────────────────────────────────────
     def _status_text(self) -> str:
-        """Node face: line 1 = current input file count, line 2 = tracking
-        state / result. Kept apart because the result's frame count is NOT
-        the input file count -- after the upstream list changed (e.g. 4004 ->
-        3911 files) the result still has the old number of frames, which on
-        a single line looked like a stale file count."""
-        n = len(self._files) if self._files else 0
-        files = f"{n} files" if n else "no files"
         if self._running and self._run_state is not None:
-            return f"{files}\ntracking {self._run_state['done']}/{self._run_state['total']}"
+            return f"tracking {self._run_state['done']}/{self._run_state['total']}"
         r = self._result
         if r is None:
-            return f"{files}\n" + ("result file error" if self._result_error else "no result")
+            return "result file error" if self._result_error else "idle"
         S, M, N = r["points"].shape[:3]
-        # Short lines: the face has room for ~4 unwrapped lines between the pins.
-        lines = [files, f"result: {M}x{N} pts",
-                 f"{r['n_done']} frames" + (" (partial)" if r["n_done"] < S else "")]
-        if n and r.get("n_files") and r["n_files"] != n:
-            lines.append(f"(made from {r['n_files']} files)")
-        return "\n".join(lines)
+        tag = " (partial)" if r["n_done"] < S else ""
+        return f"{r['n_done']} frames, {M}x{N} pts{tag}"
 
     def _update_status_item(self) -> None:
         if self._status_item is not None:
@@ -781,33 +699,17 @@ class MeshTemplateTrackNode(BaseNode):
         self._title_item = self.canvas.create_text(
             x + w / 2, y + 13, text=self.get_canvas_title(), font=("Arial", 9, "bold"),
             fill="#1c3a6b", tags=(self.node_id,))
-        cx, tw = self._text_column(x, w)
-        self._hint_item = self.canvas.create_text(
-            cx, y + 33, text="files -> mesh points", font=("Arial", 8),
-            fill="#35507d", width=tw, justify="center", tags=(self.node_id,))
-        # Anchored at the bottom edge so the 2-3 line status grows upward.
+        hint = self.canvas.create_text(
+            x + w / 2, y + 42, text="files -> tracked mesh points", font=("Arial", 8),
+            fill="#35507d", tags=(self.node_id,))
         self._status_item = self.canvas.create_text(
-            cx, y + h - 5, text=self._status_text(), font=("Arial", 7),
-            fill="#456", width=tw, anchor="s", justify="center", tags=(self.node_id,))
-        self._canvas_items += [self._body_rect, self._title_item, self._hint_item, self._status_item]
-
-    _PIN_LABEL_IN, _PIN_LABEL_OUT = 40, 58      # px taken by input / output pin labels
-
-    def _text_column(self, x, w) -> tuple[float, float]:
-        """Centre x and wrap width of the free column between the input-pin
-        labels (left) and the output-pin labels (right), so the face text
-        does not run under 'points' / 'status' / 'frames'."""
-        left, right = x + self._PIN_LABEL_IN, x + w - self._PIN_LABEL_OUT
-        return (left + right) / 2, max(60, right - left)
+            x + w / 2, y + h - 14, text=self._status_text(), font=("Arial", 7),
+            fill="#456", width=w - 12, tags=(self.node_id,))
+        self._canvas_items += [self._body_rect, self._title_item, hint, self._status_item]
 
     def on_resize(self, old_width, old_height, new_width, new_height) -> None:
-        cx, tw = self._text_column(self.x, new_width)
         if self._status_item is not None:
-            self.canvas.coords(self._status_item, cx, self.y + new_height - 5)
-            self.canvas.itemconfigure(self._status_item, width=tw)
-        if getattr(self, "_hint_item", None) is not None:
-            self.canvas.coords(self._hint_item, cx, self.y + 33)
-            self.canvas.itemconfigure(self._hint_item, width=tw)
+            self.canvas.coords(self._status_item, self.x + new_width / 2, self.y + new_height - 14)
 
     def get_help_text(self) -> str:
         return _HELP_TEXT
@@ -1012,25 +914,16 @@ class MeshTemplateTrackNode(BaseNode):
         )
 
     # ══ Files / preview image ════════════════════════════════════════════
-    def _on_files_changed(self, old_n: int = 0) -> None:
+    def _on_files_changed(self) -> None:
         n = len(self._files) if self._files else 0
         if n:
             self._files_info_var.set(f"{n} image files\nfirst: {os.path.basename(self._files[0])}\n"
                                      f"last:  {os.path.basename(self._files[-1])}")
-            # End follows the sequence length when it is automatic, and also
-            # when it was set to the OLD last frame ("track to the end"): it is
-            # often no longer automatic (after loading a result file or a
-            # project), and would otherwise keep the old length (e.g. 4004
-            # after the upstream list shrank to 3911) and block Run. An End
-            # set to any other frame is the user's choice and is kept.
-            if not self._end_auto and old_n and self._end_var.get().strip() == str(old_n):
-                self._end_auto = True
             if self._end_auto:
                 self._set_var(self._end_var, str(n))
         else:
             self._files_info_var.set("No image sequence connected.\n"
                                      "Connect the 'files' output of an Image Sequence node.")
-        self._update_status_item()                   # node face shows the file count
         self._update_result_info()
         self._validate_all()
         self._schedule_preview(60)
@@ -1321,11 +1214,6 @@ class MeshTemplateTrackNode(BaseNode):
         self._summary_label = tk.Label(box, textvariable=self._summary_var, font=("Arial", 8, "bold"),
                                        anchor="w", justify="left", wraplength=340)
         self._summary_label.pack(fill="x", pady=(4, 0))
-        tk.Label(box, text="Tracking details", font=("Arial", 8), anchor="w").pack(fill="x", pady=(4, 0))
-        self._run_info_text = tk.Text(box, height=12, width=46, font=("Consolas", 8), wrap="word",
-                                      bg="#f4f4f4", relief=tk.SUNKEN, borderwidth=1)
-        self._run_info_text.pack(fill="x")
-        self._set_run_info(self._run_info_last)
 
         box = tk.LabelFrame(f, text="Data", font=("Arial", 9), padx=6, pady=4)
         box.pack(fill="x", **pad)
@@ -1335,14 +1223,6 @@ class MeshTemplateTrackNode(BaseNode):
         self._btn_load.pack(side="left")
         self._btn_save = tk.Button(row, text="Save as ...", width=10, command=self._on_save_as)
         self._btn_save.pack(side="left", padx=6)
-        frow = tk.Frame(box)
-        frow.pack(fill="x", pady=(4, 0))
-        tk.Label(frow, text="File:", font=("Arial", 8)).pack(side="left")
-        tk.Entry(frow, textvariable=self._result_file_var, state="readonly", font=("Arial", 8),
-                 readonlybackground="#f4f4f4").pack(side="left", fill="x", expand=True, padx=(4, 0))
-        self._result_file_note = tk.Label(box, textvariable=self._result_file_note_var, font=("Arial", 8),
-                                          anchor="w", justify="left", wraplength=340, fg="#555555")
-        self._result_file_note.pack(fill="x")
         self._result_label = tk.Label(box, textvariable=self._result_info_var, font=("Arial", 8),
                                       anchor="w", justify="left", wraplength=340)
         self._result_label.pack(fill="x", pady=(4, 0))
@@ -1529,7 +1409,7 @@ class MeshTemplateTrackNode(BaseNode):
                     continue                  # the selected point stays visible
                 color = SELECT_DOT_COLOR if selected else (
                     OUTSIDE_DOT_COLOR if outside is not None and outside[i, j] else DOT_COLOR)
-                r = 2.5 if selected else 1.25
+                r = 4.5 if selected else 1.25
                 px, py = X(x), Y(y)
                 c.create_oval(px - r, py - r, px + r, py + r, fill=color, outline="", tags="overlay")
 
@@ -1837,19 +1717,16 @@ class MeshTemplateTrackNode(BaseNode):
             "mesh": (M, N, u0, v0, u1, v1), "bad_frames": 0, "n_files": len(self._files),
             "settings": self._settings_dict(),        # snapshot: saved together with the result
         }
-        job = {"files": list(self._files[start - 1:end]), "mesh_pts": mesh_pts,
+        job = {"files": list(self._files[start - 1:end]), "mesh_pts": mesh_pts, "func": calcTemplateMatchPyr,
                "update_template": cfg["update_template"],
                "cfg": {"template_size": cfg["template"], "search_range": cfg["search"],
                        "num_levels": cfg["levels"], "match_method": MATCH_METHODS[cfg["method"]],
                        "subpixel": cfg["subpixel"], "min_correlation": cfg["min_corr"],
                        "fine_search_radius": cfg["fine"], "sidelobe_exclusion_radius": cfg["sidelobe"]}}
         state = {"cancel": threading.Event(), "done": 0, "total": S, "finished": False,
-                 "error": None, "bad_frames": 0, "t0": time.time(),
-                 "info": {"phase": "starting", "tune": {}}}     # filled by the worker, shown in the Run panel
+                 "error": None, "bad_frames": 0, "t0": time.time()}
         self._result, self._run_state, self._running = result, state, True
-        # Keep self._result_path: it stays the node's result-file property (the
-        # default for "Save as"); the new result is marked as not saved in it.
-        self._result_saved, self._result_error = True, ""
+        self._result_path, self._result_saved, self._result_error = "", True, ""
         self._last_plot_done = 0
         self._series_user_view = False
         self._set_running_ui(True)
@@ -1892,48 +1769,6 @@ class MeshTemplateTrackNode(BaseNode):
             eta = "estimating ..." if done <= 1 else self._fmt_time(elapsed * (total - done) / (done - 1))
             self._progress_var.set(f"Frame {done}/{total} ({100 * done // total}%)   "
                                    f"elapsed {self._fmt_time(elapsed)}   ETA {eta}")
-        except tk.TclError:
-            pass
-        self._set_run_info(self._run_info_lines(st))
-
-    def _run_info_lines(self, st: dict) -> str:
-        """Text for the read-only 'Tracking details' box."""
-        info = st.get("info") or {}
-        lines = [f"Status     : {info.get('phase', '-')}"]
-        if "points" in info:
-            n = info.get("processes", 1)
-            lines.append(f"Processes  : {n} (of {info.get('cpus', '?')} CPUs)"
-                         + ("  -- trying counts" if info.get("phase") == "auto-tuning" else ""))
-            lines.append(f"Points     : {info['points']} per frame, ~{-(-info['points'] // max(1, n))} per process")
-            lines.append(f"Image      : {info.get('image', '?')} px")
-            tune = info.get("tune") or {}
-            if tune:
-                best = min(tune, key=tune.get)
-                lines.append("Auto-tune  : " + ", ".join(
-                    f"{k}p {v * 1000:.0f} ms" + ("*" if k == best and info.get("phase") != "auto-tuning" else "")
-                    for k, v in sorted(tune.items())))
-            if "avg_total_ms" in info:
-                # total = wall-clock time per frame step. imread runs in the
-                # read-ahead thread while the previous frame is being matched,
-                # so total can be less than imread + tm.
-                fps = 1000.0 / info["avg_total_ms"] if info["avg_total_ms"] > 0 else 0.0
-                lines.append(f"Per frame  : {info['avg_total_ms']:.0f} ms matching "
-                             f"({info['avg_read_ms']:.0f} ms imread, {info['avg_tm_ms']:.0f} ms tm) "
-                             f"(last {info['last_total_ms']:.0f} ms), {fps:.1f} frames/s")
-        lines.append(f"Frames     : {st['done']}/{st['total']}"
-                     + (f", {st['bad_frames']} unreadable" if st.get("bad_frames") else ""))
-        return "\n".join(lines)
-
-    def _set_run_info(self, text: str) -> None:
-        self._run_info_last = text
-        w = self._run_info_text
-        if w is None:
-            return
-        try:
-            w.configure(state=tk.NORMAL)
-            w.delete("1.0", tk.END)
-            w.insert("1.0", text)
-            w.configure(state=tk.DISABLED)            # read-only (still selectable / copyable)
         except tk.TclError:
             pass
 
@@ -1980,7 +1815,6 @@ class MeshTemplateTrackNode(BaseNode):
         if st["bad_frames"]:
             msg += f" {st['bad_frames']} frame(s) could not be read."
         self._progress_var.set(msg)
-        self._set_run_info(self._run_info_lines(st))
         self._set_running_ui(False)
         self._update_result_info()
         self._update_status_item()
@@ -1991,34 +1825,6 @@ class MeshTemplateTrackNode(BaseNode):
             messagebox.showerror("Mesh Template Track", st["error"], parent=self._dlg_parent())
 
     # ══ Load / save ══════════════════════════════════════════════════════
-    def _update_result_file_field(self) -> None:
-        """Show the remembered result file: full path in the read-only field,
-        and below it how the project file stores it and whether the current
-        result is in it."""
-        path = self._result_path
-        self._result_file_var.set(path or "")
-        if not path:
-            note = "No result file yet (use Save as ... to choose one)."
-        else:
-            base = self._get_project_base()
-            if base is not None:
-                note = "Stored in the project as: " + self._to_relative(path, base)
-            else:
-                note = "Project not saved yet: the path is made relative when it is."
-            if not os.path.isfile(path):
-                note += "\nFile not found."
-            elif self._result is not None and not self._result_saved and not self._running:
-                note += "\nThe current result is NOT saved in this file yet (use Save as ...)."
-        self._result_file_note_var.set(note)
-
-    def _file_dialog_start(self) -> dict:
-        """initialdir / initialfile for Load and Save as: the remembered file."""
-        path = self._result_path
-        if path:
-            return {"initialdir": os.path.dirname(path) or None, "initialfile": os.path.basename(path)}
-        base = self._get_project_base()
-        return {"initialdir": str(base) if base is not None else None, "initialfile": "mesh_tracking.npz"}
-
     def _update_result_info(self) -> None:
         res = self._result
         if res is None:
@@ -2036,8 +1842,8 @@ class MeshTemplateTrackNode(BaseNode):
                 text += f", {res['bad_frames']} unreadable frame(s)"
             if self._running:
                 text += "\nTracking in progress ..."
-            elif self._result_path and self._result_saved:
-                text += "\nSaved in the file above."
+            elif self._result_path:
+                text += f"\nFile: {self._result_path}"
             else:
                 text += "\nNOT saved to a file yet."
             if self._files and res.get("n_files") and res["n_files"] != len(self._files):
@@ -2045,7 +1851,6 @@ class MeshTemplateTrackNode(BaseNode):
                          f"the current input has {len(self._files)}.")
             color = "#b36b00" if (not self._result_saved and not self._running) else "#334477"
         self._result_info_var.set(text)
-        self._update_result_file_field()
         if self._result_label is not None:
             try:
                 self._result_label.configure(fg=color)
@@ -2087,8 +1892,7 @@ class MeshTemplateTrackNode(BaseNode):
             return
         path = filedialog.askopenfilename(
             parent=self._inspector_win, title="Load mesh tracking settings and result",
-            filetypes=[("Mesh tracking files", "*.npz"), ("All files", "*.*")],
-            **self._file_dialog_start())
+            filetypes=[("Mesh tracking files", "*.npz"), ("All files", "*.*")])
         if not path:
             return
         if self._result is not None and not self._result_saved and not messagebox.askokcancel(
@@ -2117,8 +1921,8 @@ class MeshTemplateTrackNode(BaseNode):
             return
         path = filedialog.asksaveasfilename(
             parent=self._inspector_win, title="Save mesh tracking settings and result",
-            defaultextension=".npz", filetypes=[("Mesh tracking files", "*.npz")],
-            **self._file_dialog_start())
+            defaultextension=".npz", initialfile="mesh_tracking.npz",
+            filetypes=[("Mesh tracking files", "*.npz")])
         if not path:
             return
         res = self._result

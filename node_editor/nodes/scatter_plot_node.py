@@ -848,9 +848,15 @@ class ScatterPlotNode(BaseNode):
 
         factor = 0.9 if event.button == "up" else 1.1
         xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        # Ctrl/Shift come from event.modifiers -- the state carried by the
+        # wheel event itself. event.key alone is not enough: matplotlib fills
+        # it only from key presses the plot canvas received, which needs
+        # keyboard focus, and the canvas only gets focus when clicked. That
+        # is why Ctrl/Shift-wheel acted like a plain wheel until the user had
+        # panned (clicked) the plot once.
         key = getattr(event, "key", None) or ""
         # event.key can be a combination such as "ctrl+shift"
-        mods = set(key.split("+"))
+        mods = set(key.split("+")) | set(getattr(event, "modifiers", None) or ())
 
         # Ctrl+wheel: zoom x only. Shift+wheel: zoom y only.
         # No modifier: zoom both axes together.

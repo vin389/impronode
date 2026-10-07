@@ -85,10 +85,12 @@ class Fft1DNode(BaseNode):
 
     def get_pin_schema(self) -> PinSchema:
         return PinSchema(
+            # Pin order: sampling step, time axis, then the data
+            # (outputs likewise: frequency axis, then magnitude / phase).
             inputs=[
-                PinDef(name="signal", type=PinType.ARRAY, label="signal"),
-                PinDef(name="t", type=PinType.ARRAY, label="t", optional=True),
                 PinDef(name="dt", type=PinType.SCALAR, label="dt", optional=True),
+                PinDef(name="t", type=PinType.ARRAY, label="t", optional=True),
+                PinDef(name="signal", type=PinType.ARRAY, label="signal"),
             ],
             outputs=[
                 PinDef(name="freq", type=PinType.ARRAY, label="freq"),
