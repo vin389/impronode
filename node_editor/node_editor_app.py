@@ -2482,11 +2482,21 @@ class NodeEditorApp:
             # than a save, and it also multiplies "node computed" / progress
             # messages during load. We defer all computation to the single
             # trigger_all() call after every link has been restored.
+            src_id, dst_id = str(lk.get("src_node", "")), str(lk.get("dst_node", ""))
+            # Pins renamed in a newer node version: the node class maps the old
+            # name (saved in the project) to the current one.
+            src_pin = str(lk.get("src_pin", ""))
+            dst_pin = str(lk.get("dst_pin", ""))
+            src_obj, dst_obj = self.canvas_nodes.get(src_id), self.canvas_nodes.get(dst_id)
+            if src_obj is not None:
+                src_pin = getattr(src_obj, "OUTPUT_PIN_ALIASES", {}).get(src_pin, src_pin)
+            if dst_obj is not None:
+                dst_pin = getattr(dst_obj, "INPUT_PIN_ALIASES", {}).get(dst_pin, dst_pin)
             ok = self._draw_link(
-                str(lk.get("src_node", "")),
-                str(lk.get("src_pin", "")),
-                str(lk.get("dst_node", "")),
-                str(lk.get("dst_pin", "")),
+                src_id,
+                src_pin,
+                dst_id,
+                dst_pin,
                 trigger=False,
                 geometry=lk.get("geometry"),       # absent in older project files -> default curve
             )

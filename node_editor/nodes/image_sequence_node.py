@@ -472,10 +472,22 @@ class ImageSequenceNode(BaseNode):
             except (TypeError, ValueError):
                 values[key] = None
 
+        # In Pattern mode Start/End are the numbers substituted into the
+        # pattern to CREATE the file list ("Edit file list"), so they must
+        # not be limited by the list that exists now -- otherwise an empty
+        # list could never be created and an existing one never extended.
+        # (Running past the end of the list is caught when frames are
+        # emitted: "frame expression out of range".)
+        limit = None if self._method_var.get() == "pattern" else count
+
+        def in_range(v):
+            return v is not None and v >= 1 and (limit is None or v <= limit)
+
         valid = {
-            "start": values["start"] is not None and 1 <= values["start"] <= count,
-            "end": values["end"] is not None and 1 <= values["end"] <= count,
-            "step": values["step"] is not None and values["step"] != 0 and abs(values["step"]) <= count,
+            "start": in_range(values["start"]),
+            "end": in_range(values["end"]),
+            "step": values["step"] is not None and values["step"] != 0
+                    and (limit is None or abs(values["step"]) <= limit),
         }
         if (valid["start"] and valid["end"] and valid["step"]
                 and ((values["step"] > 0 and values["start"] > values["end"])
@@ -497,7 +509,7 @@ class ImageSequenceNode(BaseNode):
                 offset is not None
                 and bool(loop_indices)
                 and all(
-                    1 <= self._expression_frame_number(offset, index) <= count
+                    in_range(self._expression_frame_number(offset, index))
                     for index in loop_indices
                 )
             )
@@ -849,8 +861,18 @@ class ImageSequenceNode(BaseNode):
 
         pattern = self._pattern_var.get().strip()
         end = int(self._batch_end_var.get())
+        # Generate every frame the batch will read: Frame 2 = i+1 needs one
+        # file past End at the last step (End = 5 -> image_0006).
+        loop_indices = self._build_batch_indices(
+            int(self._batch_start_var.get()), end, int(self._batch_step_var.get()))
+        needed = [end]
+        for var in (self._batch_frame_1_var, self._batch_frame_2_var):
+            expression = self._parse_batch_expression(var.get())
+            if expression is not None:
+                needed += [self._expression_frame_number(expression, i) for i in loop_indices]
+        last = max(needed)
         paths = []
-        for i in range(1, end + 1):
+        for i in range(1, last + 1):
             try:
                 paths.append(pattern % i)
             except (TypeError, ValueError):
@@ -860,8 +882,10 @@ class ImageSequenceNode(BaseNode):
                     "integer format specifier such as %04d.")
                 return
 
-        self._set_file_paths(paths)
-        self._edit_file_list()
+        # The batch fields defined this list: keep them (do not reset to the
+        # 1 / i defaults that a newly loaded folder gets).
+        self._set_file_paths(paths, reset_batch=False)
+        self._edit_file_list(preserve_batch=True)
 
     # ── method B: folder ─────────────────────────────────────────
 
@@ -885,11 +909,26 @@ class ImageSequenceNode(BaseNode):
         self._folder_var.set(self._to_relative(self._to_absolute(folder, base), base))
         self._set_file_paths(paths)
 
-    def _edit_file_list(self) -> None:
+    @staticmethod
+    def _popup_position_near_pointer(pointer_x: int, pointer_y: int, width: int, height: int,
+                                     screen_w: int, screen_h: int, gap: int = 16) -> tuple[int, int]:
+        """Top-left corner for a popup beside the mouse pointer: below-right
+        of it, flipped to the left / above when it would leave the screen."""
+        x = pointer_x + gap
+        if x + width > screen_w:
+            x = pointer_x - gap - width
+        y = pointer_y + gap
+        if y + height > screen_h:
+            y = pointer_y - gap - height
+        return max(0, x), max(0, y)
+
+    def _edit_file_list(self, *, preserve_batch: bool = False) -> None:
         """
         Open a popup text editor showing the current file list,
         one path per line. Experienced users can add, remove, or
         reorder paths. Changes take effect when they click Apply.
+        preserve_batch keeps the Batch sequence fields on Apply (used when
+        the list was generated from those fields in Pattern mode).
         """
         if not self._file_paths:
             messagebox.showinfo(
@@ -900,7 +939,13 @@ class ImageSequenceNode(BaseNode):
 
         win = tk.Toplevel()
         win.title("Edit File List")
-        win.geometry("700x500")
+        try:
+            px, py = win.winfo_pointerxy()
+            x, y = self._popup_position_near_pointer(
+                px, py, 700, 500, win.winfo_screenwidth(), win.winfo_screenheight())
+            win.geometry(f"700x500+{x}+{y}")
+        except tk.TclError:
+            win.geometry("700x500")
 
         tk.Label(win,
                  text="One file path per line. "
@@ -941,7 +986,7 @@ class ImageSequenceNode(BaseNode):
                             f"{sample}{more}\n\n"
                             f"Apply anyway?"):
                         return
-            self._set_file_paths(lines)
+            self._set_file_paths(lines, reset_batch=not preserve_batch)
             win.destroy()
 
         btn_frame = tk.Frame(win)
@@ -955,7 +1000,7 @@ class ImageSequenceNode(BaseNode):
 
     # ── file list management ──────────────────────────────────────
 
-    def _set_file_paths(self, paths: list[str]) -> None:
+    def _set_file_paths(self, paths: list[str], *, reset_batch: bool = True) -> None:
         # Cancel any in-flight background frame fetch/wait tied to the old list.
         self._batch_fetch_token += 1
         base = self._get_project_base()
@@ -970,14 +1015,15 @@ class ImageSequenceNode(BaseNode):
         self._stop_batch("ready")
 
         n = len(normalized)
-        self._batch_start_var.set("1")
-        # Default pair 1 / i: frame 1 is the first frame, frame 2 runs over
-        # every frame, so End is the last frame.
-        self._batch_end_var.set(str(max(1, n)))
-        self._batch_step_var.set("1")
-        self._batch_current_var.set("1")
-        self._batch_frame_1_var.set("1")
-        self._batch_frame_2_var.set("i")
+        if reset_batch:
+            self._batch_start_var.set("1")
+            # Default pair 1 / i: frame 1 is the first frame, frame 2 runs over
+            # every frame, so End is the last frame.
+            self._batch_end_var.set(str(max(1, n)))
+            self._batch_step_var.set("1")
+            self._batch_current_var.set("1")
+            self._batch_frame_1_var.set("1")
+            self._batch_frame_2_var.set("i")
         if self._slider is not None and self._slider.winfo_exists():
             self._slider.configure(from_=0, to=max(0, n - 1))
         self._slider_var.set(0)
@@ -991,7 +1037,11 @@ class ImageSequenceNode(BaseNode):
         # Publish the configured pair immediately (Frame 1=1, Frame 2=i by
         # default; at i=1 both pins carry frame 1, the reference frame).
         if self._validate_loop_fields():
-            self._emit_batch_frames(1)
+            try:
+                current = int(self._batch_current_var.get())
+            except ValueError:
+                current = 1
+            self._emit_batch_frames(current)
         else:
             self._load_and_push(0)
 

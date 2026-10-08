@@ -22,6 +22,9 @@ def test_project_progress_close_waits_for_load_and_save(monkeypatch, tmp_path):
         app._dirty = False
         app._suspend_dirty = False
         app._project_path = None
+        # One node, so a load really waits for the graph's execution-complete
+        # callback (a project with NO nodes finishes at once: nothing to run).
+        app.canvas_nodes = {"node_0": object()}
         app._serialize_graph = lambda: ([], [], {})
         app._set_clean = lambda: None
         app._restore_canvas_size = lambda _meta: None
