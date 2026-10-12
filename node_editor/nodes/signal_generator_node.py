@@ -21,6 +21,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 # Number of damped-sine channels (channel 7, the noise channel, is separate).
@@ -376,6 +377,9 @@ class SignalGeneratorNode(BaseNode):
         self._dt_var = tk.DoubleVar(value=self._common["dt"])
         self._dt_entry = tk.Entry(row, textvariable=self._dt_var, width=8)
         self._dt_entry.pack(side="left", padx=(4, 0))
+        add_tooltip(self._dt_entry, "Time between two samples (1 / sampling rate). It must be "
+                                    "well below half the period of the highest frequency, "
+                                    "otherwise that sine is not represented correctly (aliasing).")
 
         for entry, callback in (
             (self._duration_entry, lambda _e: self._on_common_changed()),
@@ -453,8 +457,19 @@ class SignalGeneratorNode(BaseNode):
         table.pack(fill="x", pady=(8, 0))
 
         headers = ("----", "on", "amplitude", "frequency", "decay", "time_shift")
+        header_tips = {
+            "on": "Include this channel in the output signal (all enabled channels are added).",
+            "amplitude": "Peak value of the sine wave.",
+            "frequency": "Oscillations per time unit (Hz when time is in seconds).",
+            "decay": "Damping rate: the amplitude is multiplied by exp(-decay * t). 0 = no "
+                     "damping; larger = dies out faster (like a free vibration).",
+            "time_shift": "Delays the sine wave by this time: sin(2*pi*f*(t - time_shift)).",
+        }
         for col, text in enumerate(headers):
-            tk.Label(table, text=text, font=("Arial", 8, "bold")).grid(row=0, column=col, padx=4)
+            header = tk.Label(table, text=text, font=("Arial", 8, "bold"))
+            header.grid(row=0, column=col, padx=4)
+            if text in header_tips:
+                add_tooltip(header, header_tips[text])
 
         self._sine_widget_vars = []
         for i, ch in enumerate(self._sine_channels):
@@ -514,6 +529,12 @@ class SignalGeneratorNode(BaseNode):
         seed_var = tk.IntVar(value=self._noise_channel["seed"])
         seed_entry = tk.Entry(table, textvariable=seed_var, width=6)
         seed_entry.grid(row=noise_row, column=5, padx=2)
+        add_tooltip(seed_entry, "Start value of the random number generator. The same seed "
+                                "always gives exactly the same noise, so results can be "
+                                "repeated; change it to get a different noise sample.")
+        add_tooltip(dist_box, "gaussian = normal-distributed noise with standard deviation = amplitude "
+                              "(typical measurement noise); "
+                              "uniform = equally likely values within +/- the amplitude.")
         seed_entry.bind("<Return>", lambda _e: self._on_noise_widget_changed())
         seed_entry.bind("<FocusOut>", lambda _e: self._on_noise_widget_changed())
         seed_entry.bind("<KeyRelease>", lambda _e: self._validate_noise_entry_state())

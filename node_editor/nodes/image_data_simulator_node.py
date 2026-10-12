@@ -91,6 +91,7 @@ from node_editor.base_node import BaseNode
 from node_editor.execution import ExecutionMode
 from node_editor.pin_types import PinDef, PinSchema, PinType
 from node_editor.project_context import get_project_directory
+from node_editor.tooltip import add_tooltips_by_text
 
 
 MAX_CAMERAS = 12
@@ -160,6 +161,57 @@ Image files: <folder>/<pattern>.<ext>, pattern fields {cam} and {frame}
 The folder is stored relative to the project file when possible.
 """
 
+
+
+# Inspector tooltips, keyed by the start of each widget's text.
+_INSPECTOR_TIPS = {
+    "View direction": "Direction the camera looks (its optical axis, camera +z), in world "
+                      "coordinates. Need not be normalised.",
+    "Roll (deg)": "Rotation of the camera about its viewing direction. 0 = the image x axis "
+                  "is parallel to the world x-y plane (camera held level).",
+    "Horizontal FOV": "Horizontal field of view: how wide the camera sees. Smaller = "
+                      "telephoto (zoomed in), larger = wide angle. Sets the focal length "
+                      "together with the image width.",
+    "Start time (s)": "Time of this camera's first frame. Give cameras different start "
+                      "times to simulate cameras that are not synchronised.",
+    "Distortion k1": "Lens distortion of the simulated camera (OpenCV model). All zero = an "
+                     "ideal lens. Use it to test calibration / undistortion.",
+    "Cells n1, n2": "Number of grid cells along direction 1 (corner 1 -> 2) and direction 2 "
+                    "(corner 1 -> 4); the object points are the grid nodes.",
+    "Perspective (homography)": "ON: grid points are spread over the quad as a perspective "
+                                "(projective) mapping of a regular grid. OFF: bilinear "
+                                "interpolation between the corners. Identical for a "
+                                "parallelogram.",
+    "Back-face colour": "Colour of the back side of the surface (seen when the mesh turns "
+                        "away from a camera); points there are not visible.",
+    "Marker type": "What is drawn at every object point: nothing, a small 2x2 checker "
+                   "corner, or an ArUco marker (identifiable by its id).",
+    "First ArUco id": "Id of the marker on the first object point; the next points get the "
+                      "following ids.",
+    "Random seed": "Same seed = exactly the same speckle pattern every time; change it for a "
+                   "different pattern.",
+    "Texture px per unit": "Resolution of the surface texture (texels per world unit). 0 = "
+                           "chosen automatically from the camera views.",
+    "Max texture size": "Upper limit for the surface texture, to keep memory use and render "
+                        "time reasonable. The resolution is lowered if needed.",
+    "Simulated duration": "Length of the simulated recording in seconds; with each camera's "
+                          "fps it sets the number of frames.",
+    "Render images": "Also render and save the camera images (slower). Off = compute only the "
+                     "ground-truth data (fast).",
+    "Image noise sigma": "Random noise added to the rendered image brightness (standard "
+                         "deviation in gray levels), like real sensor noise.",
+    "Image-point noise sigma": "Random error added to the output image_points (standard "
+                               "deviation in pixels), to test how methods cope with "
+                               "measurement noise. The .npz file also keeps the exact values.",
+    "Point dropout probability": "Chance (0 - 1) that each image point is set to NaN, to "
+                                 "simulate lost tracking.",
+    "Image points outside the image": "Set image points that fall outside the image to NaN, "
+                                      "as a real camera could not see them.",
+    "Render threads": "Number of images rendered at the same time. More = faster on "
+                      "multi-core computers (more memory).",
+    "Noise random seed": "Same seed = the same noise and dropout every time (repeatable "
+                         "tests).",
+}
 
 # ══ Defaults ═══════════════════════════════════════════════════════════════
 
@@ -1065,6 +1117,7 @@ class ImageDataSimulatorNode(BaseNode):
             inner, cv = self._make_scrollable(tab)
             builder(inner)
             self._bind_wheel_recursive(tab, cv)
+        add_tooltips_by_text(nb, _INSPECTOR_TIPS)
 
     @staticmethod
     def _make_scrollable(parent):

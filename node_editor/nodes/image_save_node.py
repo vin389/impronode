@@ -14,6 +14,7 @@ from node_editor.base_node import BaseNode
 from node_editor.execution import ExecutionMode
 from node_editor.pin_types import PinDef, PinSchema, PinType
 from node_editor.project_context import get_project_directory
+from node_editor.tooltip import add_tooltip
 
 
 _HELP_TEXT = (
@@ -228,8 +229,11 @@ class ImageSaveNode(BaseNode):
         row = tk.Frame(num_frame)
         row.pack(fill="x", pady=2)
         tk.Label(row, text="Start index:", font=("Arial", 9), width=14, anchor="w").pack(side="left")
-        tk.Spinbox(row, from_=0, to=10_000_000, textvariable=self._start_var,
-                   width=10, font=("Arial", 9)).pack(side="left")
+        start_sb = tk.Spinbox(row, from_=0, to=10_000_000, textvariable=self._start_var,
+                              width=10, font=("Arial", 9))
+        start_sb.pack(side="left")
+        add_tooltip(start_sb, "The number put into the file name (the %04d part) for the first "
+                              "save, and the value 'Reset Counter' goes back to.")
 
         row = tk.Frame(num_frame)
         row.pack(fill="x", pady=2)
@@ -245,26 +249,41 @@ class ImageSaveNode(BaseNode):
         tk.Label(row, text="(editable; overridden per-save by the index pin)",
                  font=("Arial", 8), fg="#666666").pack(side="left", padx=(6, 0))
 
-        tk.Button(num_frame, text="Reset Counter", font=("Arial", 8),
-                  command=self._on_reset_counter).pack(anchor="w", pady=(4, 0))
+        reset_btn = tk.Button(num_frame, text="Reset Counter", font=("Arial", 8),
+                              command=self._on_reset_counter)
+        reset_btn.pack(anchor="w", pady=(4, 0))
+        add_tooltip(reset_btn, "Set 'Next index' back to 'Start index', e.g. before recording "
+                               "a new series. Existing files are overwritten unless 'Skip save "
+                               "if file already exists' is on.")
 
         # ── save mode ─────────────────────────────────────────────────
         mode_frame = tk.LabelFrame(parent, text="Save mode", font=("Arial", 9), **pad)
         mode_frame.pack(fill="x", **pad)
 
-        tk.Radiobutton(
+        continuous_rb = tk.Radiobutton(
             mode_frame, text="Continuous (save every incoming frame)",
             variable=self._save_mode_var, value="continuous", font=("Arial", 9),
-        ).pack(anchor="w")
-        tk.Radiobutton(
+        )
+        continuous_rb.pack(anchor="w")
+        add_tooltip(continuous_rb, "Save every image that arrives. Simple, but a live source "
+                                   "(webcam, playing sequence) can write many files quickly.")
+        triggered_rb = tk.Radiobutton(
             mode_frame, text="Triggered (save only on a new trig pulse)",
             variable=self._save_mode_var, value="triggered", font=("Arial", 9),
-        ).pack(anchor="w")
+        )
+        triggered_rb.pack(anchor="w")
+        add_tooltip(triggered_rb, "Save only when the 'trig' input pin receives a new pulse "
+                                  "(e.g. from a Trigger node or a batch step). Use it to save "
+                                  "exactly one image per step, or only at chosen moments.")
 
-        tk.Checkbutton(
+        skip_cb = tk.Checkbutton(
             mode_frame, text="Skip save if file already exists",
             variable=self._skip_if_exists_var, font=("Arial", 9),
-        ).pack(anchor="w", pady=(4, 0))
+        )
+        skip_cb.pack(anchor="w", pady=(4, 0))
+        add_tooltip(skip_cb, "Never overwrite: if the target file is already there, it is kept "
+                             "and nothing is written (the counter still advances). Protects "
+                             "earlier results when a run is repeated.")
 
         # ── format options ───────────────────────────────────────────
         fmt_frame = tk.LabelFrame(parent, text="Format options", font=("Arial", 9), **pad)
@@ -273,14 +292,22 @@ class ImageSaveNode(BaseNode):
         row = tk.Frame(fmt_frame)
         row.pack(fill="x", pady=2)
         tk.Label(row, text="JPEG quality (0-100):", font=("Arial", 9), width=20, anchor="w").pack(side="left")
-        tk.Spinbox(row, from_=0, to=100, textvariable=self._jpeg_quality_var,
-                   width=8, font=("Arial", 9)).pack(side="left")
+        jpeg_sb = tk.Spinbox(row, from_=0, to=100, textvariable=self._jpeg_quality_var,
+                             width=8, font=("Arial", 9))
+        jpeg_sb.pack(side="left")
+        add_tooltip(jpeg_sb, "Only for .jpg / .jpeg. Higher = better image, larger file. JPEG "
+                             "always loses some detail; use .png for images that will be "
+                             "measured.")
 
         row = tk.Frame(fmt_frame)
         row.pack(fill="x", pady=2)
         tk.Label(row, text="PNG compression (0-9):", font=("Arial", 9), width=20, anchor="w").pack(side="left")
-        tk.Spinbox(row, from_=0, to=9, textvariable=self._png_compression_var,
-                   width=8, font=("Arial", 9)).pack(side="left")
+        png_sb = tk.Spinbox(row, from_=0, to=9, textvariable=self._png_compression_var,
+                            width=8, font=("Arial", 9))
+        png_sb.pack(side="left")
+        add_tooltip(png_sb, "Only for .png. PNG is lossless at every level: the image is "
+                            "identical, only file size and speed change. 0 = fastest / largest "
+                            "file, 9 = slowest / smallest.")
 
         # ── status ────────────────────────────────────────────────────
         stat_frame = tk.LabelFrame(parent, text="Status", font=("Arial", 9), **pad)

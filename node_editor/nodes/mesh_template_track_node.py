@@ -88,6 +88,8 @@ from node_editor.base_node import BaseNode
 from node_editor.execution import ExecutionMode
 from node_editor.pin_types import PinDef, PinSchema, PinType
 from node_editor.project_context import get_project_directory
+from node_editor.tooltip import add_tooltip
+from node_editor.nodes.template_match_node import TEMPLATE_MATCH_TIPS
 
 # calcTemplateMatchPyr lives as a top-level script module (not inside the
 # node_editor package); make the repo root importable exactly like
@@ -1271,6 +1273,13 @@ class MeshTemplateTrackNode(BaseNode):
                             command=lambda w=which: self._start_pick(w))
             btn.grid(row=row, column=2, sticky="w", padx=(4, 0), pady=2)
             self._btn_pick[which] = btn
+            add_tooltip(btn, f"Pick the {'top-left' if which == 'tl' else 'bottom-right'} corner "
+                             f"with the mouse in the image preview. The field follows the cursor; "
+                             f"click to accept, Esc or right-click to cancel.")
+        for widget in box.grid_slaves(row=0):
+            add_tooltip(widget, "M = number of cell rows, N = number of cell columns. One "
+                                "tracking point is placed at the centre of each cell, so the "
+                                "mesh has M x N points.")
         tk.Button(box, text="Fit Mesh to Full Image", font=("Arial", 8),
                   command=self._on_fit_mesh_to_image).grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(2, 4))
@@ -1295,8 +1304,9 @@ class MeshTemplateTrackNode(BaseNode):
         tmpl_h_entry.grid(row=0, column=2, sticky="w", padx=(4, 0), pady=2)
         self._entries.setdefault("tmpl_w", []).append(tmpl_w_entry)
         self._entries.setdefault("tmpl_h", []).append(tmpl_h_entry)
-        tk.Button(box, text="Auto (from mesh)", font=("Arial", 8),
-                  command=self._on_auto_window_size).grid(row=0, column=3, sticky="w", padx=(8, 0), pady=2)
+        auto_btn = tk.Button(box, text="Auto (from mesh)", font=("Arial", 8),
+                             command=self._on_auto_window_size)
+        auto_btn.grid(row=0, column=3, sticky="w", padx=(8, 0), pady=2)
 
         self._grid_row(box, 1, "Search range (w,h)",
                        [(self._search_w_var, "search_w", 6), (self._search_h_var, "search_h", 6)])
@@ -1319,6 +1329,22 @@ class MeshTemplateTrackNode(BaseNode):
         tk.Button(box, text="Reset tracking defaults", font=("Arial", 8),
                   command=self._reset_tracking_defaults).grid(
             row=11, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        tips = {row: TEMPLATE_MATCH_TIPS[key] for row, key in enumerate(
+            ("template", "search", "levels", "method", "subpixel"))}
+        tips.update({
+            5: "ON: each frame is matched against the patch from the PREVIOUS frame -- follows "
+               "large deformation or lighting changes, but small errors add up (drift).\n"
+               "OFF: always matched against the start frame -- no drift; best for small "
+               "deformations.",
+            6: TEMPLATE_MATCH_TIPS["min_corr"], 7: TEMPLATE_MATCH_TIPS["fine"],
+            8: TEMPLATE_MATCH_TIPS["sidelobe"],
+        })
+        for row, tip in tips.items():
+            for widget in box.grid_slaves(row=row):
+                if widget is not auto_btn:
+                    add_tooltip(widget, tip)
+        add_tooltip(auto_btn, "Set the template size to the mesh cell size, so neighbouring "
+                              "templates just touch. You can still edit it afterwards.")
 
         box = tk.LabelFrame(f, text="Run", font=("Arial", 9), padx=6, pady=4)
         box.pack(fill="x", **pad)

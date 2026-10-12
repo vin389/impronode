@@ -9,6 +9,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip
 
 
 _HELP_TEXT = """\
@@ -222,6 +223,12 @@ class RemapNode(BaseNode):
         self._interp_combo.set(_INTERP_KEY_TO_LABEL[self._interp_var.get()])
         self._interp_combo.bind("<<ComboboxSelected>>", self._on_interp_changed)
         self._interp_combo.pack(anchor="w")
+        add_tooltip(self._interp_combo,
+                    "How a pixel value is computed when the map points BETWEEN pixels.\n"
+                    "Nearest: copy the closest pixel (fast, blocky; keeps label / mask values).\n"
+                    "Linear: blend the 4 neighbours (good default).\n"
+                    "Cubic / Lanczos4: smoother and sharper, slower; often preferred for measurement images.\n"
+                    "Area: meant for shrinking images.")
 
         border_frame = tk.LabelFrame(parent, text="Border mode", font=("Arial", 9), **pad)
         border_frame.pack(fill="x", **pad)
@@ -232,6 +239,13 @@ class RemapNode(BaseNode):
         self._border_combo.set(_BORDER_KEY_TO_LABEL[self._border_var.get()])
         self._border_combo.bind("<<ComboboxSelected>>", self._on_border_changed)
         self._border_combo.pack(anchor="w")
+        add_tooltip(self._border_combo,
+                    "What to use where the map points OUTSIDE the source image (e.g. the edges "
+                    "after undistortion).\n"
+                    "Constant: fill with 'Border value' (e.g. black).\n"
+                    "Replicate: repeat the edge pixel.\n"
+                    "Reflect / Reflect101: mirror the image at the edge.\n"
+                    "Wrap: continue from the opposite edge.")
 
         value_row = tk.Frame(border_frame)
         value_row.pack(fill="x", pady=(6, 0))

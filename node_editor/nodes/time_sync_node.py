@@ -24,6 +24,7 @@ from scipy.signal import correlate, correlation_lags
 
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 class TimeSyncNode(BaseNode):
@@ -574,6 +575,14 @@ class TimeSyncNode(BaseNode):
 
         min_entry.bind("<Return>", lambda _e: self._apply_slider_range())
         max_entry.bind("<Return>", lambda _e: self._apply_slider_range())
+        range_tip = ("Smallest / largest time shift the slider (and Auto Align / Refine) may "
+                     "use; press Enter to apply. Narrow it around the expected delay for finer "
+                     "slider control and to keep the automatic search away from wrong matches.")
+        add_tooltip(min_entry, range_tip)
+        add_tooltip(max_entry, range_tip)
+        add_tooltip(self._insp_shift_scale,
+                    "Trial time shift added to t2. Drag it and watch the plot and the sync "
+                    "error; the output changes only when you press Apply.")
 
         # Full redraw once dragging stops. <ButtonRelease-1> covers mouse
         # drags and trough clicks; <KeyRelease> covers arrow-key nudges,
@@ -645,17 +654,40 @@ class TimeSyncNode(BaseNode):
         metric_box.bind("<<ComboboxSelected>>", lambda _e: self._on_analysis_setting_changed())
 
         self._insp_normalize_var = tk.BooleanVar(value=self._normalize_error)
-        tk.Checkbutton(
+        normalize_cb = tk.Checkbutton(
             row1, text="Normalize error", variable=self._insp_normalize_var,
             command=self._on_analysis_setting_changed,
-        ).pack(side="left")
+        )
+        normalize_cb.pack(side="left")
 
         row2 = tk.Frame(parent)
         row2.pack(fill="x", pady=(4, 0))
-        tk.Button(row2, text="Auto Align (cross-correlation)",
-                  command=self._on_auto_align_clicked).pack(side="left")
-        tk.Button(row2, text="Refine (minimize error)",
-                  command=self._on_refine_clicked).pack(side="left", padx=(8, 0))
+        auto_btn = tk.Button(row2, text="Auto Align (cross-correlation)",
+                             command=self._on_auto_align_clicked)
+        auto_btn.pack(side="left")
+        refine_btn = tk.Button(row2, text="Refine (minimize error)",
+                               command=self._on_refine_clicked)
+        refine_btn.pack(side="left", padx=(8, 0))
+
+        add_tooltip(interp_box, "How x2 is evaluated at x1's time points (the two series are "
+                                "sampled at different times). linear = robust; cubic = smoother, "
+                                "better for smooth signals.")
+        add_tooltip(diff_box, "Compare differences instead of values: 0 = the values, 1 = their "
+                              "changes (removes a constant offset), 2 = changes of changes (also "
+                              "removes a linear drift). Use 1 or 2 when the two sensors have "
+                              "different offsets or drift.")
+        add_tooltip(metric_box, "How the mismatch is measured. rmse = average difference of the "
+                                "values; correlation = 1 - correlation coefficient, which ignores "
+                                "scale differences (only the shape matters).")
+        add_tooltip(normalize_cb, "Scale both series to zero mean and unit spread before "
+                                  "comparing, so sensors with different units or gains can be "
+                                  "aligned.")
+        add_tooltip(auto_btn, "Find the shift automatically by cross-correlation: fast and "
+                              "finds the global best match within the t_shift range, but only "
+                              "to the nearest sample. Follow with Refine.")
+        add_tooltip(refine_btn, "Search the t_shift range for the shift with the smallest sync "
+                                "error using the current Interp / Diff order / Metric settings. "
+                                "Gives sub-sample precision; use after Auto Align.")
 
     def _on_analysis_setting_changed(self) -> None:
         self._interp_method = self._insp_interp_var.get()

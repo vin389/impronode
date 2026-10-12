@@ -11,6 +11,7 @@ from PIL import Image, ImageTk
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltips_by_text
 
 
 _IMAGE_DISPLAY_HELP = """\
@@ -587,6 +588,42 @@ class ImageDisplayNode(BaseNode):
             tab = tk.Frame(self._scroll_area(page), padx=6, pady=6)
             tab.pack(fill="both", expand=True)
             builder(tab)
+        add_tooltips_by_text(left, {
+            "Freeze": "Keep showing the current image while new frames keep arriving, e.g. to "
+                      "pick points calmly on a live or playing source. (Alt+E)",
+            "Fit": "Zoom so the whole image fits the window.",
+            "1:1": "Zoom so one image pixel = one screen pixel.",
+            "Pan": "Mouse drags move the image.",
+            "Pick points": "Mouse clicks add points to the Output points list (sent on the "
+                           "'points' pin).",
+            "Grid": "Draw the pixel grid when zoomed in far enough, to see exact pixel "
+                    "boundaries.",
+            "Interp.": "How the zoomed image is drawn. NEAREST = sharp pixel blocks (shows the "
+                       "real pixel values); LINEAR / CUBIC / LANCZOS4 = smooth. Display only.",
+        })
+        add_tooltips_by_text(mag_inner, {
+            "Corners": "Mark corners (Harris) in the magnified area -- helps to place points "
+                       "exactly on a corner.",
+            "ArUco": "Find ArUco markers in the whole frame and mark their corners and ids.",
+            "Features": "Mark well-trackable points (goodFeaturesToTrack) in the magnified "
+                        "area, e.g. to choose points for tracking.",
+            "threshold": "Keep corners at least this fraction as strong as the strongest one "
+                         "(0.05 = 5 %). Lower = more, weaker corners.",
+            "max": "Maximum number of features to mark.",
+            "quality": "Minimum feature strength as a fraction of the strongest (like the "
+                       "corner threshold). Lower = more features.",
+            "sub-pixel": "Refine the detected positions to a fraction of a pixel "
+                         "(cornerSubPix).",
+        })
+        add_tooltips_by_text(tabs, {
+            "Live": "Keep refreshing the input-points box as new data arrives. Turn off to "
+                    "freeze the list while you read or copy it.",
+            "-> Add to output": "Append the input points' x, y to the Output points list and "
+                                "send it.",
+            "Apply (send)": "Send the edited Output points list on the 'points' pin (Ctrl+Enter). "
+                            "Typing alone sends nothing.",
+            "Revert": "Discard your edits and show the list that is currently sent.",
+        })
         self._sync_text_from_points()
         self._show_result_text()
         if win is not None:

@@ -8,6 +8,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.execution import ExecutionMode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +255,7 @@ class ArrayAlgebraNode(BaseNode):
         param_frame = tk.LabelFrame(parent, text="Parameters", font=("Arial", 9), **pad)
         param_frame.pack(fill="x", **pad)
 
-        def _text_row(label_text, var, hint):
+        def _text_row(label_text, var, hint, tip):
             row = tk.Frame(param_frame)
             tk.Label(row, text=label_text, font=("Arial", 9), width=16, anchor="w").pack(side="left")
             entry = tk.Entry(row, textvariable=var, width=16, font=("Arial", 9))
@@ -262,16 +263,27 @@ class ArrayAlgebraNode(BaseNode):
             entry.bind("<FocusOut>", self._on_param_committed)
             entry.bind("<Return>", self._on_param_committed)
             tk.Label(row, text=hint, font=("Arial", 8), fg="#888888").pack(side="left", padx=(6, 0))
+            for widget in row.winfo_children():
+                add_tooltip(widget, tip)
             return row
 
         self._row_axis = _text_row(
-            "Axis:", self._axis_var, "int, e.g. 0 (concatenate/stack), or empty (norm)")
+            "Axis:", self._axis_var, "int, e.g. 0 (concatenate/stack), or empty (norm)",
+            "The dimension to work along: 0 = rows (first index), 1 = columns, ... For "
+            "Norm, empty = one norm of the whole array; a number = one norm per row / column.")
         self._row_axes = _text_row(
-            "Axes (transpose):", self._axes_var, "comma ints, empty = reverse all axes")
+            "Axes (transpose):", self._axes_var, "comma ints, empty = reverse all axes",
+            "New order of the dimensions, e.g. 1,0 swaps rows and columns; 0,2,1 swaps the "
+            "last two dimensions of a 3-D array.")
         self._row_ord = _text_row(
-            "ord / p:", self._ord_var, "empty=None, number, or fro/nuc/inf/-inf")
+            "ord / p:", self._ord_var, "empty=None, number, or fro/nuc/inf/-inf",
+            "Which norm. Empty = Euclidean length (vectors) / Frobenius (matrices); 1 = sum "
+            "of absolute values; inf = largest absolute value; nuc = sum of singular values.")
         self._row_rcond = _text_row(
-            "rcond:", self._rcond_var, "empty=None (recommended), or a number")
+            "rcond:", self._rcond_var, "empty=None (recommended), or a number",
+            "Least squares only: singular values smaller than rcond x the largest are treated "
+            "as zero, which stabilises nearly dependent (ill-conditioned) systems. Leave "
+            "empty for NumPy's default.")
 
         row_mode = tk.Frame(param_frame)
         tk.Label(row_mode, text="Mode (qr):", font=("Arial", 9), width=16, anchor="w").pack(side="left")
@@ -282,6 +294,9 @@ class ArrayAlgebraNode(BaseNode):
         )
         mode_combo.pack(side="left")
         mode_combo.bind("<<ComboboxSelected>>", self._on_param_committed)
+        add_tooltip(mode_combo, "Shape of the QR result for an m x n matrix A = Q R. reduced = "
+                                "Q m x k, R k x n with k = min(m, n) (usual); complete = square Q "
+                                "m x m; r = R only; raw = LAPACK's internal form.")
         self._row_mode = row_mode
 
         row_full = tk.Frame(param_frame)
@@ -291,6 +306,8 @@ class ArrayAlgebraNode(BaseNode):
             command=self._on_param_committed,
         )
         full_cb.pack(side="left")
+        add_tooltip(full_cb, "ON: U and Vt are full square matrices. OFF: only the parts that "
+                             "multiply non-zero singular values (smaller and usually enough).")
         self._row_full = row_full
 
         # ── status / last result summary ────────────────────────────

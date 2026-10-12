@@ -15,6 +15,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip
 
 
 _HELP_TEXT = (
@@ -429,6 +430,12 @@ class ScatterPlotNode(BaseNode):
             entry.bind("<KeyRelease>", lambda e: self._refresh_local())
         cfg["x_entry"] = x_entry
         cfg["y_entry"] = y_entry
+        expr_tip = ("A NumPy expression computed from the arrays on the input pins c1..c4, "
+                    "e.g. c1[:, 0] for the first column of c1, or (c1[:, 1] - c1[0, 1]) * 25.4 "
+                    "to plot the change from the first value, converted to mm. Lets you "
+                    "plot any column, difference or unit conversion without extra nodes.")
+        add_tooltip(x_entry, expr_tip)
+        add_tooltip(y_entry, expr_tip)
         tk.Label(data_frame,
                 text="numpy expressions using c1..c4 and np, e.g. (c1[:,1]-c1[0,1])*25.4",
                 font=("Arial", 7), fg="#888888", anchor="w").pack(fill="x", padx=(24, 0))

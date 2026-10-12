@@ -12,6 +12,7 @@ from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
 from node_editor.project_context import get_project_directory
 from node_editor import shared_array_registry as registry
+from node_editor.tooltip import add_tooltip
 
 
 _HELP_TEXT = (
@@ -246,6 +247,10 @@ class SharedArrayNode(BaseNode):
         self._name_entry = tk.Entry(
             name_frame, textvariable=self._name_var, font=("Courier", 10))
         self._name_entry.pack(fill="x")
+        add_tooltip(self._name_entry,
+                    "The table's name in this project. Other nodes read / write this table "
+                    "by this name, so several parts of the graph can share one table (e.g. "
+                    "collect results from different branches). Must be unique.")
         self._on_name_var_changed()
 
         # ── header ────────────────────────────────────────────────
@@ -283,6 +288,9 @@ class SharedArrayNode(BaseNode):
             query_row, text="Add", font=("Arial", 8), state="disabled",
             command=self._on_header_query_add)
         self._header_query_add_btn.pack(side="left")
+        add_tooltip(self._header_query_entry,
+                    "Type a column name to see its 1-based column number -- the number other "
+                    "nodes need. 'Add' appends the name to the header if it does not exist yet.")
 
         self._refresh_header_query()
 

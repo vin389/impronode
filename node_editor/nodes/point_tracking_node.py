@@ -12,7 +12,9 @@ import cv2
 import numpy as np
 
 from node_editor.base_node import BaseNode
+from node_editor.nodes.optical_flow_node import LK_TIPS
 from node_editor.nodes.point_predictor_node import (
+    PREDICTOR_TIPS,
     _LastKnownPredictor,
     _LinearPredictor,
     _PolyPredictor,
@@ -22,6 +24,7 @@ from node_editor.nodes.point_predictor_node import (
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
 from node_editor.project_context import get_project_directory
+from node_editor.tooltip import add_tooltips_by_text
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +613,7 @@ class PointTrackingNode(BaseNode):
                 width=10, font=("Arial", 9),
                 format=fmt).pack(side="left")
 
-        _lk_row("winSize (half px):",
+        _lk_row("winSize (px):",
                 self._lk_winsize_var,
                 from_=1, to=100, inc=2,
                 fmt="%.0f")
@@ -714,6 +717,32 @@ class PointTrackingNode(BaseNode):
             command=self._open_help).pack(
             anchor="e", **pad)
 
+        add_tooltips_by_text(parent, {
+            "Optical Flow (LK)": "Pyramidal Lucas-Kanade optical flow: follows each point by "
+                                 "matching the small window around it from frame to frame.",
+            "winSize": LK_TIPS["win"],
+            "maxLevel": LK_TIPS["max_level"],
+            "maxIter": "Stop refining a point after this many iterations (with epsilon below: "
+                       "whichever comes first). Larger = more precise but slower.",
+            "epsilon": "Stop refining a point once it moves less than this many pixels per "
+                       "iteration. Smaller = more precise but slower.",
+            "flags": LK_TIPS["flags"],
+            "minEigThreshold": LK_TIPS["min_eig"],
+            "Period": "Which earlier frame each frame is compared with. 0 = always frame 1: "
+                      "no drift, best for small deformation. 1 = the previous frame: follows "
+                      "large changes, but small errors add up (drift). k = a new reference "
+                      "every k frames, a compromise.",
+            "Enable cornerSubPix": "Before tracking, move each initial point to the exact "
+                                   "sub-pixel position of the nearest corner (e.g. a "
+                                   "checkerboard corner or target centre). Only for points "
+                                   "placed on corners.",
+            "Window half size": "cornerSubPix searches a (2n+1) x (2n+1) window around each "
+                                "initial point; it should contain the corner but no other "
+                                "corner.",
+            "Max iterations": "cornerSubPix stops after this many iterations ...",
+            "Epsilon": "... or once the point moves less than this (pixels).",
+        })
+
     def _build_tab_predictor(self,
                              parent: tk.Frame) -> None:
         pad = {"padx": 8, "pady": 4}
@@ -774,6 +803,7 @@ class PointTrackingNode(BaseNode):
             text="This predictor provides the initial guess used by cv2.calcOpticalFlowPyrLK(nextPts).",
             font=("Arial", 8), fg="#666666",
             justify="left", wraplength=560).pack(anchor="w", padx=8, pady=(4, 0))
+        add_tooltips_by_text(parent, PREDICTOR_TIPS)
 
     def _make_predictor(self, cfg: dict):
         algo = cfg["pred_algo"]

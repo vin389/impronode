@@ -9,6 +9,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +582,12 @@ class MeshScatterViewerNode(BaseNode):
         for mode, label in _AXIS_LABELS.items():
             tk.Radiobutton(idx_frame, text=label, variable=self._indexing_var,
                           value=mode, font=("Arial", 9), anchor="w").pack(anchor="w", pady=1)
+            add_tooltip(idx_frame.winfo_children()[-1],
+                        "Order of the dimensions of the output arrays, e.g. (nx, ny, nz) means "
+                        "X[i, j, k] belongs to the i-th x, j-th y and k-th z value. The points "
+                        "are the same in every option; only the array layout differs. Pick the "
+                        "layout the next node expects ('xy' = the Matlab / image convention, rows "
+                        "= y).")
 
         out_frame = tk.LabelFrame(inner, text="Output", font=("Arial", 9), **pad)
         out_frame.pack(fill="x", **pad)

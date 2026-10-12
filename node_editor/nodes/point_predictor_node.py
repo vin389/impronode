@@ -7,6 +7,41 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltips_by_text
+
+# Inspector tooltips keyed by the start of each widget's text; also used
+# by the Point Tracking node's predictor tab.
+PREDICTOR_TIPS = {
+    "Last known": "Predict that each point stays where it is now. A baseline for "
+                  "slow or random motion.",
+    "Linear extrapolation": "Assume constant velocity: next = 2 x now - previous. "
+                            "Good default for smooth motion.",
+    "Polynomial extrapolation": "Fit a curve through the last few positions (degree "
+                                "below) and extend it one step. Follows acceleration, "
+                                "but amplifies noise.",
+    "Exponential smoothing": "Like linear, but the velocity is averaged over recent "
+                             "steps (EMA alpha below), so single noisy steps matter "
+                             "less.",
+    "Kalman filter": "Statistically blends the measured positions with a constant-"
+                     "velocity model, using the noise settings below. Most robust "
+                     "for noisy tracks.",
+    "Poly degree": "Polynomial extrapolation only. 1 = straight line, 2 = constant "
+                   "acceleration. Higher degrees react to noise and rarely help.",
+    "EMA alpha": "Exponential smoothing only: weight of the newest velocity. 1 = "
+                 "plain linear extrapolation; smaller = smoother but slower to react. "
+                 "Typical 0.3 - 0.7.",
+    "Kalman Q_pos": "Kalman only: how much the position may change unpredictably per "
+                    "step. Larger = trusts the measurements more.",
+    "Kalman Q_vel": "Kalman only: how much the velocity may change per step. Larger "
+                    "= follows speed changes faster, but less smoothing.",
+    "Kalman R": "Kalman only: expected measurement noise (pixels squared). Larger = "
+                "trusts the model more than the measurements (smoother).",
+    "Max history": "How many past steps are kept. Older steps are discarded; only the "
+                   "last few are needed by the algorithms.",
+    "Reset history": "Forget all past positions, e.g. before tracking a new "
+                     "sequence. The next prediction is then just the current "
+                     "position.",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +676,8 @@ class PointPredictorNode(BaseNode):
             font=("Arial", 8),
             command=self._open_help).pack(
             side="right")
+
+        add_tooltips_by_text(left, PREDICTOR_TIPS)
 
         # status
         tk.Label(

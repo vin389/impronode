@@ -8,6 +8,7 @@ import cv2
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip
 
 
 # ---------------------------------------------------------------------------
@@ -282,13 +283,20 @@ class ProjectPointsNode(BaseNode):
             width=16, anchor="w").pack(
             side="left")
 
-        tk.Spinbox(
+        aspect_sb = tk.Spinbox(
             ar_row,
             from_=-1e6, to=1e6,
             increment=0.1,
             textvariable=self._aspect_var,
             width=10, font=("Arial", 9),
-            format="%.4f").pack(side="left")
+            format="%.4f")
+        aspect_sb.pack(side="left")
+        add_tooltip(
+            aspect_sb,
+            "OpenCV's aspectRatio option. It does NOT change the projected points -- only "
+            "the 'jacobian' output: when not 0, fx/fy is treated as fixed, so fx and fy are "
+            "not independent in the derivatives. Leave 0 unless you use the jacobian for an "
+            "optimisation with a fixed aspect ratio.")
 
         tk.Label(
             ar_row,

@@ -14,6 +14,45 @@ from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
 from node_editor.project_context import get_project_directory
+from node_editor.tooltip import add_tooltip, add_tooltips_by_text
+
+# What each cv2.calibrateCamera flag does and when to use it -- inspector
+# tooltips, also used by the Chessboard Calibration node.
+_FIX_K = ("Keep radial distortion coefficient k{n} fixed (at the initial value, normally 0) "
+          "instead of estimating it. Fixing higher-order terms avoids over-fitting when "
+          "there are few or similar images.")
+CALIB_FLAG_TIPS = {
+    "CALIB_USE_INTRINSIC_GUESS": "Start from the camera matrix given as the initial guess "
+                                 "instead of estimating one from scratch. Needed for the "
+                                 "'fix' options to keep YOUR values.",
+    "CALIB_FIX_ASPECT_RATIO": "Estimate one focal length only; fx / fy stays as in the "
+                              "initial guess (e.g. square pixels).",
+    "CALIB_FIX_PRINCIPAL_POINT": "Do not estimate the optical centre (cx, cy); keep the "
+                                 "initial guess (usually the image centre). More stable "
+                                 "when the views do not pin it down well.",
+    "CALIB_ZERO_TANGENT_DIST": "Assume no tangential distortion (p1 = p2 = 0), i.e. a "
+                               "well-centred lens. Fewer unknowns = a more stable result.",
+    "CALIB_FIX_FOCAL_LENGTH": "Keep fx, fy from the initial guess (with "
+                              "CALIB_USE_INTRINSIC_GUESS).",
+    "CALIB_FIX_K1": _FIX_K.format(n=1), "CALIB_FIX_K2": _FIX_K.format(n=2),
+    "CALIB_FIX_K3": _FIX_K.format(n=3), "CALIB_FIX_K4": _FIX_K.format(n=4),
+    "CALIB_FIX_K5": _FIX_K.format(n=5), "CALIB_FIX_K6": _FIX_K.format(n=6),
+    "CALIB_RATIONAL_MODEL": "Also estimate k4, k5, k6 (8 coefficients) for strong "
+                            "distortion such as wide-angle lenses. Needs many good, varied "
+                            "images.",
+    "CALIB_THIN_PRISM_MODEL": "Also estimate s1-s4, for a lens or sensor that is slightly "
+                              "misaligned.",
+    "CALIB_TILTED_MODEL": "Also estimate tau_x, tau_y, for a sensor tilted relative to the "
+                          "lens (e.g. Scheimpflug cameras).",
+    "CALIB_FIX_TANGENT_DIST": "Keep p1, p2 at their initial values instead of estimating them.",
+    "CALIB_FIX_S1_S2_S3_S4": "Keep the thin-prism coefficients s1-s4 at their initial values.",
+    "CALIB_FIX_TAUX_TAUY": "Keep the sensor-tilt coefficients tau_x, tau_y at their initial "
+                           "values.",
+    "CALIB_USE_LU": "Solve with LU decomposition instead of the default SVD: faster, less "
+                    "precise.",
+    "CALIB_USE_QR": "Solve with QR decomposition instead of the default SVD: faster, less "
+                    "precise.",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +821,26 @@ class CameraCalibNode(BaseNode):
                  textvariable=self._subpix_eps_var,
                  width=8, font=("Arial", 8)).pack(side="left")
 
+        add_tooltips_by_text(left, {
+            "Chessboard (multiple images)": "Calibrate from several photos of a printed "
+                                            "chessboard in different positions -- the usual, "
+                                            "most accurate method.",
+            "Single-image": "Calibrate from ONE image with known 3D points and their image "
+                            "positions typed in by hand (e.g. surveyed targets).",
+            "nx:": "Number of INNER corners along a chessboard row (where four squares "
+                   "meet) -- one less than the number of squares.",
+            "ny:": "Number of INNER corners along a chessboard column.",
+            "dx(mm):": "Size of one chessboard square along a row, in mm (sets the scale "
+                       "of the results).",
+            "dy(mm):": "Size of one chessboard square along a column, in mm.",
+            "Enable cv2.cornerSubPix": "Refine each detected corner to sub-pixel accuracy. "
+                                       "Recommended: it noticeably improves the calibration.",
+            "Window size (half)": "cornerSubPix searches a (2n+1) x (2n+1) window around "
+                                  "each corner. It should stay inside one square.",
+            "Max iterations": "cornerSubPix stops after this many iterations ...",
+            "Epsilon": "... or once the corner moves less than this (pixels).",
+        })
+
         # ── flags summary ─────────────────────────────────────────
         tk.Label(left, textvariable=self._flag_sum_var,
                  font=("Arial", 8), fg="#446688",
@@ -883,6 +942,14 @@ class CameraCalibNode(BaseNode):
             textvariable=self._undistort_scale_var,
             width=8,
             font=("Arial", 9)).pack(side="left", padx=4)
+        add_tooltips_by_text(vis_frame, {
+            "Undistort image before drawing": "Show the image with the lens distortion "
+                                              "removed, so you can check that straight "
+                                              "lines look straight.",
+            "Image size scale": "Size of the undistorted image relative to the original. "
+                                "Above 1 keeps the corners that undistortion pushes outside "
+                                "the original frame.",
+        })
         tk.Label(scale_row,
                  text="(1.0 = original size, 2.0 = 2x larger)",
                  font=("Arial", 8), fg="#666666").pack(side="left")
@@ -1091,14 +1158,16 @@ class CameraCalibNode(BaseNode):
 
         for i, (name, val) in enumerate(
                 self._CALIB_FLAGS):
-            tk.Checkbutton(
+            flag_cb = tk.Checkbutton(
                 inner,
                 text=f"{name}  ({val})",
                 variable=self._flag_vars[i],
                 font=("Arial", 9),
                 command=self._update_flag_sum,
-                anchor="w").pack(
-                fill="x", padx=6, pady=1)
+                anchor="w")
+            flag_cb.pack(fill="x", padx=6, pady=1)
+            if name in CALIB_FLAG_TIPS:
+                add_tooltip(flag_cb, CALIB_FLAG_TIPS[name])
 
     # ── inspector helpers ─────────────────────────────────────────
 

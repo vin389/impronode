@@ -14,6 +14,7 @@ from PIL import Image, ImageTk
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip
 
 
 class WebcamNode(BaseNode):
@@ -97,6 +98,9 @@ class WebcamNode(BaseNode):
         tk.Label(parent, text="Camera:", font=("Arial", 9)).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=2)
         cam_sb = tk.Spinbox(parent, from_=0, to=9, textvariable=self._cam_idx_var, width=4, font=("Arial", 9))
         cam_sb.grid(row=0, column=1, sticky="w", pady=2)
+        add_tooltip(cam_sb, "Which camera to open, numbered by the operating system: 0 = the "
+                            "first camera (usually the built-in one), 1 = the next one, ... "
+                            "Try another number if the wrong camera opens.")
 
         tk.Label(parent, text="Resolution:", font=("Arial", 9)).grid(row=1, column=0, sticky="w", padx=(0, 8), pady=2)
         res_cb = ttk.Combobox(parent, textvariable=self._res_var, values=[r[0] for r in self._RESOLUTIONS],
@@ -106,6 +110,13 @@ class WebcamNode(BaseNode):
         tk.Label(parent, text="Target FPS:", font=("Arial", 9)).grid(row=2, column=0, sticky="w", padx=(0, 8), pady=2)
         fps_sb = tk.Spinbox(parent, from_=1, to=60, textvariable=self._fps_var, width=5, font=("Arial", 9))
         fps_sb.grid(row=2, column=1, sticky="w", pady=2)
+        add_tooltip(fps_sb, "Maximum frames per second sent downstream. The camera may deliver "
+                            "fewer (light, resolution, USB bandwidth). Lower it when downstream "
+                            "processing is slow, so frames are not produced faster than they "
+                            "can be used.")
+        add_tooltip(res_cb, "Requested image size. A camera that does not support it uses the "
+                            "nearest size it has; the status line shows the size you actually "
+                            "get when the stream starts.")
 
         self._btn = tk.Button(parent, textvariable=self._btn_var, font=("Arial", 9, "bold"),
                               bg="#226688", fg="white", activebackground="#338899",

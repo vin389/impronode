@@ -23,6 +23,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 _HELP_TEXT = """
@@ -562,9 +563,10 @@ class BandpassFilterNode(BaseNode):
         row = tk.Frame(frame)
         row.pack(fill="x", pady=2)
         v["remove_mean"] = tk.BooleanVar(value=self._params["remove_mean"])
-        tk.Checkbutton(row, text="Remove mean (DC) before filtering",
-                       variable=v["remove_mean"], font=("Arial", 9),
-                       command=self._on_field_changed).pack(anchor="w")
+        remove_mean_cb = tk.Checkbutton(row, text="Remove mean (DC) before filtering",
+                                        variable=v["remove_mean"], font=("Arial", 9),
+                                        command=self._on_field_changed)
+        remove_mean_cb.pack(anchor="w")
 
         row = tk.Frame(frame)
         row.pack(fill="x", pady=2)
@@ -577,6 +579,29 @@ class BandpassFilterNode(BaseNode):
         tk.Label(row, text="(reflect-pad, reduces edge artifacts)",
                  font=("Arial", 7), fg="#888888").pack(side="left", padx=(4, 0))
 
+        add_tooltip(mode_combo, "Which frequencies are kept. Low-pass: below the HIGH cutoff "
+                                "(removes noise). High-pass: above the LOW cutoff (removes slow "
+                                "drift). Band-pass: between the two. Band-stop: removes the band "
+                                "between them (e.g. a known disturbance).")
+        cutoff_tip = ("Frequency (Hz) where the filter changes from keeping to removing. Low "
+                      "cutoff is used by High-pass / Band-pass / Band-stop, high cutoff by "
+                      "Low-pass / Band-pass / Band-stop. 0 = no limit on that side.")
+        add_tooltip(self._f_low_entry, cutoff_tip)
+        add_tooltip(self._f_high_entry, cutoff_tip)
+        add_tooltip(order_entry, "How sharp the change at the cutoff is. Higher = steeper "
+                                 "(closer to a perfect cut) but more ringing near sudden "
+                                 "changes in the signal. Not used by the Ideal shape.")
+        add_tooltip(shape_combo, "Butterworth: flat in the kept band, smooth roll-off (good "
+                                 "default). Gaussian: softest edge, least ringing. Ideal: "
+                                 "removes exactly everything past the cutoff, but causes the "
+                                 "most ringing (oscillations) in the time signal.")
+        add_tooltip(remove_mean_cb, "Subtract the average before filtering; it is added back "
+                                    "for Low-pass and Band-stop, which keep 0 Hz. Avoids a "
+                                    "large step at the record edges smearing into the result.")
+        add_tooltip(pad_entry, "The signal is extended at both ends by this fraction of its "
+                               "length (mirror image) before filtering, then cut back. The "
+                               "FFT treats the record as repeating; padding reduces the "
+                               "artefacts this causes at the start and end.")
         self._update_cutoff_enabled_state()
 
     def _sync_mode_label(self) -> None:

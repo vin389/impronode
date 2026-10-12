@@ -15,6 +15,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltips_by_text
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +445,41 @@ def _compute_all_strains(local_coords: np.ndarray, b_all: np.ndarray, jac_ok: np
 # StructuralMeshViewerNode
 # ---------------------------------------------------------------------------
 
+
+# Inspector tooltips, keyed by the start of each widget's text.
+_INSPECTOR_TIPS = {
+    "x' direction hint": "Optional rough direction for the local x' axis, e.g. \"1 0 0\". "
+                         "The local axes are found automatically, but each could point either "
+                         "way; this hint only picks the sign, so results do not flip "
+                         "between projects.",
+    "Normal (z') direction hint": "Optional rough outward normal of the surface (local z'), "
+                                  "used only to choose its sign.",
+    "Recompute": "Run the decomposition again (rigid-body motion, local deformation, strains) "
+                 "with the current inputs and hints.",
+    "Coord": "Plot the value itself (e.g. the position).",
+    "Displacement": "Plot the change from the first frame: value(t) - value(0).",
+    "Global coordinates": "Show the mesh as measured, including its rigid-body motion "
+                          "(translation and rotation).",
+    "Local coordinates": "Show only the deformation: the rigid-body motion is removed and the "
+                         "mesh is drawn in its own x' y' z' frame, where it can be amplified.",
+    "Auto color limits": "Scale the colours to the smallest / largest value of the shown frame. "
+                         "Turn off and set Min / Max to compare frames with the same scale.",
+    "x':": "Local view: deformation along x' is drawn this many times larger (shape = "
+           "start + amplification x (current - start)). 1 = true shape.",
+    "y':": "Local view: deformation along y' is drawn this many times larger.",
+    "z':": "Local view: deformation along z' (out of plane) is drawn this many times larger.",
+    "Fix axis-0 index": "Cut along the mesh: keep the first mesh index fixed and plot the "
+                        "points along the second index. The cut follows the same material "
+                        "points in every frame.",
+    "Fix axis-1 index": "Keep the second mesh index fixed and plot the points along the first "
+                        "index.",
+    "Amplification:": "Draw the change from the reference this many times larger, to make small "
+                      "deformations visible. 1 = true shape.",
+    "Point index": "Horizontal axis = number of the point along the cut.",
+    "In-plane coordinate": "Horizontal axis = the points' position along the cut (x' or y', "
+                           "chosen automatically).",
+}
+
 class StructuralMeshViewerNode(BaseNode):
     """
     See _HELP_TEXT (Ctrl-H) for the full reference.
@@ -747,6 +783,7 @@ class StructuralMeshViewerNode(BaseNode):
         self._build_tab_section(tab3)
         self._build_tab_field(tab4)
         self._build_tab_field_on_image(tab5)
+        add_tooltips_by_text(parent, _INSPECTOR_TIPS)
 
         if win is not None:
             win.update_idletasks()

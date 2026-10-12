@@ -3,6 +3,7 @@ import tkinter as tk
 from node_editor.base_node import BaseNode
 from node_editor.execution import ExecutionMode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 class BatchRunnerNode(BaseNode):
@@ -111,25 +112,29 @@ class BatchRunnerNode(BaseNode):
 	def build_inspector(self, parent: tk.Frame) -> None:
 		self._init_state()
 
-		tk.Label(parent, text="Default start", font=("Arial", 9)).grid(row=0, column=0, sticky="w")
-		tk.Entry(parent, textvariable=self._default_start_var, width=10, font=("Arial", 9)).grid(
-			row=0, column=1, sticky="w", padx=(8, 0)
+		# "Default" = used only while the matching input pin is NOT connected.
+		rows = (
+			("Default start", self._default_start_var,
+			 "First index of the run. Used when the 'start' input pin is not connected "
+			 "(a connected pin overrides it)."),
+			("Default iterations (N)", self._default_iterations_var,
+			 "Number of steps in the run. The last index is start + (N-1) * step. Ignored "
+			 "when the 'end' input pin is connected (then the run goes from start to end)."),
+			("Default step", self._default_step_var,
+			 "Index change per step (negative = count down). Used when the 'step' input "
+			 "pin is not connected."),
+			("Tick delay ms", self._tick_ms_var,
+			 "Pause between two steps, in milliseconds. Increase it to watch the results "
+			 "step by step, or when downstream displays cannot keep up."),
 		)
-
-		tk.Label(parent, text="Default iterations (N)", font=("Arial", 9)).grid(row=1, column=0, sticky="w", pady=(6, 0))
-		tk.Entry(parent, textvariable=self._default_iterations_var, width=10, font=("Arial", 9)).grid(
-			row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0)
-		)
-
-		tk.Label(parent, text="Default step", font=("Arial", 9)).grid(row=2, column=0, sticky="w", pady=(6, 0))
-		tk.Entry(parent, textvariable=self._default_step_var, width=10, font=("Arial", 9)).grid(
-			row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0)
-		)
-
-		tk.Label(parent, text="Tick delay ms", font=("Arial", 9)).grid(row=3, column=0, sticky="w", pady=(6, 0))
-		tk.Entry(parent, textvariable=self._tick_ms_var, width=10, font=("Arial", 9)).grid(
-			row=3, column=1, sticky="w", padx=(8, 0), pady=(6, 0)
-		)
+		for row, (text, var, tip) in enumerate(rows):
+			pady = (6, 0) if row else 0
+			label = tk.Label(parent, text=text, font=("Arial", 9))
+			label.grid(row=row, column=0, sticky="w", pady=pady)
+			entry = tk.Entry(parent, textvariable=var, width=10, font=("Arial", 9))
+			entry.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=pady)
+			add_tooltip(label, tip)
+			add_tooltip(entry, tip)
 
 		tk.Button(parent, textvariable=self._run_btn_var, command=self._toggle_run, width=10).grid(
 			row=4, column=1, sticky="e", pady=(10, 0)

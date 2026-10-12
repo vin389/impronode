@@ -22,6 +22,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 class Fft1DNode(BaseNode):
@@ -406,18 +407,30 @@ class Fft1DNode(BaseNode):
         )
         window_box.pack(side="left", padx=(4, 12))
         window_box.bind("<<ComboboxSelected>>", lambda _e: self._on_settings_changed())
+        add_tooltip(window_box, "Taper the signal towards both ends before the FFT. The FFT "
+                                "treats the record as repeating, so a jump between its end and "
+                                "start smears energy into false frequencies (leakage). hann / "
+                                "hamming / blackman reduce this (blackman most, with the widest "
+                                "peaks); 'none' keeps peak amplitudes exact for whole-period signals.")
 
         self._insp_detrend_var = tk.BooleanVar(value=self._detrend)
-        tk.Checkbutton(
+        detrend_cb = tk.Checkbutton(
             row, text="Remove mean (detrend)", variable=self._insp_detrend_var,
             command=self._on_settings_changed,
-        ).pack(side="left", padx=(0, 12))
+        )
+        detrend_cb.pack(side="left", padx=(0, 12))
+        add_tooltip(detrend_cb, "Subtract the average before the FFT. A constant offset only "
+                                "creates a large peak at 0 Hz that can dwarf the frequencies "
+                                "of interest.")
 
         self._insp_log_var = tk.BooleanVar(value=self._log_magnitude)
-        tk.Checkbutton(
+        log_cb = tk.Checkbutton(
             row, text="Log magnitude", variable=self._insp_log_var,
             command=self._on_display_setting_changed,
-        ).pack(side="left")
+        )
+        log_cb.pack(side="left")
+        add_tooltip(log_cb, "Display only: plot the magnitude on a logarithmic scale, so small "
+                            "peaks next to a large one become visible. The output is unchanged.")
 
     def _on_settings_changed(self) -> None:
         # Window/detrend change the actual computed output, so recompute

@@ -9,6 +9,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinDef, PinSchema, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip
 
 
 _EXPR_PLACEHOLDER = "e.g. x[0] or x['key'] or np.mean(x) or np.linalg.svd(x.T@x)"
@@ -273,6 +274,12 @@ class GenericDisplayNode(BaseNode):
                  font=("Arial", 9)).pack(anchor="w")
         expr_entry = tk.Entry(parent, textvariable=self._expr_var, width=40)
         expr_entry.pack(fill="x", pady=(0, 6))
+        add_tooltip(expr_entry,
+                    "A Python expression computed from the input, which is called x (np and "
+                    "math are available). The box below previews it while you type; Apply "
+                    "makes it this node's OUTPUT. Empty = pass x through unchanged.\n"
+                    "Why: to pick one element, a shape or a statistic out of an array / dict "
+                    "and pass it on, without building extra nodes.")
 
         # Placeholder: a gray label laid over the entry, shown only while the
         # entry is empty AND does not have keyboard focus. It is not text in

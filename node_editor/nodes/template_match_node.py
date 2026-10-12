@@ -10,6 +10,35 @@ if str(_REPO_ROOT) not in sys.path:
 	sys.path.insert(0, str(_REPO_ROOT))
 
 from calcTemplateMatchPyr_codex import calcTemplateMatchPyr
+from node_editor.tooltip import add_tooltip
+
+# Inspector tooltips for the matching parameters; also used by the Mesh
+# Template Track node, which has the same settings.
+TEMPLATE_MATCH_TIPS = {
+	"template": "Size (pixels) of the image patch around each point that is searched for in "
+				"the other frame. Larger = more texture to match, more robust; smaller = "
+				"follows local deformation more closely and is faster.",
+	"search": "How far (+/- pixels, full resolution) a point may move between the two frames. "
+			  "Set it a bit larger than the largest expected motion: larger is slower and "
+			  "risks matching a similar-looking spot.",
+	"levels": "Number of image-pyramid levels, including the original (1 = plain "
+			  "full-resolution matching). More levels search a large range quickly at coarse "
+			  "resolution, then refine on finer levels.",
+	"method": "How similarity is measured. TM_CCOEFF_NORMED (recommended) ignores brightness "
+			  "and contrast changes between frames; the *_NORMED methods give 'Min "
+			  "correlation' a stable 0-1 meaning.",
+	"subpixel": "Refine the best match to a fraction of a pixel by fitting a smooth peak. "
+				"Turn it off only if whole-pixel results are wanted.",
+	"min_corr": "Match quality (0-1) below which a point is marked as failed (NaN) instead of "
+				"reporting a doubtful position. Raise it to reject poor matches, lower it for "
+				"noisy images.",
+	"fine": "After the coarsest pyramid level, each finer level searches only +/- this many "
+			"pixels around the coarse result. Increase it if points fail or jump on fine "
+			"levels.",
+	"sidelobe": "Affects only the confidence score: response pixels this close to the best "
+				"peak are ignored when looking for the second-best peak. A clear gap between "
+				"the two peaks means a reliable match.",
+}
 
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -238,6 +267,10 @@ class TemplateMatchNode(BaseNode):
 		tk.Button(grid, text="Reset Defaults", command=self._reset_defaults).grid(
 			row=8, column=0, columnspan=4, sticky="w", pady=(8, 2)
 		)
+		for row, key in enumerate(("template", "search", "levels", "method", "subpixel",
+								   "min_corr", "fine", "sidelobe")):
+			for widget in grid.grid_slaves(row=row):
+				add_tooltip(widget, TEMPLATE_MATCH_TIPS[key])
 
 		tk.Label(
 			parent,

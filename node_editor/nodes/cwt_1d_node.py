@@ -30,6 +30,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 # Continuous wavelet families exposed in the UI. cmor/shan/fbsp need
@@ -514,6 +515,11 @@ class Cwt1DNode(BaseNode):
         )
         family_box.pack(side="left", padx=(4, 12))
         family_box.bind("<<ComboboxSelected>>", lambda _e: self._on_family_changed())
+        add_tooltip(family_box, "The wavelet shape the signal is compared with.\n"
+                                "morl (Morlet): good default for vibrations / oscillations.\n"
+                                "cmor (complex Morlet): also gives the phase.\n"
+                                "mexh, gausN: better for locating short pulses / sudden changes.\n"
+                                "shan, fbsp: very sharp in frequency, poorer in time.")
 
         self._wavelet_param_frame = tk.Frame(row)
         self._wavelet_param_frame.pack(side="left")
@@ -549,6 +555,12 @@ class Cwt1DNode(BaseNode):
             cf_entry = tk.Entry(frame, textvariable=self._insp_center_var, width=6)
             cf_entry.pack(side="left")
             cf_entry.bind("<KeyRelease>", lambda _e: self._on_wavelet_param_changed())
+
+        for child in frame.winfo_children():
+            add_tooltip(child, "Shape parameters of this wavelet. Larger bandwidth = longer "
+                               "wavelet: sharper frequency resolution, blurrier in time. "
+                               "Center freq sets the oscillation inside the wavelet; order "
+                               "(fbsp) sets the spline smoothness.")
 
     def _on_family_changed(self) -> None:
         self._wavelet_family = self._insp_family_var.get()
@@ -596,6 +608,12 @@ class Cwt1DNode(BaseNode):
             state="readonly", width=6,
         )
         spacing_box.pack(side="left", padx=(2, 0))
+        scale_tip = ("Scales = stretch factors of the wavelet, in samples; a larger scale "
+                     "matches a LOWER frequency. min / max set the frequency range analysed, "
+                     "count the number of rows in the result. 'log' spacing gives equal "
+                     "resolution per octave (usual); 'linear' spaces scales evenly.")
+        for widget in row.winfo_children():
+            add_tooltip(widget, scale_tip)
 
         for entry in (min_entry, max_entry, count_entry):
             entry.bind("<KeyRelease>", lambda _e: self._on_scale_settings_changed())
@@ -664,6 +682,9 @@ class Cwt1DNode(BaseNode):
         )
         view_box.pack(side="left", padx=(4, 12))
         view_box.bind("<<ComboboxSelected>>", lambda _e: self._on_display_setting_changed())
+        add_tooltip(view_box, "Display only. magnitude = how strong each frequency is at each "
+                              "time; phase = its phase angle (meaningful for complex wavelets "
+                              "such as cmor).")
 
         tk.Label(row, text="Y axis:").pack(side="left")
         self._insp_yaxis_var = tk.StringVar(value=self._y_axis_mode)
@@ -673,6 +694,9 @@ class Cwt1DNode(BaseNode):
         )
         yaxis_box.pack(side="left", padx=(4, 12))
         yaxis_box.bind("<<ComboboxSelected>>", lambda _e: self._on_display_setting_changed())
+        add_tooltip(yaxis_box, "Display only: label the vertical axis by the wavelet scale or by "
+                               "the equivalent frequency (scale converted using the sampling "
+                               "interval).")
 
         tk.Label(row, text="Colormap:").pack(side="left")
         self._insp_cmap_var = tk.StringVar(value=self._colormap)

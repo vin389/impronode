@@ -8,6 +8,25 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.execution import ExecutionMode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
+
+# Inspector tooltips for the Lucas-Kanade settings; also used by the Point
+# Tracking node, which has the same settings.
+LK_TIPS = {
+	"win": "Size (pixels) of the window around each point that is matched between the two "
+		   "images, at every pyramid level. Larger = more robust to noise and follows faster "
+		   "motion, but slower and less precise near edges / where motion varies.",
+	"max_level": "Number of image-pyramid levels (0 = full resolution only). Each level halves "
+				 "the image, so more levels can follow larger motions between the two frames.",
+	"criteria": "When to stop refining each point. type: 1 = after 'count' iterations, 2 = when "
+				"it moves less than 'eps' pixels, 3 = whichever comes first. Larger count / "
+				"smaller eps = more precise but slower.",
+	"flags": "OpenCV option flags (add them up): 0 = none; 4 = start from the points given on "
+			 "the 'nextPts' pin instead of the previous positions (a good guess helps large "
+			 "motions); 8 = use the minimum eigenvalue as the error measure.",
+	"min_eig": "Points whose surroundings have too little texture (flat, uniform areas) cannot "
+			   "be tracked reliably and are marked as lost. Larger = rejects more weak points.",
+}
 
 
 class OpticalFlowNode(BaseNode):
@@ -200,6 +219,10 @@ class OpticalFlowNode(BaseNode):
 		tk.Button(grid, text="Reset Defaults", command=self._reset_lk_defaults).grid(
 			row=5, column=0, columnspan=4, sticky="w", pady=(8, 2)
 		)
+		# One tooltip per row, on its label and its entries.
+		for row, key in enumerate(("win", "max_level", "criteria", "flags", "min_eig")):
+			for widget in grid.grid_slaves(row=row):
+				add_tooltip(widget, LK_TIPS[key])
 
 		tk.Label(
 			parent,

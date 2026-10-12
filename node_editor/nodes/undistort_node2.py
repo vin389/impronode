@@ -11,6 +11,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip, add_tooltips_by_text
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +432,12 @@ class UndistortNode(BaseNode):
             width=6, font=("Arial", 9),
             format="%.2f")
         self._alpha_sb.pack(side="left", padx=4)
+        alpha_tip = ("Undistortion bends straight image edges, leaving black areas. 0 = zoom in "
+                     "until no black area is left (some image content is lost at the edges); "
+                     "1 = keep every original pixel (black corners visible); values between "
+                     "trade one for the other.")
+        add_tooltip(alpha_slider, alpha_tip)
+        add_tooltip(self._alpha_sb, alpha_tip)
 
         # ── new camera matrix source ──────────────────────────────
         ncmat_frame = tk.LabelFrame(
@@ -618,6 +625,31 @@ class UndistortNode(BaseNode):
             font=("Arial", 9), fg="#446688",
             anchor="w", justify="left").pack(
             fill="x", **pad)
+
+        add_tooltips_by_text(parent, {
+            "Method A": "Computes the correction from scratch for every image. Simple; fine "
+                        "for a few single images.",
+            "Method B": "Computes the pixel mapping once and reuses it while the camera "
+                        "parameters stay the same -- much faster for image sequences and "
+                        "video. Also enables 'alpha'. Recommended.",
+            "Calculate automatically": "Let OpenCV choose the camera matrix of the corrected "
+                                       "image from the original one and 'alpha'. The usual "
+                                       "choice.",
+            "Equal focal lengths": "Make the corrected image's pixels exactly square "
+                                   "(same scale in x and y) -- convenient for measuring "
+                                   "distances in pixels.",
+            "Center principal point": "Put the optical centre exactly in the middle of the "
+                                      "corrected image.",
+            "Use inspector text box": "Type the values yourself, e.g. to reproduce an earlier "
+                                      "result exactly or to make several cameras match.",
+            "Use input pin": "Take the values from the input pin, e.g. computed by another node.",
+            "Scale from original": "Output image size = scale x original size. A scale above "
+                                   "1 keeps more detail when the correction stretches the "
+                                   "image.",
+            "Original image size": "Size of the images the camera was calibrated with. Only "
+                                   "needed when no image is connected (e.g. to compute maps "
+                                   "in advance).",
+        })
 
         # sync visibility
         self._on_method_change()

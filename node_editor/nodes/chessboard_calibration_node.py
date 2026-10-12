@@ -138,6 +138,8 @@ from node_editor.execution import ExecutionMode
 from node_editor.pin_types import PinDef, PinSchema, PinType
 from node_editor.project_context import get_project_directory
 from node_editor.ui_style import apply_notebook_tab_style
+from node_editor.tooltip import add_tooltips_by_text
+from node_editor.nodes.calib_nodes import CALIB_FLAG_TIPS
 
 
 PREVIEW_MAX_SIDE = 2000
@@ -493,6 +495,78 @@ _CALIB_FLAG_TABLE = (
     ("fix_taux_tauy", cv2.CALIB_FIX_TAUX_TAUY, "FixTau"),
 )
 
+
+
+# Inspector tooltips, keyed by the start of each widget's text.
+_SETTINGS_TIPS = {
+    "Columns: inner corners": "Number of INNER corners along one chessboard row (points where "
+                              "four squares meet) -- one less than the number of squares.",
+    "Rows: inner corners": "Number of INNER corners along one chessboard column.",
+    "Square size": "Edge length of one chessboard square in your world unit (e.g. mm). Sets "
+                   "the scale of the camera positions and of the object points.",
+    "Adaptive thresh": "Detection option: handle uneven lighting across the board (usually "
+                       "helps; slightly slower).",
+    "Normalize": "Detection option: equalize the image brightness before detecting.",
+    "Fast check": "Detection option: quickly reject images that do not show the board -- "
+                  "much faster for long sequences with many empty frames.",
+    "Detection max width": "Corners are first searched on a copy shrunk to this width "
+                           "(faster for large images), then refined on the full image. 0 = "
+                           "search the full-size image.",
+    "cornerSubPix window": "Half size of the window used to refine each corner to sub-pixel "
+                           "accuracy. 0 = automatic from the square size (recommended).",
+    "cornerSubPix max iterations": "Corner refinement stops after this many iterations ...",
+    "cornerSubPix epsilon": "... or once the corner moves less than this (pixels).",
+    "Worker threads": "Number of images analysed at the same time. More = faster on "
+                      "multi-core computers.",
+    "First frame": "First image of the file list to analyse (1-based).",
+    "Last frame": "Last image to analyse (blank = the last one).",
+    "Frame step": "Analyse every n-th image only, e.g. 5 for a long video-like sequence of "
+                  "nearly identical frames.",
+    "Target image count": "How many images to pick for calibration. 10 - 30 varied views "
+                          "are usually enough; more near-duplicate views do not help.",
+    "Minimum sharpness": "Skip blurred images: sharpness below this value is not used "
+                         "(0 = accept any). Look at the sharpness column to choose a value.",
+    "Diversity threshold": "Stop picking when the next image differs from every picked one "
+                           "by less than this fraction of the image diagonal -- avoids "
+                           "near-duplicate views, so you may get fewer than the target count.",
+    "Reselect": "Pick images again with the new Selection settings, without detecting the "
+                "corners again (fast).",
+    "Use intrinsic guess": CALIB_FLAG_TIPS["CALIB_USE_INTRINSIC_GUESS"],
+    "Fix principal point": CALIB_FLAG_TIPS["CALIB_FIX_PRINCIPAL_POINT"],
+    "Fix aspect ratio": CALIB_FLAG_TIPS["CALIB_FIX_ASPECT_RATIO"],
+    "Fix focal length": CALIB_FLAG_TIPS["CALIB_FIX_FOCAL_LENGTH"],
+    "Zero tangential": CALIB_FLAG_TIPS["CALIB_ZERO_TANGENT_DIST"],
+    "Rational model": CALIB_FLAG_TIPS["CALIB_RATIONAL_MODEL"],
+    "Thin prism": CALIB_FLAG_TIPS["CALIB_THIN_PRISM_MODEL"],
+    "Tilted sensor": CALIB_FLAG_TIPS["CALIB_TILTED_MODEL"],
+    **{f"k{k}": CALIB_FLAG_TIPS[f"CALIB_FIX_K{k}"] for k in range(1, 7)},
+    "s1-s4": CALIB_FLAG_TIPS["CALIB_FIX_S1_S2_S3_S4"],
+    "tau_x, tau_y": CALIB_FLAG_TIPS["CALIB_FIX_TAUX_TAUY"],
+    "Guess from image size": "Fill a typical starting camera matrix: focal length = the "
+                             "larger image side, optical centre = image centre (and "
+                             "tick 'Use intrinsic guess').",
+    "Run Calibration": "Calibrate with the CHECKED images and the options above. Each run is "
+                       "kept in the list below, so you can compare settings.",
+    "Set Active": "Make the selected run the one this node outputs and displays.",
+}
+_VIEW_TIPS = {
+    "Magnification": "Residual arrows (detected minus reprojected corner) are tiny; they "
+                     "are drawn this many times longer so their pattern is visible.",
+    "Perspective": "Display only: amount of perspective in the 3D view (0 = parallel "
+                   "projection).",
+    "Frustum size": "Display only: size of the camera pyramids drawn in the 3D view.",
+    "Board": "Keep the chessboard fixed and show where the camera was for each image.",
+    "Camera": "Keep the camera fixed and show where the board was for each image.",
+    "same as K": "Undistort with the calibrated camera matrix unchanged (same zoom; the "
+                 "image corners may be cut off).",
+    "getOptimalNewCameraMatrix": "Let OpenCV choose a new camera matrix using alpha below.",
+    "alpha (0-1)": "0 = zoom in until no black border is left; 1 = keep every original pixel "
+                   "(black corners visible).",
+    "centerPrincipalPoint": "Put the optical centre exactly in the middle of the undistorted "
+                            "image.",
+    "Run Sensitivity": "Recalibrate once without each image in turn. An image whose removal "
+                       "changes the result a lot is suspicious (e.g. a mis-detected corner).",
+}
 
 def build_calibration_flags(opts: dict) -> int:
     flags = 0
@@ -1221,6 +1295,7 @@ class ChessboardCalibrationNode(BaseNode):
             builder(tab)
         self._build_selected_table(inner)
         self._bind_scroll_recursive(inner, scroll_cv)
+        add_tooltips_by_text(inner, _SETTINGS_TIPS)
 
         # ---- right: views ----
         rnb = ttk.Notebook(right)
@@ -1236,6 +1311,7 @@ class ChessboardCalibrationNode(BaseNode):
             tab = tk.Frame(rnb)
             rnb.add(tab, text=title)
             builder(tab)
+        add_tooltips_by_text(rnb, _VIEW_TIPS)
         # The undistort tab computes lazily: only when it is (or becomes) the visible tab.
         rnb.bind("<<NotebookTabChanged>>", lambda _e: self._redraw_undistort())
 

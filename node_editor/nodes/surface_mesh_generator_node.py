@@ -9,6 +9,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltips_by_text
 
 
 _HELP_TEXT = """\
@@ -509,6 +510,34 @@ def _fit_cylinder(points: np.ndarray,
 # SurfaceMeshGeneratorNode
 # ---------------------------------------------------------------------------
 
+# Inspector tooltips, keyed by the start of each widget's text.
+_INSPECTOR_TIPS = {
+    "Use first": "Where the measured points come from: the 'points' input pin or the text "
+                 "box below. The other one is used only when the first has no points.",
+    "Origin point": "0-based index (in the given points) of the point that becomes mesh "
+                    "coordinate (a1, a2) = (0, 0).",
+    "X-axis point": "0-based index of a point on the +a1 axis: a1 runs from the origin "
+                    "towards this point.",
+    "+Y side point": "0-based index of a point on the +a2 side, so a2 points the way you "
+                     "expect (otherwise its sign is arbitrary). -1 = not used.",
+    "Approximate +height": "A rough direction of the cylinder axis, pointing to +height "
+                           "(a2). The fit finds the exact axis; this only picks which way is "
+                           "'up'.",
+    "Reverse theta": "Theta (a1) normally increases counter-clockwise when looking down the "
+                     "axis from the +height end; this makes it clockwise.",
+    "Auto-fit ranges": "Set the a1 / a2 ranges to just cover the given points (with a small "
+                       "margin) -- useful for a cylinder, whose angle range is hard to guess.",
+    "dtype": "Number type of the generated mesh. float32 halves the memory for very dense "
+             "meshes; float64 keeps full precision.",
+    "Allow >": "Safety limit: meshes larger than this are refused, because they could use up "
+               "the computer's memory. Tick only if you really need such a dense mesh.",
+    "M_draw": "Preview only: number of grid lines drawn along a1 (the real mesh is not "
+              "affected). Lower = faster preview.",
+    "N_draw": "Preview only: number of grid lines drawn along a2.",
+    "Perspective Intensity": "Preview only: 0 = parallel projection (sizes do not change "
+                             "with distance), 1 = strong perspective.",
+}
+
 class SurfaceMeshGeneratorNode(BaseNode):
     """
     Fits a plane or cylinder to a few measured 3D points and generates a
@@ -885,6 +914,8 @@ class SurfaceMeshGeneratorNode(BaseNode):
                      anchor="w", justify="left", wraplength=290).pack(fill="x")
 
         # ── 3D preview ────────────────────────────────────────────
+        add_tooltips_by_text(inner, _INSPECTOR_TIPS)
+
         prev = tk.LabelFrame(right, text="3D preview  (L-drag rotate, R-drag pan, wheel zoom)",
                              font=("Arial", 9), padx=4, pady=4)
         prev.pack(fill="both", expand=True)
@@ -1020,6 +1051,7 @@ class SurfaceMeshGeneratorNode(BaseNode):
             tk.Checkbutton(parent, text="Reverse theta direction",
                            variable=self._reverse_theta_var, font=("Arial", 8),
                            command=self._on_apply).pack(anchor="w")
+        add_tooltips_by_text(parent, _INSPECTOR_TIPS)
 
     def _on_type_changed(self, redraw: bool = True) -> None:
         is_plane = self._surface_type_var.get() == "plane"

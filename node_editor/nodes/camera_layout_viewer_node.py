@@ -10,6 +10,7 @@ import cv2
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip
 
 
 _HELP_TEXT = """\
@@ -435,6 +436,9 @@ class CameraLayoutViewerNode(BaseNode):
             ent.pack(side="left", fill="x", expand=True)
             ent.bind("<Return>", lambda e: self._on_settings_changed())
             ent.bind("<FocusOut>", lambda e: self._on_settings_changed())
+            add_tooltip(ent, "Draw a reference grid in the 3D view through these coordinates "
+                             "(e.g. the floor or the test object's plane), so you can judge "
+                             "where the cameras are. Display only.")
 
         tk.Label(grid_frame, textvariable=self._grid_status_var, font=("Arial", 8),
                  fg="#556", anchor="w", justify="left", wraplength=260).pack(fill="x", pady=(4, 0))

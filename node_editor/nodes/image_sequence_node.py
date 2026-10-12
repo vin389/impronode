@@ -6,6 +6,7 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import time
 import re
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import cv2
@@ -16,6 +17,7 @@ from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
 from node_editor.project_context import get_project_directory, get_project_file_path
 from node_editor.video_frame_reader import VideoFrameReader, VIDEO_EXTS
+from node_editor.tooltip import add_tooltip
 
 
 class ImageSequenceNode(BaseNode):
@@ -61,6 +63,16 @@ Image files -- the frames are a LIST of files (position 1 = first line).
     Edit selected list...  see / edit / reorder / delete lines of the
                        SELECTED files. With a selector, Apply makes those
                        lines the new list and clears the selector.
+                       "Move unselected ..." MOVES (not copies) the files
+                       of the full list that are not in the editor
+                       (skipped by the Selector or deleted there) to a
+                       folder you choose, e.g. to put unwanted images
+                       aside; then the editor's list is applied. Existing
+                       files in that folder are never overwritten.
+    Both dialogs: "Show index" adds a 1-based number column, and Full
+    paths / Relative paths (to the project file) / File names only choose
+    how each file is written. In the editor the view can be switched at any
+    time without losing edits; the index column is ignored on Apply.
   Wait for files that are not there yet:
     when a file in the list is missing (or still being written), wait and
     check again every N seconds until it can be read, instead of stopping.
@@ -82,11 +94,16 @@ Video file -- the frames are the frames of a video (mp4, avi, mov, mkv,
     The "Frame access" line shows whether seeking works for the file. If a
     jump will need slow in-order decoding of many frames, you are asked once
     per video. Playing / stepping forward is always fast.
-  Extract frames to image files...
-    writes the frames (or a range) as PNG/JPG files and can switch the
-    source to them: fastest random access, and nodes that need a file list
-    (e.g. Mesh Template Track, Chessboard Calibration via the 'files' pin)
-    can then use them. For a video source the 'files' output is empty.
+  Extract selected frames ...   (below the Selector box)
+    writes the frames selected by the Selector (all frames if it is
+    empty) as image files and can switch the source to them: fastest
+    random access, and nodes that need a file list (e.g. Mesh Template
+    Track, Chessboard Calibration via the 'files' pin) can then use them.
+    For a video source the 'files' output is empty. The number in each
+    file name is the video frame number (1 = first frame).
+    Quality (1-100) applies to the lossy types .jpg / .jpeg / .webp only;
+    .png, .bmp, .tif, ... are lossless and need none (the box is then
+    disabled). An unsupported file type is shown in red.
 
 Selector (both sources) -- use only some of the images / video frames.
     1:30, 61:90, 100:105   images 1-30, 61-90 and 100-105 (1-based,
@@ -139,6 +156,14 @@ Ctrl+H shows this help.
     _IMG_EXTS = {
         ".jpg", ".jpeg", ".png", ".bmp",
         ".tif", ".tiff", ".webp", ".ppm", ".pgm",
+    }
+
+    # Lossy output types and their OpenCV quality flag (1-100). The other
+    # types are lossless (PNG, BMP, TIFF, PPM/PGM): no quality setting.
+    _QUALITY_EXTS = {
+        ".jpg": cv2.IMWRITE_JPEG_QUALITY,
+        ".jpeg": cv2.IMWRITE_JPEG_QUALITY,
+        ".webp": cv2.IMWRITE_WEBP_QUALITY,
     }
 
     def __init__(self, node_id: str, canvas: tk.Canvas):
@@ -362,22 +387,47 @@ Ctrl+H shows this help.
         b = tk.Frame(p)
         b.pack(fill="x")
         tk.Label(b, text="Make the list:", font=small).pack(side="left")
-        for text, cmd in (("Folder...", self._browse_folder), ("Files...", self._browse_files),
-                          ("Numbered names...", self._open_pattern_dialog),
-                          ("Show full list", self._show_full_list),
-                          ("Edit selected list...", self._edit_file_list)):
-            tk.Button(b, text=text, font=small, command=cmd).pack(side="left", padx=(4, 0))
+        for text, cmd, tip in (
+                ("Folder...", self._browse_folder,
+                 "Use every image in a folder (sorted by name)."),
+                ("Files...", self._browse_files,
+                 "Pick the image files yourself (Ctrl / Shift-click for several)."),
+                ("Numbered names...", self._open_pattern_dialog,
+                 "Make the list from a name pattern such as img_%04d.png and a number range. "
+                 "The files do not have to exist yet -- useful when a camera or another program "
+                 "is still writing them."),
+                ("Show full list", self._show_full_list,
+                 "Show the whole list with 1-based numbers (the numbers the Selector uses). "
+                 "Read-only; text can be copied."),
+                ("Edit selected list...", self._edit_file_list,
+                 "Edit, reorder or delete the selected files' lines, or move unselected files "
+                 "to another folder.")):
+            btn = tk.Button(b, text=text, font=small, command=cmd)
+            btn.pack(side="left", padx=(4, 0))
+            add_tooltip(btn, tip)
         tk.Label(p, font=hint, fg="#666666", anchor="w", justify="left", wraplength=430, text=(
             "Folder / Files: images that exist now.  Numbered names: names such as img_%04d.png "
             "for a number range -- the files may be written later by another program.")).pack(
             fill="x", pady=(2, 0))
         w = tk.Frame(p)
         w.pack(fill="x", pady=(4, 0))
-        tk.Checkbutton(w, text="Wait for files that are not there yet", variable=self._wait_files_var,
-                       font=small, command=self._update_list_summary).pack(side="left")
+        wait_cb = tk.Checkbutton(w, text="Wait for files that are not there yet", variable=self._wait_files_var,
+                                 font=small, command=self._update_list_summary)
+        wait_cb.pack(side="left")
+        add_tooltip(wait_cb,
+                    "ON: when the next image file is missing (or still being written), the node "
+                    "waits and checks again until it can be read, then continues.\n"
+                    "OFF: a missing file cannot be read and the batch stops there.\n\n"
+                    "Why: in live or online measurements a camera or another program writes the "
+                    "images WHILE this project runs. Make the list with 'Numbered names...' for "
+                    "the files to come, turn this on, and each frame is processed as soon as its "
+                    "file is complete. Leave it off for images that already exist.")
         tk.Label(w, text="check every", font=small).pack(side="left", padx=(6, 2))
         self._pattern_wait_entry = tk.Entry(w, textvariable=self._pattern_wait_var, width=5, font=small)
         self._pattern_wait_entry.pack(side="left")
+        add_tooltip(self._pattern_wait_entry,
+                    "Seconds between checks for a missing file. Smaller = reacts sooner, "
+                    "larger = less disk activity (matters on network drives).")
         tk.Label(w, text="s", font=small).pack(side="left", padx=(2, 0))
 
         # Video panel.
@@ -388,8 +438,6 @@ Ctrl+H shows this help.
         vb = tk.Frame(v)
         vb.pack(fill="x")
         tk.Button(vb, text="Open video...", font=small, command=self._browse_video).pack(side="left")
-        tk.Button(vb, text="Extract frames to image files...", font=small,
-                  command=self._open_extract_dialog).pack(side="left", padx=(4, 0))
         tk.Label(v, textvariable=self._video_info_var, font=small, anchor="w", justify="left",
                  wraplength=430).pack(fill="x", pady=(4, 0))
         self._video_access_label = tk.Label(v, textvariable=self._video_access_var, font=small, anchor="w",
@@ -408,6 +456,11 @@ Ctrl+H shows this help.
         se.pack(side="left", fill="x", expand=True, padx=(4, 0))
         se.bind("<Return>", self._apply_selector)
         se.bind("<FocusOut>", self._apply_selector)
+        add_tooltip(se, "Use only some images / video frames, e.g. 1:30, 61:90, 100:105 "
+                        "(1-based, inclusive; also 1:100:5 for every 5th). Empty = all.\n"
+                        "Why: to skip unwanted frames (blurred, before the test started, ...). "
+                        "Everything after this -- Start / End / i, the outputs -- then counts "
+                        "the selected frames only. Press Enter to apply.")
         # Grey usage hint shown inside the empty box (Tk entries have no
         # placeholder); clicking it focuses the entry.
         placeholder = tk.Label(se, text="e.g.  1:30, 61:90, 100:105   (1-based, inclusive; empty = all)",
@@ -429,6 +482,16 @@ Ctrl+H shows this help.
         self._selector_info_label = tk.Label(sf, textvariable=self._selector_info_var, font=small,
                                              anchor="w", justify="left", wraplength=430)
         self._selector_info_label.pack(fill="x")
+        # Video only (shown / hidden by _on_source_change): it writes exactly
+        # the frames the Selector above selects.
+        self._extract_row = er = tk.Frame(sf)
+        extract_btn = tk.Button(er, text="Extract selected frames ...", font=small,
+                                command=self._open_extract_dialog)
+        extract_btn.pack(side="left", pady=(2, 0))
+        add_tooltip(extract_btn, "Save the frames selected above (all frames if the Selector is empty)\n"
+                              "as numbered image files (PNG, JPG, ...). Optionally use them as\n"
+                              "this node's source: fastest random access, and nodes that need a\n"
+                              "file list (e.g. Mesh Template Track) can use them.")
 
         # ── 2. Frames to send ─────────────────────────────────────────
         self._batch_frame = bf = tk.LabelFrame(top, text="2. Frames to send", padx=6, pady=4,
@@ -439,22 +502,35 @@ Ctrl+H shows this help.
                  font=hint, fg="#555555", wraplength=430, justify="left").grid(
             row=0, column=0, columnspan=6, sticky="w")
 
-        def entry(row_, col, label, var, key, width=6, padx=(0, 2)):
-            tk.Label(bf, text=label, font=small).grid(row=row_, column=col, sticky="w", padx=padx, pady=(4, 0))
+        def entry(row_, col, label, var, key, width=6, padx=(0, 2), tip=None):
+            lbl = tk.Label(bf, text=label, font=small)
+            lbl.grid(row=row_, column=col, sticky="w", padx=padx, pady=(4, 0))
             e = tk.Entry(bf, textvariable=var, width=width, justify="center", font=small)
             e.grid(row=row_, column=col + 1, sticky="w", pady=(4, 0))
             e.bind("<Return>", self._on_batch_range_commit)
             e.bind("<FocusOut>", self._on_batch_range_commit)
             self._loop_entries[key] = e
+            if tip:
+                add_tooltip(lbl, tip)
+                add_tooltip(e, tip)
 
         entry(1, 0, "Start:", self._batch_start_var, "start")
         entry(1, 2, "End:", self._batch_end_var, "end", padx=(10, 2))
-        entry(1, 4, "Step:", self._batch_step_var, "step", padx=(10, 2))
-        entry(2, 0, "Frame 1:", self._batch_frame_1_var, "frame_1", width=7)
-        entry(2, 2, "Frame 2:", self._batch_frame_2_var, "frame_2", width=7, padx=(10, 2))
+        entry(1, 4, "Step:", self._batch_step_var, "step", padx=(10, 2),
+              tip="How much i changes per step. 2 = every second frame; a negative Step runs "
+                  "backward (Start must then be larger than End).")
+        pair_tip = ("Which frame is sent on this output for loop index i: 'i' = the i-th frame, "
+                    "'i-1' / 'i+5' = a frame before / after it, a plain number = always that frame.\n"
+                    "Why two frames: displacement / tracking nodes compare a pair. Frame 1 = 1 and "
+                    "Frame 2 = i compares every frame with the first (reference) frame; i-1 and i "
+                    "compares each frame with the previous one.")
+        entry(2, 0, "Frame 1:", self._batch_frame_1_var, "frame_1", width=7, tip=pair_tip)
+        entry(2, 2, "Frame 2:", self._batch_frame_2_var, "frame_2", width=7, padx=(10, 2), tip=pair_tip)
         tk.Label(bf, text="i, i+N, i-N or a fixed number", font=hint, fg="#555555").grid(
             row=2, column=4, columnspan=2, sticky="w", padx=(10, 0), pady=(4, 0))
-        entry(3, 0, "Current i:", self._batch_current_var, "current")
+        entry(3, 0, "Current i:", self._batch_current_var, "current",
+              tip="The loop index that Current / Play sends next. Type a value to jump there; "
+                  "First / Prev / Next / Last change it.")
         tk.Label(bf, text="the step sent by Current / Play", font=hint, fg="#555555").grid(
             row=3, column=2, columnspan=4, sticky="w", padx=(10, 0), pady=(4, 0))
 
@@ -472,8 +548,17 @@ Ctrl+H shows this help.
         self._batch_play_btn = tk.Button(nav, textvariable=self._play_btn_var, command=self._toggle_play,
                                          font=("Arial", 8, "bold"), width=7)
         self._batch_play_btn.pack(side="left", padx=(6, 1))
-        tk.Spinbox(nav, from_=0.0001, to=1000.0, increment=0.1, textvariable=self._fps_var, width=7,
-                   font=small).pack(side="right", padx=2)
+        add_tooltip(self._batch_play_btn,
+                    "Send the loop from Current i to End, one step after another: at the FPS "
+                    "rate, or -- when the 'next' input pin is connected -- one step per trigger "
+                    "pulse, so a slow downstream node is never skipped.")
+        add_tooltip(self._batch_current_btn, "Send the pair for Current i again (e.g. after "
+                                             "changing a downstream setting).")
+        fps_box = tk.Spinbox(nav, from_=0.0001, to=1000.0, increment=0.1, textvariable=self._fps_var, width=7,
+                             font=small)
+        fps_box.pack(side="right", padx=2)
+        add_tooltip(fps_box, "Steps per second while playing (timer mode). Ignored when the "
+                             "'next' input pin is connected: then each trigger pulse sends one step.")
         tk.Label(nav, text="FPS:", font=small).pack(side="right", padx=(8, 0))
         tk.Label(bf, textvariable=self._batch_mode_var, font=small, fg="#356a49").grid(
             row=5, column=0, columnspan=6, sticky="w", pady=(4, 0))
@@ -1040,6 +1125,7 @@ Ctrl+H shows this help.
                 pass
             self._selector_placeholder_trace = None
         self._selector_frame = self._selector_entry = self._selector_info_label = None
+        self._extract_row = None
         super().close_inspector()
         self._pat_entry = None
         self._pattern_wait_entry = None
@@ -1083,6 +1169,12 @@ Ctrl+H shows this help.
                 panel.pack(fill="x")
             elif not show and panel.winfo_manager() == "pack":
                 panel.pack_forget()
+        row = getattr(self, "_extract_row", None)
+        if row is not None and row.winfo_exists():
+            if video and row.winfo_manager() != "pack":
+                row.pack(fill="x")
+            elif not video and row.winfo_manager() == "pack":
+                row.pack_forget()
         if not user:
             return
         self._stop_batch("ready")
@@ -1418,7 +1510,7 @@ Ctrl+H shows this help.
             f"To be sure it is exactly the right frame, the video will be decoded in order: "
             f"about {cost} frames, which can take a while.\n\n"
             f"Playing / Next (in order) is always fast. For frequent jumps use "
-            f"'Extract frames to image files'.\n\nThis message is shown once per video. Continue?",
+            f"'Extract selected frames ...'.\n\nThis message is shown once per video. Continue?",
             icon="warning", parent=self._dialog_parent())
 
     def _open_extract_dialog(self) -> None:
@@ -1429,67 +1521,132 @@ Ctrl+H shows this help.
             return
         stem = Path(r.path).stem
         top = tk.Toplevel(self._dialog_parent())
-        top.title("Extract video frames to image files")
+        top.title("Extract selected frames to image files")
         top.transient(self._dialog_parent())
         f = tk.Frame(top, padx=10, pady=8)
         f.pack(fill="both", expand=True)
         folder_var = tk.StringVar(value=str(Path(r.path).parent / f"{stem}_frames"))
         name_var = tk.StringVar(value=f"{stem}_%06d.png")
-        first_var = tk.StringVar(value="1")
-        last_var = tk.StringVar(value=str(r.count_known()))
-        step_var = tk.StringVar(value="1")
         quality_var = tk.StringVar(value="95")
+
+        # The frames to write = the Selector's frames (0-based source
+        # indices here; names and texts use 1-based frame numbers).
+        sel = self._selection()[0]
+        if sel is None:
+            which = f"All {r.count_known()} frames (the Selector is empty)"
+        else:
+            which = (f"{len(sel)} frames selected by the Selector: "
+                     f"{self._selector_applied}")
+        tk.Label(f, justify="left", anchor="w", wraplength=540, font=("Arial", 9, "bold"),
+                 fg="#2f3e5c", text=which).grid(row=0, column=0, columnspan=4, sticky="w")
         tk.Label(f, justify="left", anchor="w", wraplength=540, font=("Arial", 8), fg="#444444", text=(
-            "Frames are read IN ORDER (always exact). The number in each name is the video frame "
-            "number (1 = first frame). .png = lossless (recommended for measurements), .jpg = smaller "
-            "files.")).grid(row=0, column=0, columnspan=4, sticky="w")
-        tk.Label(f, text="Folder:").grid(row=1, column=0, sticky="w", pady=(8, 2))
-        tk.Entry(f, textvariable=folder_var, width=60).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(8, 2))
+            "To write other frames, change the Selector first. Frames are read IN ORDER (always "
+            "exact). The number in each file name is the video frame number (1 = first frame). "
+            ".png = lossless (recommended for measurements), .jpg = smaller files.")).grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        tk.Label(f, text="Folder:").grid(row=2, column=0, sticky="w", pady=(8, 2))
+        tk.Entry(f, textvariable=folder_var, width=60).grid(row=2, column=1, columnspan=2, sticky="ew", pady=(8, 2))
         tk.Button(f, text="...", command=lambda: folder_var.set(
-            filedialog.askdirectory(parent=top) or folder_var.get())).grid(row=1, column=3, padx=(4, 0), pady=(8, 2))
-        tk.Label(f, text="File names:").grid(row=2, column=0, sticky="w", pady=2)
-        tk.Entry(f, textvariable=name_var, width=36).grid(row=2, column=1, sticky="w", pady=2)
-        tk.Label(f, text="JPG quality:").grid(row=2, column=2, sticky="e", pady=2)
-        tk.Entry(f, textvariable=quality_var, width=5).grid(row=2, column=3, sticky="w", pady=2)
-        rr = tk.Frame(f)
-        rr.grid(row=3, column=0, columnspan=4, sticky="w", pady=2)
-        for label, var in (("Frames from:", first_var), ("to:", last_var), ("every:", step_var)):
-            tk.Label(rr, text=label).pack(side="left", padx=(0, 2))
-            tk.Entry(rr, textvariable=var, width=8).pack(side="left", padx=(0, 10))
+            filedialog.askdirectory(parent=top) or folder_var.get())).grid(row=2, column=3, padx=(4, 0), pady=(8, 2))
+        tk.Label(f, text="File names:").grid(row=3, column=0, sticky="w", pady=2)
+        name_entry = tk.Entry(f, textvariable=name_var, width=36)
+        name_entry.grid(row=3, column=1, sticky="w", pady=2)
+        quality_label = tk.Label(f, text="Quality (1-100):")
+        quality_label.grid(row=3, column=2, sticky="e", pady=2, padx=(8, 2))
+        quality_entry = tk.Entry(f, textvariable=quality_var, width=5)
+        quality_entry.grid(row=3, column=3, sticky="w", pady=2)
+        check_var = tk.StringVar(value="")
+        check_label = tk.Label(f, textvariable=check_var, anchor="w", justify="left", font=("Arial", 8),
+                               wraplength=540)
+        check_label.grid(row=4, column=0, columnspan=4, sticky="w")
         progress = tk.StringVar(value="")
         tk.Label(f, textvariable=progress, anchor="w", justify="left", font=("Arial", 8, "bold"),
-                 fg="#2f3e5c").grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 4))
+                 fg="#2f3e5c").grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 4))
         btns = tk.Frame(f)
-        btns.grid(row=5, column=0, columnspan=4, sticky="e")
+        btns.grid(row=6, column=0, columnspan=4, sticky="e")
         job = {"cancel": threading.Event(), "done": 0, "total": 0, "error": None,
                "finished": False, "paths": []}
 
-        def worker(abs_video, out_dir, pattern, first, last, step, quality):
+        def check(*_a) -> tuple[str, int] | None:
+            """Validate the name pattern and quality live: red text for an
+            unsupported file type / bad pattern; Quality only for lossy types.
+            Returns (pattern, quality) when everything is valid."""
+            pattern = name_var.get().strip()
+            ext = Path(pattern).suffix.lower()
+            lossy = ext in self._QUALITY_EXTS
+            problem = None
+            if ext not in self._IMG_EXTS:
+                problem = (f"Unsupported file type '{ext or '(none)'}'. Use one of: "
+                           f"{' '.join(sorted(self._IMG_EXTS))}")
+            else:
+                try:
+                    self._numbered_paths(pattern, 1, 1, 1)           # exactly one %d field
+                except ValueError as e:
+                    problem = str(e)
+            name_entry.configure(fg="#c62828" if problem else "#111111")
+            state = tk.NORMAL if lossy else tk.DISABLED
+            quality_entry.configure(state=state)
+            quality_label.configure(state=state)
+            quality = 0
+            if lossy and not problem:
+                try:
+                    quality = int(quality_var.get())
+                    if not 1 <= quality <= 100:
+                        raise ValueError
+                    quality_entry.configure(fg="#111111")
+                except ValueError:
+                    quality_entry.configure(fg="#c62828")
+                    problem = "Quality must be a whole number from 1 to 100."
+            if problem:
+                check_var.set(problem)
+                check_label.configure(fg="#c62828")
+                return None
+            check_var.set(f"{ext}: lossy, the quality applies." if lossy else
+                          f"{ext}: lossless -- no quality setting needed.")
+            check_label.configure(fg="#555555")
+            return pattern, quality
+
+        name_var.trace_add("write", check)
+        quality_var.trace_add("write", check)
+        check()
+
+        def worker(abs_video, out_dir, pattern, wanted, quality):
+            """wanted: 0-based frame indices in the order the list should
+            have (None = every frame); written once each, read in order."""
             try:
                 os.makedirs(out_dir, exist_ok=True)
                 cap = cv2.VideoCapture(abs_video)
-                wanted = set(range(first, last + 1, step))
-                job["total"] = len(wanted)
+                if wanted is not None:
+                    wanted = list(dict.fromkeys(wanted))           # drop repeats, keep order
+                    wanted_set = set(wanted)
+                    last = max(wanted) if wanted else -1
+                    job["total"] = len(wanted)
+                else:
+                    wanted_set, last = None, None
+                    job["total"] = r.count_known()
                 ext = Path(pattern).suffix.lower()
-                params = [cv2.IMWRITE_JPEG_QUALITY, quality] if ext in (".jpg", ".jpeg") else []
-                k = 0
-                while k < last and not job["cancel"].is_set():
-                    ok = cap.grab()
-                    if not ok:
+                params = [self._QUALITY_EXTS[ext], quality] if ext in self._QUALITY_EXTS else []
+                written: dict[int, str] = {}
+                k = -1                                             # 0-based index of the frame read
+                while (last is None or k < last) and not job["cancel"].is_set():
+                    if not cap.grab():
                         break
                     k += 1
-                    if k in wanted:
+                    if wanted_set is None or k in wanted_set:
                         ok, frame = cap.retrieve()
                         if not ok:
                             break
-                        out = os.path.join(out_dir, pattern % k)
+                        out = os.path.join(out_dir, pattern % (k + 1))   # 1-based in names
                         ok, buf = cv2.imencode(ext, frame, params)
                         if not ok:
                             raise IOError(f"cannot encode {out}")
                         buf.tofile(out)                      # also works for non-ASCII paths
-                        job["paths"].append(out)
+                        written[k] = out
                         job["done"] += 1
                 cap.release()
+                # The new list follows the Selector's order (video order for "all").
+                order = wanted if wanted is not None else sorted(written)
+                job["paths"] = [written[i] for i in order if i in written]
             except Exception as e:
                 job["error"] = f"{type(e).__name__}: {e}"
             finally:
@@ -1510,27 +1667,28 @@ Ctrl+H shows this help.
             progress.set(msg)
             if job["paths"] and messagebox.askyesno(
                     "Extract frames", f"{msg}\n\nUse these images as this node's source now?", parent=top):
+                # The new list IS the selection: clear the selector so all of
+                # it is used (it referred to video frame numbers anyway).
+                self._selector_applied = ""
+                self._selector_var.set("")
                 self._set_file_paths(job["paths"])
                 top.destroy()
 
         def start():
-            try:
-                pattern = name_var.get().strip()
-                self._numbered_paths(pattern, 1, 1, 1)           # validates the number field
-                first, last, step = int(first_var.get()), int(last_var.get()), int(step_var.get())
-                quality = max(1, min(100, int(quality_var.get())))
-                if Path(pattern).suffix.lower() not in self._IMG_EXTS:
-                    raise ValueError("File names must end with an image extension such as .png or .jpg.")
-                if not (1 <= first <= last) or step < 1:
-                    raise ValueError("Use 1 <= from <= to and every >= 1.")
-            except (ValueError, TypeError) as e:
-                progress.set(f"Not valid: {e}")
+            valid = check()
+            if valid is None:
+                progress.set("Correct the red field first.")
+                return
+            pattern, quality = valid
+            if sel is not None and not sel:
+                progress.set("The Selector selects no frames.")
                 return
             job.update(done=0, total=0, error=None, finished=False, paths=[])
             job["cancel"].clear()
             start_btn.configure(state=tk.DISABLED)
             threading.Thread(target=worker, daemon=True, args=(r.path, folder_var.get().strip(), pattern,
-                                                               first, last, step, quality)).start()
+                                                               None if sel is None else list(sel),
+                                                               quality)).start()
             poll()
         start_btn = tk.Button(btns, text="Extract", font=("Arial", 9, "bold"), command=start)
         start_btn.pack(side="left")
@@ -1576,6 +1734,104 @@ Ctrl+H shows this help.
             y = pointer_y - gap - height
         return max(0, x), max(0, y)
 
+    # ── list dialogs: what each line shows ────────────────────────
+    # Per-node view choice of each dialog (not saved in the project).
+    _LIST_VIEW_DEFAULTS = {"full": (True, "relative"), "edit": (False, "relative")}
+    _INDEX_RE = re.compile(r"^\s*\d+\t")
+
+    def _list_view_controls(self, win, key: str, render) -> None:
+        """'Show index' + Full paths / Relative paths / File names only.
+        render(show_index, mode) redraws the text; it may return False to
+        refuse a view, which then puts the controls back."""
+        views = self.__dict__.setdefault("_list_views", dict(self._LIST_VIEW_DEFAULTS))
+        show_index, mode = views[key]
+        index_var = tk.BooleanVar(master=win, value=show_index)
+        mode_var = tk.StringVar(master=win, value=mode)
+        row = tk.Frame(win)
+        row.pack(fill="x", padx=8, pady=(0, 4))
+        current = {"index": show_index, "mode": mode}
+
+        def changed():
+            if render(index_var.get(), mode_var.get()):
+                current.update(index=index_var.get(), mode=mode_var.get())
+                views[key] = (current["index"], current["mode"])
+            else:
+                index_var.set(current["index"])
+                mode_var.set(current["mode"])
+
+        tk.Checkbutton(row, text="Show index", variable=index_var, font=("Arial", 9),
+                       command=changed).pack(side="left")
+        tk.Label(row, text="   Show:", font=("Arial", 9)).pack(side="left")
+        for value, label in (("full", "Full paths"), ("relative", "Relative paths"),
+                             ("name", "File names only")):
+            tk.Radiobutton(row, text=label, value=value, variable=mode_var, font=("Arial", 9),
+                           command=changed).pack(side="left", padx=(6, 0))
+        if not render(show_index, mode):                # e.g. names became ambiguous
+            current["mode"] = "relative"
+            mode_var.set("relative")
+            render(show_index, "relative")
+
+    def _display_paths(self, paths: list[str], mode: str) -> list[str]:
+        """Stored paths as shown: absolute ('full'), relative to the project
+        file where possible ('relative') or the file name only ('name').
+        Converted once per folder (lists have thousands of files)."""
+        if mode == "name":
+            return [os.path.basename(p) for p in paths]
+        base = self._get_project_base()
+        if mode == "relative":
+            return self._normalize_paths(paths, base)
+        folders: dict[str, str] = {}
+        out = []
+        for p in paths:
+            folder, name = os.path.split(p)
+            if folder not in folders:
+                folders[folder] = os.path.dirname(self._to_absolute(os.path.join(folder, "x"), base))
+            out.append(os.path.join(folders[folder], name))
+        return out
+
+    def _format_list_lines(self, paths: list[str], show_index: bool, mode: str) -> str:
+        shown = self._display_paths(paths, mode)
+        if not show_index:
+            return "\n".join(shown)
+        width = len(str(len(shown)))
+        # A TAB after the number: it lines up, copies cleanly into a
+        # spreadsheet, and _parse_list_lines can strip it unambiguously.
+        return "\n".join(f"{k + 1:>{width}}\t{p}" for k, p in enumerate(shown))
+
+    @staticmethod
+    def _name_lookup(paths: list[str]) -> dict[str, str] | None:
+        """File name -> stored path, or None when one name occurs in two
+        different folders (file names alone would then be ambiguous)."""
+        lookup: dict[str, str] = {}
+        for p in paths:
+            name = os.path.normcase(os.path.basename(p))
+            if lookup.setdefault(name, p) != p and \
+                    os.path.normcase(os.path.dirname(lookup[name])) != os.path.normcase(os.path.dirname(p)):
+                return None
+        return lookup
+
+    def _parse_list_lines(self, text: str, show_index: bool, mode: str,
+                          names: dict[str, str], default_path: str) -> list[str]:
+        """Inverse of _format_list_lines for (edited) editor text: drop the
+        index column, and turn file-name-only lines back into paths -- a
+        known name -> its path; a new name -> the folder of the line above."""
+        out: list[str] = []
+        for line in text.splitlines():
+            if show_index:
+                line = self._INDEX_RE.sub("", line, count=1)
+            line = line.strip()
+            if not line:
+                continue
+            if mode == "name" and not re.search(r"[\\/]", line):
+                known = names.get(os.path.normcase(line))
+                if known is not None:
+                    line = known
+                else:
+                    folder = os.path.dirname(out[-1] if out else default_path)
+                    line = os.path.join(folder, line) if folder else line
+            out.append(line)
+        return out
+
     def _show_full_list(self) -> None:
         """Read-only view of the WHOLE list with 1-based numbers (what the
         selector refers to). Text can be selected and copied (Ctrl+C,
@@ -1598,32 +1854,37 @@ Ctrl+H shows this help.
         except tk.TclError:
             win.geometry("760x520")
         tk.Label(win, font=("Arial", 9), pady=4, text=(
-            "Number (1-based, as used by the Selector) and path. Read-only: select + Ctrl+C to copy."
+            "Index = 1-based number, as used by the Selector. Read-only: select + Ctrl+C to copy."
             + ("" if sel is None else "  Grey = not selected."))).pack()
         frame = tk.Frame(win)
-        frame.pack(fill="both", expand=True)
         txt = tk.Text(frame, font=("Courier", 9), wrap=tk.NONE)
+
+        def render(show_index: bool, mode: str) -> bool:
+            txt.delete("1.0", tk.END)
+            txt.insert("1.0", self._format_list_lines(self._file_paths, show_index, mode))
+            if sel is not None:
+                txt.tag_configure("unselected", foreground="#a0a0a0")
+                chosen = set(sel)
+                k = 0
+                while k < n:                       # tag runs of unselected lines, not single lines
+                    if k in chosen:
+                        k += 1
+                        continue
+                    j = k
+                    while j + 1 < n and (j + 1) not in chosen:
+                        j += 1
+                    txt.tag_add("unselected", f"{k + 1}.0", f"{j + 1}.end")
+                    k = j + 1
+            return True
+
+        self._list_view_controls(win, "full", render)
+        frame.pack(fill="both", expand=True)
         vsb = tk.Scrollbar(frame, orient="vertical", command=txt.yview)
         hsb = tk.Scrollbar(frame, orient="horizontal", command=txt.xview)
         txt.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         hsb.pack(side="bottom", fill="x")
         vsb.pack(side="right", fill="y")
         txt.pack(fill="both", expand=True)
-        width = len(str(n))
-        txt.insert("1.0", "\n".join(f"{k + 1:>{width}}  {p}" for k, p in enumerate(self._file_paths)))
-        if sel is not None:
-            txt.tag_configure("unselected", foreground="#a0a0a0")
-            chosen = set(sel)
-            k = 0
-            while k < n:                       # tag runs of unselected lines, not single lines
-                if k in chosen:
-                    k += 1
-                    continue
-                j = k
-                while j + 1 < n and (j + 1) not in chosen:
-                    j += 1
-                txt.tag_add("unselected", f"{k + 1}.0", f"{j + 1}.end")
-                k = j + 1
 
         # Read-only but still selectable / copyable: a disabled Text does
         # not take keyboard focus on every platform, so block edits instead.
@@ -1688,24 +1949,157 @@ Ctrl+H shows this help.
                 f"list and clears the selector -- the {len(self._file_paths) - len(selected)} "
                 f"unselected files are dropped from the list.")).pack(padx=8)
 
+        # The text is always re-read into real paths with the view it was
+        # drawn in (`shown`), then redrawn in the new view -- so edits survive
+        # a view change. File-name-only lines are resolved via `shown["names"]`.
         txt = tk.Text(win, font=("Courier", 9), wrap=tk.NONE)
+        shown = {"index": False, "mode": "relative", "names": {}, "drawn": False}
+
+        def read_back() -> list[str]:
+            return self._parse_list_lines(txt.get("1.0", tk.END), shown["index"], shown["mode"],
+                                          shown["names"], selected[0] if selected else "")
+
+        def render(show_index: bool, mode: str) -> bool:
+            paths = read_back() if shown["drawn"] else selected
+            names = self._name_lookup(paths)
+            if mode == "name" and names is None:
+                messagebox.showwarning(
+                    "File names only",
+                    "Some files with the same name are in different folders, so file names "
+                    "alone are ambiguous in this editor. Use full or relative paths.", parent=win)
+                return False
+            txt.delete("1.0", tk.END)
+            txt.insert("1.0", self._format_list_lines(paths, show_index, mode))
+            shown.update(index=show_index, mode=mode, names=names or {}, drawn=True)
+            return True
+
+        hint = tk.Label(win, font=("Arial", 8), fg="#555555", wraplength=660, justify="left", text=(
+            "Index = position in the selected list (= batch i); it is ignored on Apply. With "
+            "'File names only', a new name goes into the folder of the line above it."))
+        self._list_view_controls(win, "edit", render)
+        hint.pack(padx=8, anchor="w")
         vsb = tk.Scrollbar(win, orient="vertical",
                            command=txt.yview)
         hsb = tk.Scrollbar(win, orient="horizontal",
                            command=txt.xview)
         txt.configure(yscrollcommand=vsb.set,
                       xscrollcommand=hsb.set)
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(side="bottom", fill="x", pady=4)
         hsb.pack(side="bottom", fill="x")
         vsb.pack(side="right",  fill="y")
         txt.pack(fill="both", expand=True)
 
-        txt.insert("1.0", "\n".join(selected))
+        # ── Move unselected ... ──────────────────────────────────────
+        # "Unselected" = files of the FULL list that are not in this editor
+        # right now (skipped by the Selector, or deleted here). Re-counted
+        # (debounced) after every edit; the button is disabled at zero.
+        move = {"after": None, "busy": False, "files": []}
+
+        def unselected_files() -> list[tuple[str, str]]:
+            keep = {os.path.normcase(p) for p in self._display_paths(read_back(), "full")}
+            full = self._display_paths(self._file_paths, "full")
+            return [(stored, absp) for stored, absp in zip(self._file_paths, full)
+                    if os.path.normcase(absp) not in keep]
+
+        def recount():
+            move["after"] = None
+            if move["busy"] or not win.winfo_exists():
+                return
+            move["files"] = unselected_files()
+            move_btn.configure(state=tk.NORMAL if move["files"] else tk.DISABLED)
+
+        def on_modified(_e=None):
+            txt.edit_modified(False)                 # re-arm <<Modified>>
+            if move["after"] is not None:
+                win.after_cancel(move["after"])
+            move["after"] = win.after(300, recount)
+
+        def move_unselected():
+            recount()
+            files = move["files"]
+            if not files:
+                return
+            names = "\n".join(f"   {os.path.basename(a)}" for _s, a in files[:5])
+            more = f"\n   ... and {len(files) - 5} more" if len(files) > 5 else ""
+            if not messagebox.askokcancel(
+                    "Move Unselected Files",
+                    f"{len(files)} unselected file(s) will be MOVED (not copied) to the folder "
+                    f"you choose in the next step. They will no longer be in their current "
+                    f"folder.\n\n{names}{more}\n\n"
+                    f"Unselected files are files in the full list that are not in this editor "
+                    f"(skipped by the Selector, or deleted here).\n\n"
+                    f"After the move, the list in this editor is applied (as if you clicked "
+                    f"Apply). Files with the same name in the destination folder are not "
+                    f"overwritten; they are skipped.\n\nContinue?",
+                    icon="warning", default="cancel", parent=win):
+                return
+            dest = filedialog.askdirectory(title="Move unselected files to folder", parent=win)
+            if not dest:
+                return
+            dest = os.path.abspath(dest)
+            state = {"done": 0, "moved": 0, "missing": [], "exists": [], "same": 0,
+                     "errors": [], "finished": False}
+
+            def worker():
+                for _stored, src in files:
+                    try:
+                        if not os.path.isfile(src):
+                            state["missing"].append(src)
+                        elif os.path.normcase(os.path.dirname(os.path.abspath(src))) == os.path.normcase(dest):
+                            state["same"] += 1
+                        else:
+                            target = os.path.join(dest, os.path.basename(src))
+                            if os.path.exists(target):
+                                state["exists"].append(src)
+                            else:
+                                shutil.move(src, target)
+                                state["moved"] += 1
+                    except OSError as e:
+                        state["errors"].append(f"{os.path.basename(src)}: {e}")
+                    state["done"] += 1
+                state["finished"] = True
+
+            move["busy"] = True
+            for b in (move_btn, apply_btn, cancel_btn):
+                b.configure(state=tk.DISABLED)
+            win.protocol("WM_DELETE_WINDOW", lambda: None)   # no closing mid-move
+            threading.Thread(target=worker, daemon=True, name="move-unselected").start()
+
+            def poll():
+                if not state["finished"]:
+                    move_btn.configure(text=f"Moving {state['done']}/{len(files)} ...")
+                    win.after(100, poll)
+                    return
+                move["busy"] = False
+                win.protocol("WM_DELETE_WINDOW", win.destroy)
+                move_btn.configure(text="Move unselected ...")
+                for b in (apply_btn, cancel_btn):
+                    b.configure(state=tk.NORMAL)
+                lines = [f"Moved {state['moved']} of {len(files)} file(s) to:\n{dest}"]
+                if state["same"]:
+                    lines.append(f"{state['same']} already in that folder (left as they are).")
+                if state["exists"]:
+                    lines.append(f"{len(state['exists'])} skipped: a file with the same name "
+                                 f"already exists there.")
+                if state["missing"]:
+                    lines.append(f"{len(state['missing'])} skipped: not found.")
+                if state["errors"]:
+                    lines.append(f"{len(state['errors'])} failed:\n   " + "\n   ".join(state["errors"][:5]))
+                problems = state["exists"] or state["missing"] or state["errors"]
+                (messagebox.showwarning if problems else messagebox.showinfo)(
+                    "Move Unselected Files", "\n\n".join(lines), parent=win)
+                if state["moved"] or state["same"]:
+                    _apply()          # drop the moved files from the node's list
+                else:
+                    recount()
+            poll()
+
+        txt.bind("<<Modified>>", on_modified)
 
         def _apply():
             base = self._get_project_base()
-            lines = [l.strip()
-                     for l in txt.get("1.0", tk.END).splitlines()
-                     if l.strip()]
+            lines = read_back()
             # With "Wait for files" on, missing paths are expected (another
             # program may still write them); otherwise ask before applying.
             if not self._wait_files_var.get():
@@ -1728,14 +2122,19 @@ Ctrl+H shows this help.
             self._set_file_paths(lines, reset_batch=not preserve_batch)
             win.destroy()
 
-        btn_frame = tk.Frame(win)
-        btn_frame.pack(fill="x", pady=4)
-        tk.Button(btn_frame, text="Apply",
-                  command=_apply,
-                  font=("Arial", 9)).pack(side="right", padx=8)
-        tk.Button(btn_frame, text="Cancel",
-                  command=win.destroy,
-                  font=("Arial", 9)).pack(side="right")
+        apply_btn = tk.Button(btn_frame, text="Apply",
+                              command=_apply,
+                              font=("Arial", 9))
+        apply_btn.pack(side="right", padx=8)
+        cancel_btn = tk.Button(btn_frame, text="Cancel",
+                               command=win.destroy,
+                               font=("Arial", 9))
+        cancel_btn.pack(side="right")
+        move_btn = tk.Button(btn_frame, text="Move unselected ...", command=move_unselected,
+                             font=("Arial", 9), state=tk.DISABLED)
+        move_btn.pack(side="left", padx=8)
+        add_tooltip(move_btn, "Move unselected files to another folder")
+        recount()
 
     # ── file list management ──────────────────────────────────────
 

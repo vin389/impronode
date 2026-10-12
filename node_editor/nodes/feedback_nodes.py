@@ -5,6 +5,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.execution import ExecutionMode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 class ArrayFeedbackNode(BaseNode):
@@ -140,9 +141,12 @@ class ArrayFeedbackNode(BaseNode):
             wraplength=320,
         ).pack(fill="x")
 
-        tk.Button(parent, text="Reset To Init", command=self._request_reset).pack(
-            anchor="w", pady=(10, 6)
-        )
+        reset_btn = tk.Button(parent, text="Reset To Init", command=self._request_reset)
+        reset_btn.pack(anchor="w", pady=(10, 6))
+        add_tooltip(reset_btn,
+                    "Start the iteration over: the next pass outputs the 'init' array instead "
+                    "of the previous pass's 'current' value. Use it after changing the initial "
+                    "points, or when an iteration has drifted and should restart.")
 
         tk.Label(
             parent,

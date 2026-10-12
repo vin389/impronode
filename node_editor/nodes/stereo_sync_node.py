@@ -87,6 +87,7 @@ from scipy.optimize import minimize_scalar
 
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 NAN_FILL_CHOICES = ("linear", "cubic", "nearest", "none (exclude gaps)")
@@ -887,8 +888,18 @@ class StereoSyncNode(BaseNode):
             state="readonly", width=10,
         )
         scope_box.pack(side="left", padx=(4, 8))
-        tk.Button(action_row, text="Auto Align", command=self._on_auto_align_clicked).pack(side="left")
-        tk.Button(action_row, text="Refine", command=self._on_refine_clicked).pack(side="left", padx=(6, 0))
+        auto_btn = tk.Button(action_row, text="Auto Align", command=self._on_auto_align_clicked)
+        auto_btn.pack(side="left")
+        refine_btn = tk.Button(action_row, text="Refine", command=self._on_refine_clicked)
+        refine_btn.pack(side="left", padx=(6, 0))
+        add_tooltip(scope_box, "Which points Auto Align / Refine work on: only the selected "
+                               "point, or every point (each point gets its own time shift).")
+        add_tooltip(auto_btn, "Try a grid of time shifts over the t_shift range and keep, per "
+                              "point, the one with the smallest reprojection error. Finds the "
+                              "right region; follow with Refine.")
+        add_tooltip(refine_btn, "Optimise each point's time shift within the t_shift range to "
+                                "minimise the reprojection error, with sub-sample precision. "
+                                "Slower with many points.")
 
         apply_row = tk.Frame(left)
         apply_row.pack(fill="x", pady=(4, 0))
@@ -1325,6 +1336,10 @@ class StereoSyncNode(BaseNode):
         )
         nanfill_box.pack(side="left", padx=(4, 12))
         nanfill_box.bind("<<ComboboxSelected>>", lambda _e: self._on_pipeline_setting_changed())
+        add_tooltip(nanfill_box, "How gaps (NaN, e.g. a point lost by the tracker) in the image "
+                                 "tracks are filled before comparing the cameras: interpolated "
+                                 "linearly / smoothly, copied from the nearest sample, or left "
+                                 "out of the comparison.")
 
         tk.Label(row, text="Interp:").pack(side="left")
         self._insp_interp_var = tk.StringVar(value=self._interp_method)
@@ -1334,6 +1349,9 @@ class StereoSyncNode(BaseNode):
         )
         interp_box.pack(side="left", padx=(4, 12))
         interp_box.bind("<<ComboboxSelected>>", lambda _e: self._on_pipeline_setting_changed())
+        add_tooltip(interp_box, "How camera 2's track is evaluated between its own frames when "
+                                "it is shifted by a fraction of a frame. cubic = smoother, for "
+                                "smooth motion.")
 
         row2 = tk.Frame(parent)
         row2.pack(fill="x", pady=(4, 0))
@@ -1343,6 +1361,9 @@ class StereoSyncNode(BaseNode):
         excl_entry.pack(side="left", padx=(4, 0))
         excl_entry.bind("<Return>", lambda _e: self._on_pipeline_setting_changed())
         excl_entry.bind("<FocusOut>", lambda _e: self._on_pipeline_setting_changed())
+        add_tooltip(excl_entry, "Indices (0-based) of points to leave out entirely, e.g. "
+                                "badly tracked ones that would spoil the result. Press Enter "
+                                "to apply.")
 
     def _on_pipeline_setting_changed(self) -> None:
         # These settings change what gets computed for every point, so a
@@ -1367,6 +1388,9 @@ class StereoSyncNode(BaseNode):
         )
         agg_box.pack(side="left", padx=(4, 12))
         agg_box.bind("<<ComboboxSelected>>", lambda _e: self._on_cost_setting_changed())
+        add_tooltip(agg_box, "How the reprojection errors over time are combined into one "
+                             "number per point. median = robust to occasional bad frames; "
+                             "mean / rms = use every frame (rms weights large errors more).")
 
         tk.Label(row, text="Outlier threshold (px, blank = off):").pack(side="left")
         self._insp_outlier_var = tk.StringVar(
@@ -1376,6 +1400,9 @@ class StereoSyncNode(BaseNode):
         outlier_entry.pack(side="left", padx=(4, 0))
         outlier_entry.bind("<Return>", lambda _e: self._on_cost_setting_changed())
         outlier_entry.bind("<FocusOut>", lambda _e: self._on_cost_setting_changed())
+        add_tooltip(outlier_entry, "Ignore time samples whose reprojection error is larger "
+                                   "than this many pixels (e.g. tracking glitches). Blank = use "
+                                   "every sample.")
 
     def _on_cost_setting_changed(self) -> None:
         # These settings only change how the ALREADY-COMPUTED per-sample

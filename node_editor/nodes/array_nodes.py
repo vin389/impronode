@@ -8,6 +8,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip
 from node_editor.project_context import get_project_directory, get_project_file_path
 
 
@@ -79,15 +80,25 @@ class ArrayInputNode(BaseNode):
         dtype_cb = ttk.Combobox(parent, textvariable=self._dtype_var,
                                 values=self._DTYPES, width=10, state="readonly")
         dtype_cb.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        add_tooltip(dtype_cb, "Number type of the array. float64 = normal decimal numbers "
+                              "(default); float32 = half the memory, needed by some OpenCV "
+                              "functions; int / uint8 = whole numbers (e.g. images, indices).")
 
         shape_frame = tk.LabelFrame(parent, text="Array shape", font=("Arial", 9), padx=6, pady=6)
         shape_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 4))
 
         self._shape_mode_var.set("auto")
-        tk.Radiobutton(shape_frame, text="Auto reshape", variable=self._shape_mode_var,
-                       value="auto", command=self._refresh_shape_state, anchor="w").pack(anchor="w")
-        tk.Radiobutton(shape_frame, text="User defined shape", variable=self._shape_mode_var,
-                       value="manual", command=self._refresh_shape_state, anchor="w").pack(anchor="w")
+        auto_rb = tk.Radiobutton(shape_frame, text="Auto reshape", variable=self._shape_mode_var,
+                                 value="auto", command=self._refresh_shape_state, anchor="w")
+        auto_rb.pack(anchor="w")
+        manual_rb = tk.Radiobutton(shape_frame, text="User defined shape", variable=self._shape_mode_var,
+                                   value="manual", command=self._refresh_shape_state, anchor="w")
+        manual_rb.pack(anchor="w")
+        add_tooltip(auto_rb, "The shape follows the text: one row per line, one column per "
+                             "value; the result is always 2-D (one line = a 1 x N array).")
+        add_tooltip(manual_rb, "Reshape the typed numbers to the shape below, e.g. 3,3 for a "
+                               "3x3 matrix or 2,4,4 for a 3-D array. The number of values must "
+                               "match; -1 lets one dimension be computed.")
 
         shape_row = tk.Frame(shape_frame)
         shape_row.pack(fill="x", pady=(4, 0))

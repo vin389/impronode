@@ -26,6 +26,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinDef, PinSchema, PinType
+from node_editor.tooltip import add_tooltip
 
 
 class Ifft1DNode(BaseNode):
@@ -461,6 +462,11 @@ class Ifft1DNode(BaseNode):
         )
         parity_box.pack(side="left", padx=(4, 12))
         parity_box.bind("<<ComboboxSelected>>", lambda _e: self._on_parity_changed())
+        add_tooltip(parity_box, "A one-sided spectrum with m values can come from a signal of "
+                                "n = 2(m-1) samples (even) or n = 2m-1 samples (odd); the "
+                                "spectrum alone cannot tell which. Choose the parity of the "
+                                "ORIGINAL signal length, otherwise the result has one sample "
+                                "too many / too few and slightly wrong values.")
 
         self._insp_show_phase_var = tk.BooleanVar(value=self._show_phase)
         tk.Checkbutton(

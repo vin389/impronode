@@ -11,6 +11,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.tooltip import add_tooltip
 from node_editor.project_context import get_project_directory, get_project_file_path
 
 
@@ -281,6 +282,10 @@ class ArrayAccumulatorNode(BaseNode):
             textvariable=self._save_interval_var,
             width=7, font=("Arial", 9))
         self._interval_sb.pack(side="left", padx=(6, 0))
+        add_tooltip(self._interval_sb,
+                    "Write the CSV file to disk after every N new rows. 1 = safest (nothing "
+                    "is lost if the program stops), larger = less disk activity for long, "
+                    "fast runs. 'Save now' writes immediately.")
         tk.Label(
             interval_row,
             text="(1 = save after every write)",
