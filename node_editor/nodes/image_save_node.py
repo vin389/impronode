@@ -368,6 +368,42 @@ class ImageSaveNode(BaseNode):
             return [cv2.IMWRITE_PNG_COMPRESSION, int(self._png_compression_var.get())]
         return []
 
+    @staticmethod
+    def _write_atomic(abs_path: Path, out_img: np.ndarray, params: list) -> None:
+        """Write to ``<name>.tmp`` then rename onto ``abs_path``.
+
+        Other nodes polling for ``abs_path`` must never see a half-written
+        file. cv2.imwrite picks the codec from the extension, so a ``.tmp``
+        name would fail; encode in memory with the real extension instead
+        (this also sidesteps cv2.imwrite's non-ASCII path issue on Windows).
+        """
+        ok, buf = cv2.imencode(abs_path.suffix, out_img, params)
+        if not ok:
+            raise IOError(f"cv2.imencode failed for {abs_path}")
+        tmp_path = abs_path.with_name(abs_path.name + ".tmp")
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(buf.tobytes())
+                f.flush()
+                os.fsync(f.fileno())
+            # os.replace (not os.rename) overwrites an existing target on
+            # Windows too. On Windows it can still fail transiently if a
+            # reader / antivirus / indexer has the target open, so retry.
+            for attempt in range(20):
+                try:
+                    os.replace(tmp_path, abs_path)
+                    return
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(0.05)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def _warn_once(self, key: str, title: str, message: str) -> None:
         if self._last_warn_key == key:
             return
@@ -468,9 +504,7 @@ class ImageSaveNode(BaseNode):
 
                 out_img = self._prepare_for_imwrite(image)
                 params = self._imwrite_params(abs_path)
-                ok = cv2.imwrite(str(abs_path), out_img, params)
-                if not ok:
-                    raise IOError(f"cv2.imwrite returned False for {abs_path}")
+                self._write_atomic(abs_path, out_img, params)
 
                 self._saved_count += 1
                 self._status_var.set(

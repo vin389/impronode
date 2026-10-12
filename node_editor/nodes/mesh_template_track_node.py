@@ -48,7 +48,7 @@ Tracking strategy
 Coordinates
     Image coordinates follow OpenCV: (0, 0) is the CENTRE of the top-left
     pixel, u is horizontal, v is vertical. Mesh points are the centres of the
-    M x N cells spanned by the top-left / lower-right corners.
+    M x N cells spanned by the top-left / bottom-right corners.
 
 Result array
     points: (num_steps, M, N, 2) with the last axis (u, v) in pixels.
@@ -81,6 +81,7 @@ import cv2
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
 from PIL import Image, ImageTk
 
 from node_editor.base_node import BaseNode
@@ -122,6 +123,7 @@ SELECT_COLOR = "#ff3d00"
 DOT_COLOR = "#ffe000"
 SELECT_DOT_COLOR = "#ff2d2d"
 OUTSIDE_DOT_COLOR = "#ff8c00"
+PICK_COLOR = "#7CFC00"         # crosshair while picking a mesh corner
 INVALID_FG = "#c62828"
 NORMAL_FG = "#111111"
 
@@ -173,10 +175,15 @@ ALGORITHM
 MESH SETTINGS
   Cells        M N   cells along the vertical / horizontal image edge
   Top-left     u v   corner of the mesh (pixels)
-  Lower-right  u v   corner of the mesh (pixels; filled from the image size)
+  Bottom-right u v   corner of the mesh (pixels; filled from the image size)
   One tracking point sits at the centre of every cell. Numbers may be
   separated by space, tab or comma. Coordinates are OpenCV pixel coordinates:
   (0, 0) is the centre of the top-left pixel.
+  "Pick TL" / "Pick BR" pick a corner with the mouse in the image preview:
+  a crosshair follows the cursor and the corner field (and the mesh) updates
+  live with the integer pixel under it. Click to accept; Esc or right-click
+  cancels and restores the previous value. Dragging and wheel zoom still
+  work while picking.
   "Fit Mesh to Full Image" sets the corners to (0, 0) and
   (image width - 1, image height - 1), read from the currently loaded
   preview image.
@@ -465,7 +472,7 @@ class MeshTemplateTrackNode(BaseNode):
         ("_start_var", "start_frame", "start"), ("_end_var", "end_frame", "end"),
     )
     _FIELD_LABELS = {
-        "cells": "cells (M, N)", "tl": "top-left corner", "lr": "lower-right corner",
+        "cells": "cells (M, N)", "tl": "top-left corner", "lr": "bottom-right corner",
         "tmpl_w": "template width", "tmpl_h": "template height",
         "search_w": "search range width", "search_h": "search range height",
         "levels": "number of levels", "min_corr": "min. correlation",
@@ -489,9 +496,12 @@ class MeshTemplateTrackNode(BaseNode):
         self._outputs_dirty = True
         self._destroyed = False
         self._status_item = None
-        self._lr_auto = True           # lower-right follows the image size until edited
+        self._lr_auto = True           # bottom-right follows the image size until edited
         self._end_auto = True          # end frame follows the sequence length until edited
         self._sel = (0, 0)             # selected cell (row, column)
+        self._pick = None              # None, "tl" or "lr": corner being picked in the preview
+        self._pick_orig = None         # (text, lr_auto) restored when the pick is cancelled
+        self._pick_hover = None        # (u, v) integer pixel under the cursor while picking
         self._view_frame = 1
         self._preview_rgb = None
         self._image_size = None        # (W, H) of the full-resolution image
@@ -535,6 +545,7 @@ class MeshTemplateTrackNode(BaseNode):
         self._progress = None
         self._summary_label = self._result_label = None
         self._btn_run = self._btn_stop = self._btn_load = self._btn_save = None
+        self._btn_pick = {}                   # "tl"/"lr" -> Pick button
         self._help_popup = None
 
     @staticmethod
@@ -913,7 +924,7 @@ class MeshTemplateTrackNode(BaseNode):
         if bad:
             return "Fix the values shown in red."
         if cfg["lr"] is None:
-            return "Image size not known yet; enter the lower-right corner."
+            return "Image size not known yet; enter the bottom-right corner."
         if cfg["end"] is None:
             return "End frame is not set."
         return None
@@ -1254,7 +1265,12 @@ class MeshTemplateTrackNode(BaseNode):
         box.pack(fill="x", **pad)
         self._grid_row(box, 0, "Cells (M rows, N columns)", [(self._cells_var, "cells", 16)])
         self._grid_row(box, 1, "Top-left corner (u v)", [(self._tl_var, "tl", 16)])
-        self._grid_row(box, 2, "Lower-right corner (u v)", [(self._lr_var, "lr", 16)])
+        self._grid_row(box, 2, "Bottom-right corner (u v)", [(self._lr_var, "lr", 16)])
+        for row, which, text in ((1, "tl", "Pick TL"), (2, "lr", "Pick BR")):
+            btn = tk.Button(box, text=text, font=("Arial", 8), width=8,
+                            command=lambda w=which: self._start_pick(w))
+            btn.grid(row=row, column=2, sticky="w", padx=(4, 0), pady=2)
+            self._btn_pick[which] = btn
         tk.Button(box, text="Fit Mesh to Full Image", font=("Arial", 8),
                   command=self._on_fit_mesh_to_image).grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(2, 4))
@@ -1382,6 +1398,10 @@ class MeshTemplateTrackNode(BaseNode):
         self._c_img.bind("<MouseWheel>", self._on_img_wheel)
         self._c_img.bind("<Button-4>", self._on_img_wheel)
         self._c_img.bind("<Button-5>", self._on_img_wheel)
+        self._c_img.bind("<Motion>", self._on_img_motion)
+        self._c_img.bind("<Leave>", self._on_img_leave)
+        self._c_img.bind("<ButtonPress-3>", self._on_img_cancel_pick)
+        self._c_img.bind("<Escape>", self._on_img_cancel_pick)
 
         self._slider = tk.Scale(srow, from_=1, to=1, orient=tk.HORIZONTAL, resolution=1,
                                 showvalue=False, variable=self._slider_var,
@@ -1463,6 +1483,7 @@ class MeshTemplateTrackNode(BaseNode):
             c.delete("all")
             self._photo, self._photo_key = None, None
             self._draw_overlay(c, ox, oy, s)
+            self._draw_pick_cursor(c, ox, oy, s, cw, ch)
             return
 
         # Screen position of the crop's edges, from the same full-res mapping.
@@ -1484,6 +1505,38 @@ class MeshTemplateTrackNode(BaseNode):
             c.delete("overlay")
 
         self._draw_overlay(c, ox, oy, s)
+        self._draw_pick_cursor(c, ox, oy, s, cw, ch)
+
+    def _draw_pick_cursor(self, c, ox, oy, s, cw, ch) -> None:
+        """Crosshair + hint while a corner is being picked (tagged 'overlay'
+        so the next redraw removes it like the rest of the overlay)."""
+        if self._pick is None:
+            return
+        name = "top-left" if self._pick == "tl" else "bottom-right"
+        hint = f"Picking {name} corner: click to accept, Esc / right-click to cancel"
+        c.create_text(9, ch - 7, anchor="sw", fill="#000000", text=hint, tags="overlay")
+        c.create_text(8, ch - 8, anchor="sw", fill=PICK_COLOR, text=hint, tags="overlay")
+        if self._pick_hover is None:
+            return
+        u, v = self._pick_hover
+        x, y = ox + (u + 0.5) * s, oy + (v + 0.5) * s       # centre of the picked pixel
+        for dash, color, width in (((), "#000000", 3), ((6, 4), PICK_COLOR, 1)):
+            c.create_line(0, y, cw, y, fill=color, width=width, dash=dash, tags="overlay")
+            c.create_line(x, 0, x, ch, fill=color, width=width, dash=dash, tags="overlay")
+        if s >= 4:                                           # zoomed in: outline the whole pixel
+            h = s / 2.0
+            c.create_rectangle(x - h, y - h, x + h, y + h, outline=PICK_COLOR, width=2, tags="overlay")
+        else:
+            c.create_oval(x - 4, y - 4, x + 4, y + 4, outline=PICK_COLOR, width=2, tags="overlay")
+        label = f"{'TL' if self._pick == 'tl' else 'BR'} ({u}, {v})"
+        # Keep the label inside the canvas: flip to the other side near the edges.
+        lx, anchor_x = (x + 10, "w") if x + 140 < cw else (x - 10, "e")
+        ly, anchor_y = (y - 10, "s") if y - 30 > 0 else (y + 10, "n")
+        anchor = {("s", "w"): "sw", ("s", "e"): "se", ("n", "w"): "nw", ("n", "e"): "ne"}[(anchor_y, anchor_x)]
+        c.create_text(lx + 1, ly + 1, anchor=anchor, fill="#000000", text=label,
+                      font=("Arial", 10, "bold"), tags="overlay")
+        c.create_text(lx, ly, anchor=anchor, fill=PICK_COLOR, text=label,
+                      font=("Arial", 10, "bold"), tags="overlay")
 
     def _draw_overlay(self, c, ox, oy, s) -> None:
         cfg, bad = self._collect()
@@ -1586,8 +1639,92 @@ class MeshTemplateTrackNode(BaseNode):
         pan = self._img_pan
         was_drag = pan["active"] and pan["moved"]
         pan["active"] = False
-        if not was_drag:
+        if was_drag:
+            self._update_pick(event)
+        elif self._pick is not None:
+            self._update_pick(event)
+            self._end_pick(commit=True)
+        else:
             self._select_cell_at(event)
+
+    # -- Corner picking ("Pick TL" / "Pick BR") ------------------------------
+    # While picking, the hovered pixel is written straight into the corner
+    # field, so the field and the mesh overlay follow the mouse; a plain
+    # click keeps it, Esc / right-click restores the value from before.
+
+    def _start_pick(self, which: str) -> None:
+        if self._pick == which:
+            return
+        if self._pick is not None:
+            self._end_pick(commit=False)
+        if self._image_size is None or self._c_img is None:
+            messagebox.showwarning("Pick corner", "No image is loaded yet to pick from.",
+                                   parent=self._dlg_parent())
+            return
+        var = self._tl_var if which == "tl" else self._lr_var
+        self._pick, self._pick_orig, self._pick_hover = which, (var.get(), self._lr_auto), None
+        if which == "lr":
+            self._lr_auto = False      # keep a new preview image from overwriting the pick
+        for btn in self._btn_pick.values():
+            self._set_state(btn, tk.DISABLED)
+        try:
+            self._c_img.configure(cursor="crosshair")
+            self._c_img.focus_set()    # receive <Escape>
+        except tk.TclError:
+            pass
+        self._redraw_preview()
+
+    def _end_pick(self, commit: bool) -> None:
+        which = self._pick
+        if which is None:
+            return
+        orig_text, orig_auto = self._pick_orig
+        self._pick, self._pick_orig, self._pick_hover = None, None, None
+        var = self._tl_var if which == "tl" else self._lr_var
+        if not commit:
+            self._set_var(var, orig_text)
+            if which == "lr":
+                self._lr_auto = orig_auto
+        for btn in self._btn_pick.values():
+            self._set_state(btn, tk.NORMAL)
+        if self._c_img is not None:
+            try:
+                self._c_img.configure(cursor="")
+            except tk.TclError:
+                pass
+        self._redraw_preview()
+
+    def _update_pick(self, event) -> None:
+        """Map the cursor to the integer FULL-resolution pixel under it (the
+        view (ox, oy, s) is in full-res pixels, see _redraw_preview) and
+        write it into the corner field being picked."""
+        if self._pick is None or self._view is None or self._image_size is None:
+            return
+        ox, oy, s = self._view
+        W, H = self._image_size
+        # Pixel u spans screen [ox + u*s, ox + (u+1)*s), so floor() gives the
+        # pixel under the cursor; clamp to the image.
+        u = min(max(int(math.floor((event.x - ox) / s)), 0), W - 1)
+        v = min(max(int(math.floor((event.y - oy) / s)), 0), H - 1)
+        if self._pick_hover == (u, v):
+            return
+        self._pick_hover = (u, v)
+        var = self._tl_var if self._pick == "tl" else self._lr_var
+        self._set_var(var, f"{u} {v}")   # -> _validate_all -> redraws mesh + crosshair
+
+    def _on_img_cancel_pick(self, _event) -> str | None:
+        if self._pick is None:
+            return None
+        self._end_pick(commit=False)
+        return "break"                     # don't let Esc also reach window-level bindings
+
+    def _on_img_motion(self, event) -> None:
+        self._update_pick(event)
+
+    def _on_img_leave(self, _event) -> None:
+        if self._pick is not None and self._pick_hover is not None:
+            self._pick_hover = None        # hide the crosshair; the field keeps the last value
+            self._redraw_preview()
 
     def _on_img_wheel(self, event) -> str | None:
         """Zoom the image preview, anchored on the point under the cursor
@@ -1609,6 +1746,7 @@ class MeshTemplateTrackNode(BaseNode):
         self._img_view = (new_ox, new_oy, new_s)
         self._img_user_view = True
         self._redraw_preview()
+        self._update_pick(event)                     # another pixel may now be under the cursor
         return "break"
 
     def _on_reset_img_view(self) -> None:
@@ -1734,7 +1872,14 @@ class MeshTemplateTrackNode(BaseNode):
                     ax.axvline(self._view_frame, color="#888888", linestyle="--", linewidth=1)
                 valid = int(np.isfinite(xy[:, 0]).sum())
                 ax.set_title(f"cell (row {i + 1}, col {j + 1}); valid {valid}/{n} frames", fontsize=8)
-                ax.set_xlabel("frame", fontsize=8)
+                # Frame numbers are 1-based. Without this, matplotlib's 5% x
+                # margin pads the axis to below frame 1 and labels a "0" tick
+                # (and fractional ticks for short runs), which reads as 0-based.
+                ax.set_xmargin(0)
+                ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+                if n == 1:
+                    ax.set_xlim(frames[0] - 0.5, frames[0] + 0.5)
+                ax.set_xlabel("frame (1-based)", fontsize=8)
                 ax.set_ylabel("displacement (px)", fontsize=8)
                 ax.tick_params(labelsize=8)
                 ax.grid(True, alpha=0.3)
@@ -1770,9 +1915,9 @@ class MeshTemplateTrackNode(BaseNode):
         self._set_var(self._update_template_var, False)
 
     def _on_fit_mesh_to_image(self) -> None:
-        """Set the mesh to span the whole image: top-left (0, 0), lower-right
+        """Set the mesh to span the whole image: top-left (0, 0), bottom-right
         (W-1, H-1), where (W, H) is the size of the currently loaded preview
-        image. Also re-enables lower-right's "auto-fit to image size" mode,
+        image. Also re-enables bottom-right's "auto-fit to image size" mode,
         so it keeps tracking the image size afterwards for as long as it is
         not edited by hand -- the same behaviour a fresh node starts with.
         """
@@ -2180,6 +2325,7 @@ class MeshTemplateTrackNode(BaseNode):
             except tk.TclError:
                 pass
         self._cancel_after("_preview_debounce_id")
+        self._end_pick(commit=False)  # an unfinished pick restores the corner
         super().close_inspector()
         self._reset_widget_refs()     # widgets are gone; a running job keeps going
 

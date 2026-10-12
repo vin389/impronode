@@ -56,7 +56,11 @@ Image files -- the frames are a LIST of files (position 1 = first line).
                        img_0001.png ... img_0500.png. The files do NOT have
                        to exist yet (another program may still write them).
                        %d = plain number, %04d = 4 digits with leading zeros.
-    Edit list...       see / edit / reorder / delete lines of the list.
+    Show full list     read-only view of the whole list with 1-based numbers
+                       (select + Ctrl+C to copy; unselected lines are grey).
+    Edit selected list...  see / edit / reorder / delete lines of the
+                       SELECTED files. With a selector, Apply makes those
+                       lines the new list and clears the selector.
   Wait for files that are not there yet:
     when a file in the list is missing (or still being written), wait and
     check again every N seconds until it can be read, instead of stopping.
@@ -83,6 +87,22 @@ Video file -- the frames are the frames of a video (mp4, avi, mov, mkv,
     source to them: fastest random access, and nodes that need a file list
     (e.g. Mesh Template Track, Chessboard Calibration via the 'files' pin)
     can then use them. For a video source the 'files' output is empty.
+
+Selector (both sources) -- use only some of the images / video frames.
+    1:30, 61:90, 100:105   images 1-30, 61-90 and 100-105 (1-based,
+                           inclusive): 30 + 30 + 6 = 66 images.
+    7                      a single image.
+    1:100:5                every 5th image of 1..100.
+    200:  /  :50           from 200 to the last  /  from the first to 50.
+  Separate items with commas or spaces; they are used in the order given.
+  Empty = all images. Press Enter (or leave the box) to apply; the line
+  below shows how many are selected. Numbers beyond the last image are
+  ignored (and reported).
+  After applying, EVERYTHING else works on the selected images only, as if
+  they were the whole sequence: Start / End / i / Frame 1 / Frame 2, the
+  index pins and the index / count / files outputs all count 1..66 in the
+  example ('files' lists the 66 selected files). "Now sending" shows
+  "#k: name" = position k in the selection, then the file / video frame.
 
 2. FRAMES TO SEND (batch)
 -------------------------
@@ -195,6 +215,18 @@ Ctrl+H shows this help.
         self._video_panel = None
         self._video_access_label = None
         self._help_popup = None
+        # Selector: which source frames are used ("1:30, 61:90"; empty = all).
+        # _selector_var is the entry text; _selector_applied is the text in
+        # effect (applied on Enter / leaving the box) -- a plain str, since
+        # the frame-read worker threads map positions through it.
+        self._selector_var = tk.StringVar(value="")
+        self._selector_applied = ""
+        self._selector_info_var = tk.StringVar(value="")
+        self._selector_cache = None          # ((text, source total), (map | None, dropped))
+        self._selector_frame = None
+        self._selector_entry = None
+        self._selector_info_label = None
+        self._selector_var.trace_add("write", lambda *_a: self._update_selector_info())
         self._pattern_var = tk.StringVar(value="/images/DCIM%04d.JPG")
         self._start_var = tk.StringVar(value="0")
         self._end_var = tk.StringVar(value="100")
@@ -332,7 +364,8 @@ Ctrl+H shows this help.
         tk.Label(b, text="Make the list:", font=small).pack(side="left")
         for text, cmd in (("Folder...", self._browse_folder), ("Files...", self._browse_files),
                           ("Numbered names...", self._open_pattern_dialog),
-                          ("Edit list...", self._edit_file_list)):
+                          ("Show full list", self._show_full_list),
+                          ("Edit selected list...", self._edit_file_list)):
             tk.Button(b, text=text, font=small, command=cmd).pack(side="left", padx=(4, 0))
         tk.Label(p, font=hint, fg="#666666", anchor="w", justify="left", wraplength=430, text=(
             "Folder / Files: images that exist now.  Numbered names: names such as img_%04d.png "
@@ -362,6 +395,40 @@ Ctrl+H shows this help.
         self._video_access_label = tk.Label(v, textvariable=self._video_access_var, font=small, anchor="w",
                                             justify="left", wraplength=430)
         self._video_access_label.pack(fill="x")
+
+        # Selector (both sources). The panels above are re-packed BEFORE
+        # this frame when the source changes (see _on_source_change).
+        sf = tk.Frame(src)
+        self._selector_frame = sf
+        sf.pack(fill="x", side="bottom", pady=(6, 0))
+        srow = tk.Frame(sf)
+        srow.pack(fill="x")
+        tk.Label(srow, text="Selector:", font=small).pack(side="left")
+        self._selector_entry = se = tk.Entry(srow, textvariable=self._selector_var, font=small)
+        se.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        se.bind("<Return>", self._apply_selector)
+        se.bind("<FocusOut>", self._apply_selector)
+        # Grey usage hint shown inside the empty box (Tk entries have no
+        # placeholder); clicking it focuses the entry.
+        placeholder = tk.Label(se, text="e.g.  1:30, 61:90, 100:105   (1-based, inclusive; empty = all)",
+                               font=hint, fg="#9a9a9a", bg="white", anchor="w", cursor="xterm")
+        placeholder.bind("<Button-1>", lambda _e: se.focus_set())
+
+        def _toggle_placeholder(*_a):
+            try:
+                if self._selector_var.get() or se.focus_get() is se:
+                    placeholder.place_forget()
+                else:
+                    placeholder.place(x=2, rely=0.5, anchor="w", relwidth=0.97)
+            except (tk.TclError, KeyError):
+                pass
+        se.bind("<FocusIn>", _toggle_placeholder, add="+")
+        se.bind("<FocusOut>", _toggle_placeholder, add="+")
+        self._selector_placeholder_trace = self._selector_var.trace_add("write", _toggle_placeholder)
+        _toggle_placeholder()
+        self._selector_info_label = tk.Label(sf, textvariable=self._selector_info_var, font=small,
+                                             anchor="w", justify="left", wraplength=430)
+        self._selector_info_label.pack(fill="x")
 
         # ── 2. Frames to send ─────────────────────────────────────────
         self._batch_frame = bf = tk.LabelFrame(top, text="2. Frames to send", padx=6, pady=4,
@@ -461,12 +528,168 @@ Ctrl+H shows this help.
     def _is_video(self) -> bool:
         return hasattr(self, "_source_var") and self._source_var.get() == "video"
 
-    def _frame_total(self) -> int:
-        """Number of frames of the current source (list length / video frames)."""
+    # ── selector ──────────────────────────────────────────────────
+    # Two index spaces:
+    #   source index   -- 0-based position in the FULL list / video;
+    #   position       -- 0-based position in the SELECTED frames.
+    # Everything the user and downstream nodes see (batch Start/End/i,
+    # index pins, 'count', 'files', _current_index, the frame caches) is in
+    # positions; only the actual frame reads map a position to its source
+    # index (_src_index). With an empty selector the two are identical.
+
+    def _source_total(self) -> int:
+        """Number of frames of the whole source (list length / video frames)."""
         if self._is_video():
             reader = getattr(self, "_video_reader", None)
             return reader.count_known() if reader is not None else 0
         return len(getattr(self, "_file_paths", []))
+
+    def _frame_total(self) -> int:
+        """Number of SELECTED frames -- the frames the batch loops over."""
+        sel = self._selection()[0]
+        return self._source_total() if sel is None else len(sel)
+
+    @staticmethod
+    def _parse_selector(text: str, total: int) -> tuple[list[int] | None, int]:
+        """'1:30, 61:90, 100' (1-based, inclusive) -> (0-based source indices
+        in the given order, number of requested indices beyond `total` that
+        were dropped). Also 'a:b:step', 'a:' (to the last) and ':b' (from
+        the first). Empty text -> (None, 0) = everything.
+        Raises ValueError for malformed text."""
+        text = re.sub(r"\s*:\s*", ":", (text or "").strip())
+        if not text:
+            return None, 0
+        out: list[int] = []
+        dropped = 0
+        for token in re.split(r"[,;\s]+", text):
+            if not token:
+                continue
+            m = re.fullmatch(r"(\d*)(?::(\d*)(?::(\d+))?)?", token)
+            if m is None or token in (":", "::"):
+                raise ValueError(f"'{token}' is not a number or a range a:b")
+            a_s, b_s, step_s = m.groups()
+            is_range = ":" in token
+            if not is_range:
+                a = b = int(a_s)
+            else:
+                a = int(a_s) if a_s else 1
+                b = int(b_s) if b_s else max(total, a)
+            step = int(step_s) if step_s else 1
+            if a < 1 or b < 1:
+                raise ValueError(f"'{token}': numbers start at 1")
+            if step < 1:
+                raise ValueError(f"'{token}': step must be 1 or more")
+            if a > b:
+                raise ValueError(f"'{token}': the first number is larger than the last")
+            requested = (b - a) // step + 1
+            stop = min(b, total)              # never build a huge range past the source
+            if a <= stop:
+                kept = range(a - 1, stop, step)
+                out.extend(kept)
+                dropped += requested - len(kept)
+            else:
+                dropped += requested
+        return out, dropped
+
+    def _selection(self) -> tuple[list[int] | None, int]:
+        """(source indices of the selected frames or None for all, dropped)
+        for the APPLIED selector; cached per (text, source total). Touches no
+        Tk variable, so frame-read worker threads may call it."""
+        text = getattr(self, "_selector_applied", "")
+        if not text:
+            return None, 0
+        key = (text, self._source_total())
+        cache = self._selector_cache
+        if cache is None or cache[0] != key:
+            try:
+                value = self._parse_selector(text, key[1])
+            except ValueError:
+                value = (None, 0)             # cannot happen: only valid text is applied
+            cache = self._selector_cache = (key, value)
+        return cache[1]
+
+    def _src_index(self, position: int) -> int:
+        """Source index of a 0-based position in the selected frames."""
+        sel = self._selection()[0]
+        if sel is None:
+            return position
+        return sel[position] if 0 <= position < len(sel) else -1
+
+    def _update_selector_info(self) -> None:
+        """'66 images are selected' -- for the text being typed (live), or an
+        error; applied on Enter / leaving the box."""
+        unit = "frames" if self._is_video() else "images"
+        total = self._source_total()
+        typed = self._selector_var.get()
+        color = "#2f3e5c"
+        try:
+            sel, dropped = self._parse_selector(typed, total)
+        except ValueError as e:
+            current = self._frame_total()
+            text = (f"Invalid selector: {e}.  Still using the previous selection "
+                    f"({current} {unit}).")
+            color = "#c62828"
+        else:
+            n = total if sel is None else len(sel)
+            text = f"{n} {unit} are selected" + ("" if sel is None else f"  (of {total})")
+            if dropped:
+                text += f"\n{dropped} requested numbers are beyond the last ({total}) and are ignored."
+                color = "#b36b00"
+            if typed.strip() != self._selector_applied.strip():
+                text += "   -- press Enter to apply"
+        self._selector_info_var.set(text)
+        label = getattr(self, "_selector_info_label", None)
+        if label is not None:
+            try:
+                label.configure(fg=color)
+            except tk.TclError:
+                pass
+        entry = getattr(self, "_selector_entry", None)
+        if entry is not None:
+            try:
+                entry.configure(fg="#c62828" if color == "#c62828" else "#111111")
+            except tk.TclError:
+                pass
+
+    def _apply_selector(self, _event=None) -> None:
+        """Make the typed selector the one in effect (if valid and changed):
+        the batch then runs over the selected frames, i = 1 .. count."""
+        typed = self._selector_var.get().strip()
+        if typed == self._selector_applied:
+            self._update_selector_info()
+            return
+        try:
+            self._parse_selector(typed, self._source_total())
+        except ValueError:
+            self._update_selector_info()          # shows the error; keep the old selection
+            return
+        self._set_selector(typed, emit=True)
+
+    def _set_selector(self, text: str, *, emit: bool) -> None:
+        self._selector_applied = text.strip()
+        if self._selector_var.get().strip() != self._selector_applied:
+            self._selector_var.set(self._selector_applied)
+        self._invalidate_frame_cache()            # positions now mean other frames
+        self._stop_batch("ready")
+        n = self._frame_total()
+        # Keep Step and the Frame 1 / Frame 2 expressions; the loop restarts
+        # over the new selection.
+        self._batch_start_var.set("1")
+        self._batch_end_var.set(str(max(1, n)))
+        self._batch_current_var.set("1")
+        self._current_index = 0
+        self._update_selector_info()
+        self._refresh_current_file_display()
+        if emit and n and self._validate_loop_fields():
+            self._emit_batch_frames(1)
+
+    def _invalidate_frame_cache(self) -> None:
+        """Forget decoded frames: their positions refer to an old list /
+        selection, and _emit_batch_frames re-uses frames by position."""
+        self._batch_fetch_token += 1
+        self._last_frame, self._last_frame_index = None, -1
+        self._last_frame_1, self._last_frame_1_index = None, -1
+        self._last_frame_2, self._last_frame_2_index = None, -1
 
     def _validate_loop_fields(self, *_args) -> bool:
         """Show valid loop values in black and invalid values in red."""
@@ -809,6 +1032,14 @@ Ctrl+H shows this help.
             _resolve("frame_2", frame_2_index)
 
     def close_inspector(self) -> None:
+        trace_id = getattr(self, "_selector_placeholder_trace", None)
+        if trace_id is not None:
+            try:
+                self._selector_var.trace_remove("write", trace_id)
+            except tk.TclError:
+                pass
+            self._selector_placeholder_trace = None
+        self._selector_frame = self._selector_entry = self._selector_info_label = None
         super().close_inspector()
         self._pat_entry = None
         self._pattern_wait_entry = None
@@ -844,6 +1075,7 @@ Ctrl+H shows this help.
         """Show the panel of the selected source. user=True (radio button):
         restart the batch for the new source and send its first pair."""
         video = self._is_video()
+        self._update_selector_info()          # "images" <-> "frames", other total
         for panel, show in ((self._images_panel, not video), (self._video_panel, video)):
             if panel is None or not panel.winfo_exists():
                 continue
@@ -896,6 +1128,8 @@ Ctrl+H shows this help.
     def _update_list_summary(self) -> None:
         """'523 images: a.png ... b.png / in <folder> / all exist' (or how
         many are missing and whether the node waits for them)."""
+        if not self._is_video():
+            self._update_selector_info()
         n = len(self._file_paths)
         if not n:
             self._list_summary_var.set(
@@ -1088,11 +1322,12 @@ Ctrl+H shows this help.
                 messagebox.showerror("Open video", f"{e}", parent=self._dialog_parent())
             return False
         self._video_reader = reader
+        self._invalidate_frame_cache()
         self._video_path_var.set(self._to_relative(abs_path, base))
         self._source_var.set("video")
         self._on_source_change(user=False)
         if reset_batch:
-            self._reset_batch_defaults(reader.count_known())
+            self._reset_batch_defaults(self._frame_total())
         # Count the frames exactly + fingerprint them, in the background.
         threading.Thread(target=reader.build_index, daemon=True, name="video-index").start()
         self._poll_video_index(reader)
@@ -1110,9 +1345,14 @@ Ctrl+H shows this help.
             exact = reader.frame_count
             if exact is not None and exact != reader.reported_count:
                 # The header's count was wrong: an End that meant "the last
-                # frame" follows the exact count.
-                if self._batch_end_var.get().strip() == str(reader.reported_count):
-                    self._batch_end_var.set(str(exact))
+                # (selected) frame" follows the exact count.
+                try:
+                    old_sel = self._parse_selector(self._selector_applied, reader.reported_count)[0]
+                except ValueError:
+                    old_sel = None
+                old_n = reader.reported_count if old_sel is None else len(old_sel)
+                if self._batch_end_var.get().strip() == str(old_n):
+                    self._batch_end_var.set(str(self._frame_total()))
             self._validate_loop_fields()
             return
         try:
@@ -1121,6 +1361,8 @@ Ctrl+H shows this help.
             pass
 
     def _update_video_labels(self) -> None:
+        if self._is_video():
+            self._update_selector_info()      # the frame count grows while indexing
         r = self._video_reader
         if r is None:
             self._video_name_var.set("No video. Use Open video...")
@@ -1162,7 +1404,9 @@ Ctrl+H shows this help.
         for var in (self._batch_frame_1_var, self._batch_frame_2_var):
             expr = self._parse_batch_expression(var.get())
             if expr is not None:
-                cost = max(cost, r.slow_cost(self._expression_frame_number(expr, loop_index) - 1))
+                src = self._src_index(self._expression_frame_number(expr, loop_index) - 1)
+                if src >= 0:
+                    cost = max(cost, r.slow_cost(src))
         if cost <= r.SLOW_WARN_FRAMES or r.path in self._video_warned:
             return True
         self._video_warned.add(r.path)
@@ -1332,6 +1576,80 @@ Ctrl+H shows this help.
             y = pointer_y - gap - height
         return max(0, x), max(0, y)
 
+    def _show_full_list(self) -> None:
+        """Read-only view of the WHOLE list with 1-based numbers (what the
+        selector refers to). Text can be selected and copied (Ctrl+C,
+        Ctrl+A); unselected lines are greyed out."""
+        if not self._file_paths:
+            messagebox.showinfo(
+                "Full List",
+                "The list is empty. Make it with Folder..., Files... or Numbered names... first.",
+                parent=self._dialog_parent())
+            return
+        n = len(self._file_paths)
+        sel = self._selection()[0]
+        win = tk.Toplevel()
+        win.title(f"Full List ({n} images" + ("" if sel is None else f", {len(sel)} selected") + ")")
+        try:
+            px, py = win.winfo_pointerxy()
+            x, y = self._popup_position_near_pointer(
+                px, py, 760, 520, win.winfo_screenwidth(), win.winfo_screenheight())
+            win.geometry(f"760x520+{x}+{y}")
+        except tk.TclError:
+            win.geometry("760x520")
+        tk.Label(win, font=("Arial", 9), pady=4, text=(
+            "Number (1-based, as used by the Selector) and path. Read-only: select + Ctrl+C to copy."
+            + ("" if sel is None else "  Grey = not selected."))).pack()
+        frame = tk.Frame(win)
+        frame.pack(fill="both", expand=True)
+        txt = tk.Text(frame, font=("Courier", 9), wrap=tk.NONE)
+        vsb = tk.Scrollbar(frame, orient="vertical", command=txt.yview)
+        hsb = tk.Scrollbar(frame, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        hsb.pack(side="bottom", fill="x")
+        vsb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        width = len(str(n))
+        txt.insert("1.0", "\n".join(f"{k + 1:>{width}}  {p}" for k, p in enumerate(self._file_paths)))
+        if sel is not None:
+            txt.tag_configure("unselected", foreground="#a0a0a0")
+            chosen = set(sel)
+            k = 0
+            while k < n:                       # tag runs of unselected lines, not single lines
+                if k in chosen:
+                    k += 1
+                    continue
+                j = k
+                while j + 1 < n and (j + 1) not in chosen:
+                    j += 1
+                txt.tag_add("unselected", f"{k + 1}.0", f"{j + 1}.end")
+                k = j + 1
+
+        # Read-only but still selectable / copyable: a disabled Text does
+        # not take keyboard focus on every platform, so block edits instead.
+        def _block(event):
+            ctrl = bool(event.state & 0x4)
+            if ctrl and event.keysym.lower() in ("c", "a", "insert", "home", "end"):
+                return None
+            if event.keysym in ("Left", "Right", "Up", "Down", "Prior", "Next", "Home", "End",
+                                "Shift_L", "Shift_R", "Control_L", "Control_R"):
+                return None
+            return "break"
+
+        def _select_all(_e):
+            txt.tag_add("sel", "1.0", "end-1c")
+            return "break"
+        txt.bind("<Key>", _block)
+        for seq in ("<<Paste>>", "<<Cut>>", "<<Clear>>", "<<PasteSelection>>"):
+            txt.bind(seq, lambda _e: "break")
+        txt.bind("<Control-a>", _select_all)
+        txt.bind("<Control-A>", _select_all)
+        txt.focus_set()
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(fill="x", pady=4)
+        tk.Button(btn_frame, text="Close", command=win.destroy, font=("Arial", 9)).pack(side="right", padx=8)
+        win.bind("<Escape>", lambda _e: win.destroy())
+
     def _edit_file_list(self, *, preserve_batch: bool = False) -> None:
         """
         Open a popup text editor showing the current file list,
@@ -1342,13 +1660,16 @@ Ctrl+H shows this help.
         """
         if not self._file_paths:
             messagebox.showinfo(
-                "Edit File List",
+                "Edit Selected List",
                 "The list is empty. Make it with Folder..., Files... or Numbered names... first.",
                 parent=self._dialog_parent())
             return
 
+        selected = self._selected_file_paths()
+        has_selector = self._selection()[0] is not None
         win = tk.Toplevel()
-        win.title("Edit File List")
+        win.title("Edit Selected List" + (f" ({len(selected)} of {len(self._file_paths)})"
+                                          if has_selector else f" ({len(selected)})"))
         try:
             px, py = win.winfo_pointerxy()
             x, y = self._popup_position_near_pointer(
@@ -1361,6 +1682,11 @@ Ctrl+H shows this help.
                  text="One file path per line. "
                       "Paths relative to project file or absolute.",
                  font=("Arial", 9), pady=4).pack()
+        if has_selector:
+            tk.Label(win, fg="#b36b00", font=("Arial", 8), wraplength=660, justify="left", text=(
+                f"Only the {len(selected)} SELECTED files are shown. Apply makes these lines the new "
+                f"list and clears the selector -- the {len(self._file_paths) - len(selected)} "
+                f"unselected files are dropped from the list.")).pack(padx=8)
 
         txt = tk.Text(win, font=("Courier", 9), wrap=tk.NONE)
         vsb = tk.Scrollbar(win, orient="vertical",
@@ -1373,7 +1699,7 @@ Ctrl+H shows this help.
         vsb.pack(side="right",  fill="y")
         txt.pack(fill="both", expand=True)
 
-        txt.insert("1.0", "\n".join(self._file_paths))
+        txt.insert("1.0", "\n".join(selected))
 
         def _apply():
             base = self._get_project_base()
@@ -1395,6 +1721,10 @@ Ctrl+H shows this help.
                             f"{sample}{more}\n\n"
                             f"Apply anyway?"):
                         return
+            if has_selector:
+                # The edited lines ARE the selection now: every line is used.
+                self._selector_applied = ""
+                self._selector_var.set("")
             self._set_file_paths(lines, reset_batch=not preserve_batch)
             win.destroy()
 
@@ -1418,11 +1748,14 @@ Ctrl+H shows this help.
 
         self._file_paths    = normalized
         self._current_index = 0
+        self._invalidate_frame_cache()
         self._stop_batch("ready")
         self._source_var.set("images")
         self._on_source_change(user=False)
 
-        n = len(normalized)
+        # The selector (if any) applies to the new list too.
+        n = self._frame_total()
+        self._update_selector_info()
         if reset_batch:
             # Default pair 1 / i: frame 1 is the first frame, frame 2 runs over
             # every frame, so End is the last frame.
@@ -1432,8 +1765,8 @@ Ctrl+H shows this help.
         self._slider_var.set(0)
         self._count_var.set(f"/ {n}")
         self._info_var.set(
-            f"{n} files  "
-            f"{Path(normalized[0]).name} ... {Path(normalized[-1]).name}" if n else "no files")
+            f"{len(normalized)} files  "
+            f"{Path(normalized[0]).name} ... {Path(normalized[-1]).name}" if normalized else "no files")
         self._update_list_summary()
         self._idx_var.set("1")
         self._fname_var.set("")
@@ -1459,23 +1792,31 @@ Ctrl+H shows this help.
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     def _frame_label(self, index: int) -> str:
-        """Display name of a position: file name, or 'frame k  (t s)' for a video."""
+        """Display name of a position: file name, or 'frame k  (t s)' for a
+        video (k = the frame number in the whole video)."""
+        src = self._src_index(index)
+        if src < 0:
+            return ""
+        prefix = "" if self._selection()[0] is None else f"#{index + 1}: "
         if self._is_video():
             r = self._video_reader
-            t = r.time_of(index) if r is not None else None
-            return f"frame {index + 1}" + (f"  (t = {t:.3f} s)" if t is not None else "")
-        if 0 <= index < len(self._file_paths):
-            return Path(self._file_paths[index]).name
+            t = r.time_of(src) if r is not None else None
+            return f"{prefix}frame {src + 1}" + (f"  (t = {t:.3f} s)" if t is not None else "")
+        if src < len(self._file_paths):
+            return prefix + Path(self._file_paths[src]).name
         return ""
 
     def _read_index_once(self, index: int):
         """Decode one position now (any thread). None if it cannot be read."""
+        src = self._src_index(index)
+        if src < 0:
+            return None
         if self._is_video():
             reader = self._video_reader
-            return reader.read(index) if reader is not None else None
-        if not (0 <= index < len(self._file_paths)):
+            return reader.read(src) if reader is not None else None
+        if src >= len(self._file_paths):
             return None
-        return self._decode_frame(self._to_absolute(self._file_paths[index], self._get_project_base()))
+        return self._decode_frame(self._to_absolute(self._file_paths[src], self._get_project_base()))
 
     def _request_decode(self, index: int) -> None:
         total = self._frame_total()
@@ -1918,6 +2259,7 @@ Ctrl+H shows this help.
         finished being generated yet; in Folder mode it is a one-shot decode.
         """
         token = self._batch_fetch_token
+        src = self._src_index(index)
 
         def _cancelled() -> bool:
             return self._destroyed or self._batch_fetch_token != token
@@ -1926,9 +2268,12 @@ Ctrl+H shows this help.
             reader = self._video_reader
 
             def _task():
-                return reader.read(index) if reader is not None else None
+                return reader.read(src) if reader is not None and src >= 0 else None
+        elif not (0 <= src < len(self._file_paths)):
+            def _task():
+                return None
         else:
-            abs_path = self._to_absolute(self._file_paths[index], self._get_project_base())
+            abs_path = self._to_absolute(self._file_paths[src], self._get_project_base())
             waits = self._waits_for_files()
             try:
                 wait_s = float(self._pattern_wait_var.get())
@@ -2036,19 +2381,28 @@ Ctrl+H shows this help.
         return get_project_directory()
 
     def _absolute_file_paths(self) -> list[str]:
-        """Return the full file list as absolute paths, same order as the inspector's file list.
+        """Return the SELECTED files as absolute paths, in selection order
+        (all files, in list order, when the selector is empty) -- so that
+        'files', 'count' and the index pins describe the same sequence.
 
         Called on every frame emit, so the converted list is cached and only
-        rebuilt when the file list or the project folder changes."""
+        rebuilt when the file list, the selection or the project folder changes."""
         if self._is_video():
             return []                      # a video has no file list
         base = self._get_project_base()
-        key = (str(base), tuple(self._file_paths))
+        key = (str(base), tuple(self._file_paths), self._selector_applied)
         cache = getattr(self, "_abs_paths_cache", None)
         if cache is None or cache[0] != key:
-            cache = (key, [self._to_absolute(p, base) for p in self._file_paths])
+            sel = self._selection()[0]
+            paths = self._file_paths if sel is None else [self._file_paths[k] for k in sel]
+            cache = (key, [self._to_absolute(p, base) for p in paths])
             self._abs_paths_cache = cache
         return list(cache[1])
+
+    def _selected_file_paths(self) -> list[str]:
+        """Stored (project-relative) paths of the selected files, in order."""
+        sel = self._selection()[0]
+        return list(self._file_paths) if sel is None else [self._file_paths[k] for k in sel]
 
     def get_help_text(self) -> str:
         return self.HELP_TEXT
@@ -2180,6 +2534,7 @@ Ctrl+H shows this help.
             "batch_current": self._batch_current_var.get(),
             "batch_frame_1": self._batch_frame_1_var.get(),
             "batch_frame_2": self._batch_frame_2_var.get(),
+            "selector":      self._selector_applied,
         }
 
     def set_params(self, params: dict) -> None:
@@ -2214,6 +2569,18 @@ Ctrl+H shows this help.
             self._fps_var.set(str(fps))
         except (TypeError, ValueError):
             self._fps_var.set("5")
+
+        # The selector is set BEFORE the source is loaded, so the frames
+        # emitted while loading are already the selected ones. A text that
+        # no longer parses (should not happen) falls back to "all".
+        selector = str(params.get("selector", "") or "").strip()
+        try:
+            self._parse_selector(selector, 0)
+        except ValueError:
+            selector = ""
+        self._selector_applied = selector
+        self._selector_var.set(selector)
+        self._invalidate_frame_cache()
 
         # A video source: open it (the batch fields are restored below).
         if source == "video":
