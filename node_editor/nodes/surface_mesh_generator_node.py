@@ -29,9 +29,88 @@ over that surface to seed tracking, interpolation, or strain analysis.
 INPUT PINS
 ----------
 points   ARRAY (optional)
-    (np, 3) array of measured 3D world points. Minimum 3 for a plane,
-    5 for a cylinder (see MINIMUM POINTS below). If this pin is not
-    connected, the inspector's text box is used instead.
+    (np, 3) array of measured 3D world points (also accepted: (np, 1, 3),
+    or a flat array whose length is a multiple of 3). Minimum 3 for a
+    plane, 5 for a cylinder (see MINIMUM POINTS below). Whether the pin
+    or the inspector's text box is used is chosen under "Use first"
+    (see GIVEN POINTS).
+
+GIVEN POINTS
+------------
+The given points are a few MEASURED 3D points (x, y, z in world units)
+that lie on the real surface -- e.g. surveyed targets or triangulated
+markers. The node fits the surface through ALL of them, then builds the
+mesh on the fitted surface. The points do not need to be in any order,
+but SOME of them also define the mesh coordinates (a1, a2), chosen by
+their 0-based index under Parameterization:
+
+  Plane
+    Origin point   ->  (a1, a2) = (0, 0)
+    X-axis point   ->  lies on the +a1 axis: (a1, 0), where a1 is its
+                       distance from the origin (measured in the plane)
+    +Y side point  ->  lies on the +a2 side (a2 > 0). Optional (-1): the
+                       sign of a2 is then whatever the fit gives.
+    Give 3+ points, well spread, not all on one line (4+ recommended).
+
+  Cylinder
+    Origin point   ->  (a1, a2) = (0 deg, 0): it defines theta = 0 AND
+                       height 0.
+    Height (a2) runs along the "approximate +height vector" (refined by
+    the fit into the real axis direction). Theta (a1, degrees) increases
+    COUNTER-CLOCKWISE when looking from the +height end back down the
+    axis; "Reverse theta" makes it clockwise.
+    Give 5+ points (8+ recommended), spread around the arc AND along the
+    height -- points on a single ring or a single straight line do not
+    determine a cylinder.
+
+Inspector, "Given points" group:
+  Use first      Pin points  or  Text box points. The other source is the
+                 fallback, used only when the first one has no points.
+                 The line below says which one is used and how many points
+                 each has. (Projects saved before this option: Pin first.)
+  Text box       editable, one point per line: "x y z" or "x, y, z";
+                 lines starting with # are ignored; lines that are not 3
+                 numbers are skipped and counted.
+  Pin points     read-only list of what arrives on the pin: select and
+                 Ctrl+C (Ctrl+A selects all), "Copy all", or "Copy to text
+                 box" to edit a copy there.
+  Press Apply after editing the text box or the indices.
+
+EXAMPLES
+--------
+Example 1 -- Plane: a wall 3000 x 2000 (mm) standing in the world X-Z
+plane. Text box (4 corners):
+    0     0  0        # point 0: bottom-left
+    3000  0  0        # point 1: bottom-right
+    3000  0  2000     # point 2: top-right
+    0     0  2000     # point 3: top-left
+  Surface type Plane; Origin point 0, X-axis point 1, +Y side point 3.
+  Result: vx = (1, 0, 0) (along the bottom edge), vy = (0, 0, 1) (up),
+  normal vz = (0, -1, 0). The points map to (a1, a2) =
+    0: (0, 0)   1: (3000, 0)   2: (3000, 2000)   3: (0, 2000).
+  Mesh: a1 0..3000 with M = 31, a2 0..2000 with N = 21 -> a 31 x 21 grid
+  with 100 mm spacing (interval 100). Without the +Y side point, a2 could
+  come out as 0..-2000 instead (the fit's normal sign is arbitrary).
+
+Example 2 -- Cylinder: a column of radius 500 (mm) whose axis is the
+world Z axis; 8 points on a quarter of its surface, every 30 degrees at
+heights 0 and 1000:
+    500      0        0       # point 0: theta 0, bottom
+    433.013  250      0
+    250      433.013  0
+    0        500      0       # theta 90, bottom
+    500      0        1000    # theta 0, top
+    433.013  250      1000
+    250      433.013  1000
+    0        500      1000
+  Surface type Cylinder; Origin point 0; approximate +height vector
+  0 0 1. Result: R = 500, axis vz = (0, 0, 1); theta runs from +X toward
+  +Y. The points map to (a1 deg, a2) = (0, 0) (30, 0) (60, 0) (90, 0)
+  (0, 1000) (30, 1000) (60, 1000) (90, 1000). With "Reverse theta" the
+  angles become 0, -30, -60, -90.
+  Mesh: a1 0..90 deg with M = 91 (1 deg = arc 8.727 mm), a2 0..1000 with
+  N = 21 -> 91 x 21 points. "Auto-fit ranges" sets these spans (plus a
+  small margin) from the given points automatically.
 
 OUTPUT PINS
 -----------
@@ -162,6 +241,30 @@ KEYBOARD SHORTCUT
 -----------------
 Ctrl-H / Ctrl-h -- show this help window.
 """
+
+_POINTS_DESC = {
+    "plane": (
+        "PLANE: give at least 3 points (x y z) that lie on the surface, well spread and "
+        "not all on one line (4 or more recommended). A plane is fitted through all of "
+        "them; each point's distance to it is its error.\n"
+        "  - Origin point  -> (a1, a2) = (0, 0)\n"
+        "  - X-axis point  -> on the +a1 axis: (a1, 0), a1 = its distance from the origin\n"
+        "  - +Y side point -> on the +a2 side (optional; otherwise the +a2 side is arbitrary)\n"
+        "Example (a wall): 0 bottom-left, 1 bottom-right, 2 top-right, 3 top-left; "
+        "origin 0, X-axis 1, +Y side 3  ->  0:(0,0)  1:(W,0)  2:(W,H)  3:(0,H)."
+    ),
+    "cylinder": (
+        "CYLINDER: give at least 5 points (x y z) on the curved surface (8 or more "
+        "recommended), spread around the arc AND along the height. An axis and radius R "
+        "are fitted through all of them.\n"
+        "  - Origin point -> (a1, a2) = (0 deg, 0): it defines theta = 0 and height 0\n"
+        "  - a2 = height along the 'approximate +height vector' (below)\n"
+        "  - a1 = theta in degrees, increasing counter-clockwise seen from the +height "
+        "end (Reverse theta flips it)\n"
+        "Example (column R=500, axis +Z): points every 30 deg at two heights; origin = the "
+        "point at the start of the arc, bottom  ->  (0,0) (30,0) ... (90,1000)."
+    ),
+}
 
 _COMMON_COLORS = [
     "red", "green", "blue", "black", "orange",
@@ -495,6 +598,8 @@ class SurfaceMeshGeneratorNode(BaseNode):
         self._a2_interval_var = tk.StringVar(value="")
         self._range_syncing = False
         self._range_surface_type = "plane"
+        for var in (self._origin_idx_var, self._xaxis_idx_var, self._yside_idx_var):
+            var.trace_add("write", lambda *_a: self._update_points_desc())
         self._dtype_var = tk.StringVar(value="float64")
         self._mem_override_var = tk.BooleanVar(value=False)
 
@@ -517,6 +622,18 @@ class SurfaceMeshGeneratorNode(BaseNode):
         self._points_text = ""
         self._points_widget: tk.Text | None = None
         self._points_from_pin = False
+        # Which source wins when both have points: "pin" (default, the old
+        # behaviour) or "text". The other one is the fallback.
+        self._points_priority_var = tk.StringVar(value="pin")
+        self._pin_points = None                  # last (np,3) array from the pin, or None
+        self._pin_error = ""
+        self._points_source = ""                 # "pin" / "text" / "" -- what the fit used
+        self._source_var = tk.StringVar(value="")
+        self._pin_info_var = tk.StringVar(value="")
+        self._roles_var = tk.StringVar(value="")
+        self._desc_var = tk.StringVar(value="")
+        self._pin_widget: tk.Text | None = None
+        self._points_priority_var.trace_add("write", lambda *_a: self._on_apply())
 
         self._status_var = tk.StringVar(value="waiting for points")
         self._fit_var = tk.StringVar(value="")
@@ -614,16 +731,63 @@ class SurfaceMeshGeneratorNode(BaseNode):
                            command=self._on_type_changed).pack(anchor="w")
 
         # ── given points ──────────────────────────────────────────
-        pf = tk.LabelFrame(inner, text="Given points (pin overrides text box)",
+        pf = tk.LabelFrame(inner, text="Given points  (measured 3D points on the surface)",
                            font=("Arial", 9), **pad)
         pf.pack(fill="x", **pad)
-        tk.Label(pf, text="One point per line:  x y z   or   x,y,z",
-                 font=("Arial", 7), fg="#888888").pack(anchor="w")
-        self._points_widget = tk.Text(pf, height=6, font=("Courier", 8), wrap=tk.NONE)
+        # What the points are for, for the selected surface type.
+        wrap_labels = [
+            tk.Label(pf, textvariable=self._desc_var, font=("Arial", 8), fg="#24452c",
+                     justify="left", anchor="w", wraplength=300),
+            tk.Label(pf, textvariable=self._roles_var, font=("Arial", 8, "bold"), fg="#1c5528",
+                     justify="left", anchor="w", wraplength=300)]
+        wrap_labels[0].pack(fill="x")
+        wrap_labels[1].pack(fill="x", pady=(3, 0))
+
+        # Which source is used.
+        src = tk.Frame(pf)
+        src.pack(fill="x", pady=(6, 0))
+        tk.Label(src, text="Use first:", font=("Arial", 8, "bold")).pack(side="left")
+        for value, label in (("pin", "Pin points"), ("text", "Text box points")):
+            tk.Radiobutton(src, text=label, value=value, variable=self._points_priority_var,
+                           font=("Arial", 8)).pack(side="left")
+        wrap_labels.append(tk.Label(pf, text="The other source is used only when the first one has no points.",
+                                    font=("Arial", 7), fg="#888888", justify="left", anchor="w",
+                                    wraplength=300))
+        wrap_labels[-1].pack(fill="x")
+        wrap_labels.append(tk.Label(pf, textvariable=self._source_var, font=("Arial", 8, "bold"),
+                                    fg="#885500", justify="left", anchor="w", wraplength=300))
+        wrap_labels[-1].pack(fill="x", pady=(2, 0))
+
+        # Text box points (editable).
+        wrap_labels.append(tk.Label(pf, text="Text box points  (editable; one 'x y z' or 'x, y, z' "
+                                             "per line, # = comment)",
+                                    font=("Arial", 8), justify="left", anchor="w", wraplength=300))
+        wrap_labels[-1].pack(fill="x", pady=(6, 0))
+        self._points_widget = tk.Text(pf, height=6, font=("Courier", 8), wrap=tk.NONE, undo=True)
         self._points_widget.pack(fill="x")
         self._points_widget.insert("1.0", self._points_text)
-        if self._points_from_pin:
-            self._points_widget.configure(state="disabled")
+
+        # Pin points (read-only, copyable).
+        wrap_labels.append(tk.Label(pf, textvariable=self._pin_info_var, font=("Arial", 8),
+                                    justify="left", anchor="w", wraplength=300))
+        wrap_labels[-1].pack(fill="x", pady=(6, 0))
+        prow = tk.Frame(pf)
+        prow.pack(fill="x")
+        tk.Button(prow, text="Copy all", font=("Arial", 7),
+                  command=self._copy_pin_points).pack(side="left")
+        tk.Button(prow, text="Copy to text box", font=("Arial", 7),
+                  command=self._copy_pin_to_text).pack(side="left", padx=(3, 0))
+        self._pin_widget = tk.Text(pf, height=5, font=("Courier", 8), wrap=tk.NONE,
+                                   bg="#f2f4f2", fg="#355535", cursor="arrow")
+        self._pin_widget.pack(fill="x")
+        self._pin_widget.bind("<Button-1>", lambda _e: self._pin_widget.focus_set())
+        self._pin_widget.bind("<Control-a>", lambda _e: (
+            self._pin_widget.tag_add("sel", "1.0", tk.END), "break")[1])
+        # Wrap to the group's real width (the left panel can be resized).
+        pf.bind("<Configure>", lambda e: [lbl.configure(wraplength=max(150, e.width - 20))
+                                          for lbl in wrap_labels])
+        self._refresh_pin_box()
+        self._update_points_desc()
 
         # ── parameterization ──────────────────────────────────────
         self._param_frame = tk.LabelFrame(inner, text="Parameterization (point indices are 0-based)",
@@ -868,6 +1032,7 @@ class SurfaceMeshGeneratorNode(BaseNode):
         self._update_intervals()
         if hasattr(self, "_param_frame") and self._param_frame.winfo_exists():
             self._build_param_rows(self._param_frame)
+        self._update_points_desc()
         if hasattr(self, "_a1_label") and self._a1_label.winfo_exists():
             self._a1_label.configure(
                 text="a1:  (length units)" if is_plane else "a1:  theta, DEGREES")
@@ -920,7 +1085,7 @@ class SurfaceMeshGeneratorNode(BaseNode):
 
     def _sync_points_text(self) -> None:
         w = self._points_widget
-        if w is not None and w.winfo_exists() and not self._points_from_pin:
+        if w is not None and w.winfo_exists():
             self._points_text = w.get("1.0", tk.END)
 
     def _on_apply(self) -> None:
@@ -1012,14 +1177,108 @@ class SurfaceMeshGeneratorNode(BaseNode):
     # ── fitting + parameterization ────────────────────────────────
 
     def _resolve_points(self, inputs: dict | None) -> np.ndarray:
-        raw = inputs.get("points") if inputs else None
-        if raw is not None and isinstance(raw, np.ndarray) and raw.size:
-            self._points_from_pin = True
-            return _coerce_points(raw)
-        self._points_from_pin = False
+        """Pick the points to fit: the preferred source ('Use first'), or the
+        other one when the preferred source has no points. inputs=None (Apply
+        pressed without the engine) keeps the last pin data."""
+        if inputs is not None:
+            raw = inputs.get("points")
+            self._pin_points, self._pin_error = None, ""
+            if raw is not None and np.size(raw):
+                try:
+                    pin = _coerce_points(raw)
+                    self._pin_points = pin if pin.shape[0] else None
+                except ValueError as e:
+                    self._pin_error = str(e)
         self._sync_points_text()
-        parsed, _skipped = _parse_points_block(self._points_text)
-        return parsed if parsed is not None else np.empty((0, 3), dtype=np.float64)
+        text_pts, skipped = _parse_points_block(self._points_text)
+        order = ("pin", "text") if self._points_priority_var.get() == "pin" else ("text", "pin")
+        chosen, pts = "", None
+        for src in order:
+            if src == "pin" and self._pin_points is not None:
+                chosen, pts = "pin", self._pin_points
+                break
+            if src == "text" and text_pts is not None:
+                chosen, pts = "text", text_pts
+                break
+        self._points_source = chosen
+        self._points_from_pin = chosen == "pin"
+        n_text = 0 if text_pts is None else text_pts.shape[0]
+        n_pin = 0 if self._pin_points is None else self._pin_points.shape[0]
+        if chosen:
+            other = (f"text box has {n_text}" if chosen == "pin" else
+                     (f"pin has {n_pin}" if n_pin else "pin has no data"))
+            fallback = "" if chosen == order[0] else "  (fallback: first choice has no points)"
+            self._source_var.set(f"Using: {'pin' if chosen == 'pin' else 'text box'} points "
+                                 f"({pts.shape[0]}); {other}{fallback}")
+        else:
+            self._source_var.set("Using: nothing -- neither the pin nor the text box has points")
+        if skipped:
+            self._source_var.set(self._source_var.get() + f"\n{skipped} text line(s) ignored "
+                                 "(not 3 numbers)")
+        self._refresh_pin_box()
+        if pts is None:
+            if self._pin_error:
+                raise ValueError(f"pin points: {self._pin_error}")
+            return np.empty((0, 3), dtype=np.float64)
+        return pts
+
+    def _refresh_pin_box(self) -> None:
+        """Show the pin's points, read-only (selectable / Ctrl+C)."""
+        pin = self._pin_points
+        if self._pin_error:
+            info = f"Pin points: not usable ({self._pin_error})"
+        elif pin is None:
+            info = "Pin points: none (pin not connected or empty)"
+        else:
+            info = f"Pin points: {pin.shape[0]}  (read-only, Ctrl+C to copy)"
+        self._pin_info_var.set(info)
+        w = self._pin_widget
+        if w is None or not w.winfo_exists():
+            return
+        text = "" if pin is None else "\n".join(" ".join(f"{v:.6g}" for v in row) for row in pin)
+        w.configure(state="normal")
+        w.delete("1.0", tk.END)
+        w.insert("1.0", text)
+        w.configure(state="disabled")
+
+    def _copy_pin_points(self) -> None:
+        pin = self._pin_points
+        text = "" if pin is None else "\n".join(" ".join(f"{v:.6g}" for v in row) for row in pin)
+        try:
+            self.canvas.clipboard_clear()
+            self.canvas.clipboard_append(text)
+        except tk.TclError:
+            pass
+
+    def _copy_pin_to_text(self) -> None:
+        """Put the pin's points into the text box (editable from there)."""
+        pin, w = self._pin_points, self._points_widget
+        if pin is None or w is None or not w.winfo_exists():
+            return
+        w.delete("1.0", tk.END)
+        w.insert("1.0", "\n".join(" ".join(f"{v:.6g}" for v in row) for row in pin))
+        self._sync_points_text()
+
+    def _update_points_desc(self) -> None:
+        """Explain what the given points are for, and the current roles."""
+        if not hasattr(self, "_desc_var"):
+            return
+        st = self._surface_type_var.get()
+        self._desc_var.set(_POINTS_DESC.get(st, ""))
+
+        def idx(var):
+            try:
+                return int(var.get())
+            except (tk.TclError, ValueError):
+                return None
+        o, x, y = idx(self._origin_idx_var), idx(self._xaxis_idx_var), idx(self._yside_idx_var)
+        if st == "plane":
+            yside = f"point {y} on the +a2 side" if y is not None and y >= 0 else "+a2 side not set"
+            self._roles_var.set(f"Now: point {o} = origin (0, 0),  point {x} = +a1 direction,  {yside}  "
+                                f"(indices are 0-based; set them under Parameterization)")
+        else:
+            self._roles_var.set(f"Now: point {o} = origin (theta 0, height 0)  "
+                                f"(0-based; set it under Parameterization)")
 
     def _safe_idx(self, var: tk.IntVar, n: int, default: int) -> int:
         try:
@@ -1495,6 +1754,7 @@ class SurfaceMeshGeneratorNode(BaseNode):
         return {
             "surface_type": self._surface_type_var.get(),
             "points_text": self._points_text,
+            "points_priority": self._points_priority_var.get(),
             "origin_idx": self._origin_idx_var.get(),
             "xaxis_idx": self._xaxis_idx_var.get(),
             "yside_idx": self._yside_idx_var.get(),
@@ -1525,6 +1785,8 @@ class SurfaceMeshGeneratorNode(BaseNode):
         st = str(params.get("surface_type", "plane"))
         self._surface_type_var.set(st if st in ("plane", "cylinder") else "plane")
         self._points_text = str(params.get("points_text", ""))
+        prio = str(params.get("points_priority", "pin"))       # older projects: pin overrides text
+        self._points_priority_var.set(prio if prio in ("pin", "text") else "pin")
         self._origin_idx_var.set(int(params.get("origin_idx", 0)))
         self._xaxis_idx_var.set(int(params.get("xaxis_idx", 1)))
         self._yside_idx_var.set(int(params.get("yside_idx", -1)))
@@ -1563,6 +1825,7 @@ class SurfaceMeshGeneratorNode(BaseNode):
         self._sync_points_text()
         super().close_inspector()
         self._points_widget = None
+        self._pin_widget = None
         self._preview_canvas = None
 
     def on_destroy(self) -> None:

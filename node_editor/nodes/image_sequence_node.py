@@ -15,27 +15,21 @@ from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
 from node_editor.project_context import get_project_directory, get_project_file_path
+from node_editor.video_frame_reader import VideoFrameReader, VIDEO_EXTS
 
 
 class ImageSequenceNode(BaseNode):
     """
-    Provides a sequence of images from disk as IMAGE output.
+    Provides frames from a list of IMAGE FILES or from a VIDEO FILE.
 
-    Two input methods:
-      A. Pattern mode  — printf-style path pattern with start/end indices
-                         e.g. /images/DCIM%04d.JPG  start=123  end=987
-      B. Folder mode   — scan a folder for all OpenCV-readable image files,
-                         sorted alphanumerically
+    Image files: the list is made from a folder, from picked files, or from
+    numbered names (printf pattern + number range; the files may be created
+    later -- "Wait for files" then waits for each one). Video: frames are
+    read with exact frame access (see node_editor/video_frame_reader.py).
 
-    Paths are stored and serialized as relative paths with respect to the
-    XLSX project file location (app._current_file.parent). If no project
-    file is saved yet, absolute paths are used and a warning is shown on
-    save.
-
-    Playback uses tk.after() on the main thread (no extra thread needed).
-    Output pins: image, image_2 (PinType.IMAGE), trigger (PinType.TRIGGER)
-    Additional output pins: frame_index (PinType.SCALAR), 
-                            frame_count (PinType.SCALAR)
+    Positions are 1-based everywhere (1 = first image / first video frame).
+    The Batch section emits a pair of frames (Frame 1, Frame 2) for each
+    loop index i. Paths are stored relative to the project file.
     """
 
     EXECUTION_MODE = ExecutionMode.SYNC
@@ -45,30 +39,78 @@ class ImageSequenceNode(BaseNode):
     NODE_WIDTH     = 260
     NODE_HEIGHT    = 270
 
-    HELP_TEXT = (
-        "Image Sequence\n\n"
-        "Load images with Pattern or Folder mode, then use the Batch sequence "
-        "section to choose an inclusive, 1-based Start/End/Step. (e.g., 2/5/1 --> [2 3 4 5])"
-        "Positive and negative steps are supported. Set Frame 1 and Frame 2 "
-        "with i, i+N, i-N, or a fixed frame number; they are checked across every loop iteration. "
-        "A black value is valid; red text must be corrected before a batch can run.\n\n"
-        "Pattern mode substitutes the Batch sequence Start/End numbers directly into the "
-        "printf-style pattern (position i -> pattern % i), so it no longer has its own "
-        "Start/End fields. Click Edit File List... to generate/review the resulting paths. "
-        "Files do not need to exist yet: if a path is missing when read, this node waits "
-        "'Wait for file (s)' seconds and retries until the file appears and can be fully "
-        "decoded -- useful when another process is still generating the sequence.\n\n"
-        "Play: with no link on the next input, one frame pair is emitted at "
-        "each FPS interval. Connect a TRIGGER output to next to advance one "
-        "frame for each trigger pulse instead. Connect a TRIGGER output to "
-        "current to re-emit the current frame pair (same as clicking the "
-        "Current button) for each pulse, without advancing.\n\n"
-        "Batch outputs:\n"
-        "- trigger pulses on every emitted batch step.\n"
-        "- batch_start pulses only on the first emitted step of a batch run.\n\n"
-        "The index and index 2 inputs still select the two image outputs "
-        "directly. They take precedence over manual and batch playback."
-    )
+    HELP_TEXT = """\
+Image Sequence
+==============
+Sends frames from a list of IMAGE FILES or from a VIDEO FILE, one pair of
+frames (frame 1, frame 2) at a time.
+
+1. SOURCE
+---------
+Image files -- the frames are a LIST of files (position 1 = first line).
+  Make the list with one of:
+    Folder...          every image in a folder (sorted by name).
+    Files...           pick image files yourself.
+    Numbered names...  names made from a pattern and a number range, e.g.
+                       C:/data/img_%04d.png, numbers 1..500  ->
+                       img_0001.png ... img_0500.png. The files do NOT have
+                       to exist yet (another program may still write them).
+                       %d = plain number, %04d = 4 digits with leading zeros.
+    Edit list...       see / edit / reorder / delete lines of the list.
+  Wait for files that are not there yet:
+    when a file in the list is missing (or still being written), wait and
+    check again every N seconds until it can be read, instead of stopping.
+    Turned on automatically when "Numbered names" makes names of files
+    that do not exist yet. The summary line shows how many are missing.
+
+Video file -- the frames are the frames of a video (mp4, avi, mov, mkv,
+  mpg, wmv, ... whatever OpenCV/FFmpeg can decode). Position 1 = first frame.
+  Exact frame access:
+    Seeking in a video (jumping to frame k) is not guaranteed to land on
+    frame k with every codec / file / OpenCV version, and the frame count
+    written in the file header can be wrong. So when a video is opened the
+    node first reads it once in order (in the background) to COUNT the
+    frames exactly and to record a fingerprint of every frame. Then:
+      - the next frame / a short jump forward: decoded in order (always exact);
+      - a long jump: seek, then the frame is CHECKED against its fingerprint;
+      - if the check fails (or the index is not ready yet): decoded in order
+        from the start -- exact, but slow for far frames.
+    The "Frame access" line shows whether seeking works for the file. If a
+    jump will need slow in-order decoding of many frames, you are asked once
+    per video. Playing / stepping forward is always fast.
+  Extract frames to image files...
+    writes the frames (or a range) as PNG/JPG files and can switch the
+    source to them: fastest random access, and nodes that need a file list
+    (e.g. Mesh Template Track, Chessboard Calibration via the 'files' pin)
+    can then use them. For a video source the 'files' output is empty.
+
+2. FRAMES TO SEND (batch)
+-------------------------
+  Start / End / Step   the loop index i runs from Start to End inclusive
+                       (End is always included). Negative Step runs backward.
+  Frame 1 / Frame 2    which positions are sent for each i: i, i+N, i-N or a
+                       fixed number. Default Frame 1 = 1 (reference frame),
+                       Frame 2 = i. For "previous / current" use i-1 and i.
+  Current i            the loop index sent by Current / Play.
+  First Prev Current Next Last   send that step of the loop.
+  Play / Stop          run the loop at FPS, or -- when the 'next' input pin
+                       is connected -- one step per trigger pulse.
+  Red text = invalid value (e.g. a position outside 1..number of frames).
+
+INPUT PINS
+  index 1 / index 2  select the two frames directly (1-based); they take
+                     precedence over the batch.
+  next               trigger: advance one batch step per pulse.
+  current            trigger: re-send the current batch step.
+
+OUTPUT PINS
+  frame 1 / frame 2  the images (RGB).   index 1 / index 2  their positions.
+  files              absolute paths of the image list (empty for a video).
+  count              number of frames (list length / exact video frame count).
+  trig               pulse on every batch step.  start  pulse on the first step.
+
+Ctrl+H shows this help.
+"""
 
     # Shared decode pool across all ImageSequence instances.
     _DECODE_POOL = ThreadPoolExecutor(max_workers=4)
@@ -132,7 +174,27 @@ class ImageSequenceNode(BaseNode):
         if hasattr(self, "_method_var"):
             return
 
-        self._method_var = tk.StringVar(value="pattern")
+        self._method_var = tk.StringVar(value="pattern")     # legacy; kept for old projects
+        # Source: "images" (a list of files) or "video" (one video file).
+        self._source_var = tk.StringVar(value="images")
+        # Wait for list files that do not exist yet / are still being written.
+        self._wait_files_var = tk.BooleanVar(value=False)
+        self._pattern_first_var = tk.StringVar(value="1")
+        self._pattern_last_var = tk.StringVar(value="100")
+        self._pattern_step_var = tk.StringVar(value="1")
+        self._list_summary_var = tk.StringVar(
+            value="No images yet. Make the list with Folder..., Files... or Numbered names...")
+        self._missing_cache = (None, 0, False)          # (list key, missing count, fully checked)
+        self._video_path_var = tk.StringVar(value="")   # project-relative path of the video
+        self._video_name_var = tk.StringVar(value="No video. Use Open video...")
+        self._video_info_var = tk.StringVar(value="")
+        self._video_access_var = tk.StringVar(value="")
+        self._video_reader = None
+        self._video_warned: set = set()
+        self._images_panel = None
+        self._video_panel = None
+        self._video_access_label = None
+        self._help_popup = None
         self._pattern_var = tk.StringVar(value="/images/DCIM%04d.JPG")
         self._start_var = tk.StringVar(value="0")
         self._end_var = tk.StringVar(value="100")
@@ -242,192 +304,131 @@ class ImageSequenceNode(BaseNode):
 
     def build_inspector(self, parent: tk.Frame) -> None:
         self._init_ui_state()
-
+        win = self._inspector_win
+        if win is not None:
+            for seq in ("<Control-h>", "<Control-H>"):
+                win.bind(seq, lambda _e: self._open_help())
         top = tk.Frame(parent)
         top.pack(fill="both", expand=True)
+        small, hint = ("Arial", 8), ("Arial", 7)
 
-        method_frame = tk.Frame(top)
-        method_frame.pack(fill="x", pady=(0, 6))
-        tk.Radiobutton(
-            method_frame, text="Pattern",
-            variable=self._method_var, value="pattern",
-            font=("Arial", 8),
-            command=self._on_method_change,
-        ).pack(side="left")
-        tk.Radiobutton(
-            method_frame, text="Folder",
-            variable=self._method_var, value="folder",
-            font=("Arial", 8),
-            command=self._on_method_change,
-        ).pack(side="left", padx=6)
+        # ── 1. Source ─────────────────────────────────────────────────
+        src = tk.LabelFrame(top, text="1. Source", padx=6, pady=4, font=("Arial", 9, "bold"))
+        src.pack(fill="x", pady=(0, 6))
+        row = tk.Frame(src)
+        row.pack(fill="x")
+        for value, label in (("images", "Image files"), ("video", "Video file")):
+            tk.Radiobutton(row, text=label, value=value, variable=self._source_var, font=("Arial", 9),
+                           command=lambda: self._on_source_change(user=True)).pack(side="left", padx=(0, 12))
+        tk.Button(row, text="Help (Ctrl+H)", font=small, command=self._open_help).pack(side="right")
 
-        self._pat_frame = tk.LabelFrame(top, text="Pattern Mode", padx=6, pady=4)
-        self._pat_frame.pack(fill="x", pady=(0, 6))
+        # Image files panel: one list, three ways to make it.
+        p = tk.Frame(src)
+        self._images_panel = p
+        tk.Label(p, textvariable=self._list_summary_var, font=small, anchor="w", justify="left",
+                 wraplength=430, fg="#2f3e5c").pack(fill="x", pady=(4, 3))
+        b = tk.Frame(p)
+        b.pack(fill="x")
+        tk.Label(b, text="Make the list:", font=small).pack(side="left")
+        for text, cmd in (("Folder...", self._browse_folder), ("Files...", self._browse_files),
+                          ("Numbered names...", self._open_pattern_dialog),
+                          ("Edit list...", self._edit_file_list)):
+            tk.Button(b, text=text, font=small, command=cmd).pack(side="left", padx=(4, 0))
+        tk.Label(p, font=hint, fg="#666666", anchor="w", justify="left", wraplength=430, text=(
+            "Folder / Files: images that exist now.  Numbered names: names such as img_%04d.png "
+            "for a number range -- the files may be written later by another program.")).pack(
+            fill="x", pady=(2, 0))
+        w = tk.Frame(p)
+        w.pack(fill="x", pady=(4, 0))
+        tk.Checkbutton(w, text="Wait for files that are not there yet", variable=self._wait_files_var,
+                       font=small, command=self._update_list_summary).pack(side="left")
+        tk.Label(w, text="check every", font=small).pack(side="left", padx=(6, 2))
+        self._pattern_wait_entry = tk.Entry(w, textvariable=self._pattern_wait_var, width=5, font=small)
+        self._pattern_wait_entry.pack(side="left")
+        tk.Label(w, text="s", font=small).pack(side="left", padx=(2, 0))
 
-        tk.Label(self._pat_frame, text="Pattern:", font=("Arial", 8)).grid(row=0, column=0, sticky="w")
-        self._pat_entry = tk.Entry(self._pat_frame, textvariable=self._pattern_var, width=34, font=("Arial", 8))
-        self._pat_entry.grid(row=0, column=1, columnspan=3, padx=2, pady=1, sticky="ew")
-        tk.Label(
-            self._pat_frame,
-            text="Uses Batch sequence's Start/End below as the substituted numbers.",
-            font=("Arial", 8), fg="#555555",
-        ).grid(row=1, column=0, columnspan=4, sticky="w")
+        # Video panel.
+        v = tk.Frame(src)
+        self._video_panel = v
+        tk.Label(v, textvariable=self._video_name_var, font=small, anchor="w", justify="left",
+                 wraplength=430, fg="#2f3e5c").pack(fill="x", pady=(4, 2))
+        vb = tk.Frame(v)
+        vb.pack(fill="x")
+        tk.Button(vb, text="Open video...", font=small, command=self._browse_video).pack(side="left")
+        tk.Button(vb, text="Extract frames to image files...", font=small,
+                  command=self._open_extract_dialog).pack(side="left", padx=(4, 0))
+        tk.Label(v, textvariable=self._video_info_var, font=small, anchor="w", justify="left",
+                 wraplength=430).pack(fill="x", pady=(4, 0))
+        self._video_access_label = tk.Label(v, textvariable=self._video_access_var, font=small, anchor="w",
+                                            justify="left", wraplength=430)
+        self._video_access_label.pack(fill="x")
 
-        tk.Label(self._pat_frame, text="Wait for file (s):", font=("Arial", 8)).grid(
-            row=2, column=0, sticky="w", pady=(4, 0))
-        self._pattern_wait_entry = tk.Entry(
-            self._pat_frame, textvariable=self._pattern_wait_var, width=8, font=("Arial", 8))
-        self._pattern_wait_entry.grid(row=2, column=1, sticky="w", pady=(4, 0))
-        tk.Label(
-            self._pat_frame,
-            text="retry interval while a file has not finished writing yet",
-            font=("Arial", 8), fg="#555555",
-        ).grid(row=2, column=2, columnspan=2, sticky="w", pady=(4, 0))
+        # ── 2. Frames to send ─────────────────────────────────────────
+        self._batch_frame = bf = tk.LabelFrame(top, text="2. Frames to send", padx=6, pady=4,
+                                               font=("Arial", 9, "bold"))
+        bf.pack(fill="x", pady=(0, 6))
+        tk.Label(bf, text="Positions are 1-based (1 = first image / first video frame). "
+                          "The loop index i runs from Start to End by Step.",
+                 font=hint, fg="#555555", wraplength=430, justify="left").grid(
+            row=0, column=0, columnspan=6, sticky="w")
 
-        tk.Button(self._pat_frame, text="Edit File List...", font=("Arial", 8), command=self._edit_pattern_file_list).grid(
-            row=3, column=0, columnspan=4, pady=3, sticky="ew"
-        )
+        def entry(row_, col, label, var, key, width=6, padx=(0, 2)):
+            tk.Label(bf, text=label, font=small).grid(row=row_, column=col, sticky="w", padx=padx, pady=(4, 0))
+            e = tk.Entry(bf, textvariable=var, width=width, justify="center", font=small)
+            e.grid(row=row_, column=col + 1, sticky="w", pady=(4, 0))
+            e.bind("<Return>", self._on_batch_range_commit)
+            e.bind("<FocusOut>", self._on_batch_range_commit)
+            self._loop_entries[key] = e
 
-        self._fld_frame = tk.LabelFrame(top, text="Folder Mode", padx=6, pady=4)
-        self._fld_frame.pack(fill="x", pady=(0, 6))
+        entry(1, 0, "Start:", self._batch_start_var, "start")
+        entry(1, 2, "End:", self._batch_end_var, "end", padx=(10, 2))
+        entry(1, 4, "Step:", self._batch_step_var, "step", padx=(10, 2))
+        entry(2, 0, "Frame 1:", self._batch_frame_1_var, "frame_1", width=7)
+        entry(2, 2, "Frame 2:", self._batch_frame_2_var, "frame_2", width=7, padx=(10, 2))
+        tk.Label(bf, text="i, i+N, i-N or a fixed number", font=hint, fg="#555555").grid(
+            row=2, column=4, columnspan=2, sticky="w", padx=(10, 0), pady=(4, 0))
+        entry(3, 0, "Current i:", self._batch_current_var, "current")
+        tk.Label(bf, text="the step sent by Current / Play", font=hint, fg="#555555").grid(
+            row=3, column=2, columnspan=4, sticky="w", padx=(10, 0), pady=(4, 0))
 
-        self._folder_label = tk.Label(
-            self._fld_frame,
-            textvariable=self._folder_var,
-            font=("Arial", 8),
-            anchor="w",
-            justify="left",
-            wraplength=360,
-        )
-        self._folder_label.grid(row=0, column=0, columnspan=2, sticky="w")
+        nav = tk.Frame(bf)
+        nav.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(6, 0))
+        cfg = dict(font=small, width=7)
+        self._batch_first_btn = tk.Button(nav, text="First", command=self._go_first, **cfg)
+        self._batch_prev_btn = tk.Button(nav, text="Prev", command=self._prev_frame, **cfg)
+        self._batch_current_btn = tk.Button(nav, text="Current", command=self._send_current_batch_frame, **cfg)
+        self._batch_next_btn = tk.Button(nav, text="Next", command=self._next_frame, **cfg)
+        self._batch_last_btn = tk.Button(nav, text="Last", command=self._go_last, **cfg)
+        for btn in (self._batch_first_btn, self._batch_prev_btn, self._batch_current_btn,
+                    self._batch_next_btn, self._batch_last_btn):
+            btn.pack(side="left", padx=1)
+        self._batch_play_btn = tk.Button(nav, textvariable=self._play_btn_var, command=self._toggle_play,
+                                         font=("Arial", 8, "bold"), width=7)
+        self._batch_play_btn.pack(side="left", padx=(6, 1))
+        tk.Spinbox(nav, from_=0.0001, to=1000.0, increment=0.1, textvariable=self._fps_var, width=7,
+                   font=small).pack(side="right", padx=2)
+        tk.Label(nav, text="FPS:", font=small).pack(side="right", padx=(8, 0))
+        tk.Label(bf, textvariable=self._batch_mode_var, font=small, fg="#356a49").grid(
+            row=5, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
-        tk.Button(self._fld_frame, text="Browse Folder...", font=("Arial", 8), command=self._browse_folder).grid(
-            row=1, column=0, pady=3, sticky="ew"
-        )
-        tk.Button(self._fld_frame, text="Edit File List...", font=("Arial", 8), command=self._edit_file_list).grid(
-            row=1, column=1, pady=3, sticky="ew", padx=(4, 0)
-        )
+        # ── 3. Now sending ────────────────────────────────────────────
+        now = tk.LabelFrame(top, text="3. Now sending", padx=6, pady=4, font=("Arial", 9, "bold"))
+        now.pack(fill="x")
+        tk.Label(now, textvariable=self._fname_var, font=small, anchor="nw", justify="left",
+                 height=2).pack(fill="x")
+        tk.Label(now, textvariable=self._size_var, font=small, anchor="w", justify="left").pack(fill="x")
 
-        info_lbl = tk.Label(top, textvariable=self._info_var, font=("Arial", 8), anchor="w", justify="left")
-        info_lbl.pack(fill="x", pady=(0, 6))
-
-        self._batch_frame = tk.LabelFrame(
-            top, text="Batch sequence", padx=6, pady=4,
-        )
-        self._batch_frame.pack(fill="x", pady=(0, 6))
-        tk.Label(
-            self._batch_frame,
-            text="Inclusive 1-based loop. Use i, i+N, i-N, or a fixed frame number.",
-            font=("Arial", 8), fg="#555555",
-        ).grid(row=0, column=0, columnspan=6, sticky="w")
-
-        for column, (label, variable, key) in enumerate((
-            ("Start", self._batch_start_var, "start"),
-            ("End", self._batch_end_var, "end"),
-            ("Step", self._batch_step_var, "step"),
-        )):
-            tk.Label(self._batch_frame, text=label + ":", font=("Arial", 8)).grid(
-                row=1, column=column * 2, sticky="w", padx=(0 if column == 0 else 8, 2), pady=(4, 0),
-            )
-            entry = tk.Entry(
-                self._batch_frame, textvariable=variable, width=6,
-                justify="center", font=("Arial", 8),
-            )
-            entry.grid(row=1, column=column * 2 + 1, sticky="w", pady=(4, 0))
-            entry.bind("<Return>", self._on_batch_range_commit)
-            entry.bind("<FocusOut>", self._on_batch_range_commit)
-            self._loop_entries[key] = entry
-
-        tk.Label(self._batch_frame, text="Current i:", font=("Arial", 8)).grid(
-            row=2, column=0, sticky="w", pady=(5, 0),
-        )
-        current_entry = tk.Entry(
-            self._batch_frame, textvariable=self._batch_current_var,
-            width=6, justify="center", font=("Arial", 8),
-        )
-        current_entry.grid(row=2, column=1, sticky="w", pady=(5, 0))
-        current_entry.bind("<Return>", self._on_batch_range_commit)
-        current_entry.bind("<FocusOut>", self._on_batch_range_commit)
-        self._loop_entries["current"] = current_entry
-        tk.Label(
-            self._batch_frame, text="Current loop position (1-based)",
-            font=("Arial", 8), fg="#555555",
-        ).grid(row=2, column=2, columnspan=4, sticky="w", padx=(8, 0), pady=(5, 0))
-
-        nav_frame = tk.Frame(self._batch_frame)
-        nav_frame.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(5, 0))
-        nav_cfg = dict(font=("Arial", 8), width=7)
-        self._batch_first_btn = tk.Button(
-            nav_frame, text="First", command=self._go_first, **nav_cfg,
-        )
-        self._batch_first_btn.pack(side="left", padx=1)
-        self._batch_prev_btn = tk.Button(
-            nav_frame, text="Prev", command=self._prev_frame, **nav_cfg,
-        )
-        self._batch_prev_btn.pack(side="left", padx=1)
-        self._batch_current_btn = tk.Button(
-            nav_frame, text="Current", command=self._send_current_batch_frame, **nav_cfg,
-        )
-        self._batch_current_btn.pack(side="left", padx=1)
-        self._batch_next_btn = tk.Button(
-            nav_frame, text="Next", command=self._next_frame, **nav_cfg,
-        )
-        self._batch_next_btn.pack(side="left", padx=1)
-        self._batch_last_btn = tk.Button(
-            nav_frame, text="Last", command=self._go_last, **nav_cfg,
-        )
-        self._batch_last_btn.pack(side="left", padx=1)
-        self._batch_play_btn = tk.Button(
-            nav_frame, textvariable=self._play_btn_var,
-            command=self._toggle_play, **nav_cfg,
-        )
-        self._batch_play_btn.pack(side="left", padx=(4, 1))
-        tk.Label(nav_frame, text="FPS:", font=("Arial", 8)).pack(side="right", padx=(8, 0))
-        tk.Spinbox(
-            nav_frame, from_=0.0001, to=1000.0, increment=0.1,
-            textvariable=self._fps_var, width=8, font=("Arial", 8),
-        ).pack(side="right", padx=2)
-
-        tk.Label(self._batch_frame, text="Frame 1:", font=("Arial", 8)).grid(
-            row=4, column=0, sticky="w", pady=(5, 0),
-        )
-        frame_1_entry = tk.Entry(
-            self._batch_frame, textvariable=self._batch_frame_1_var,
-            width=8, justify="center", font=("Arial", 8),
-        )
-        frame_1_entry.grid(row=4, column=1, sticky="w", pady=(5, 0))
-        tk.Label(self._batch_frame, text="Frame 2:", font=("Arial", 8)).grid(
-            row=4, column=2, sticky="w", padx=(8, 2), pady=(5, 0),
-        )
-        frame_2_entry = tk.Entry(
-            self._batch_frame, textvariable=self._batch_frame_2_var,
-            width=8, justify="center", font=("Arial", 8),
-        )
-        frame_2_entry.grid(row=4, column=3, sticky="w", pady=(5, 0))
-        for entry, key in ((frame_1_entry, "frame_1"), (frame_2_entry, "frame_2")):
-            entry.bind("<Return>", self._on_batch_range_commit)
-            entry.bind("<FocusOut>", self._on_batch_range_commit)
-            self._loop_entries[key] = entry
-
-        tk.Label(
-            self._batch_frame, textvariable=self._batch_mode_var,
-            font=("Arial", 8), fg="#356a49",
-        ).grid(row=5, column=0, columnspan=6, sticky="w", pady=(5, 0))
-
-        tk.Label(
-            top, textvariable=self._fname_var, font=("Arial", 8),
-            height=2, anchor="nw", justify="left",
-        ).pack(fill="x")
-        tk.Label(top, textvariable=self._size_var, font=("Arial", 8), anchor="w", justify="left").pack(fill="x")
-
-        self._on_method_change()
+        self._on_source_change(user=False)
+        self._update_list_summary()
+        self._update_video_labels()
         self._refresh_inspector_widgets()
         self._validate_loop_fields()
+        self._refresh_current_file_display()
 
     def _refresh_inspector_widgets(self) -> None:
         if self._slider is not None and self._slider.winfo_exists():
-            self._slider.configure(from_=0, to=max(0, len(self._file_paths) - 1))
-            self._slider_var.set(max(0, min(self._current_index, max(0, len(self._file_paths) - 1))))
+            self._slider.configure(from_=0, to=max(0, self._frame_total() - 1))
+            self._slider_var.set(max(0, min(self._current_index, max(0, self._frame_total() - 1))))
             self._slider.configure(state=tk.DISABLED if self._frame_index_input_connected else tk.NORMAL)
         self._validate_loop_fields()
 
@@ -457,9 +458,19 @@ class ImageSequenceNode(BaseNode):
             self._status_var.set("batch running at FPS")
             self._schedule_batch_tick(0)
 
+    def _is_video(self) -> bool:
+        return hasattr(self, "_source_var") and self._source_var.get() == "video"
+
+    def _frame_total(self) -> int:
+        """Number of frames of the current source (list length / video frames)."""
+        if self._is_video():
+            reader = getattr(self, "_video_reader", None)
+            return reader.count_known() if reader is not None else 0
+        return len(getattr(self, "_file_paths", []))
+
     def _validate_loop_fields(self, *_args) -> bool:
         """Show valid loop values in black and invalid values in red."""
-        count = len(getattr(self, "_file_paths", []))
+        count = self._frame_total()
         values: dict[str, int | None] = {}
         for key, variable in (
             ("start", self._batch_start_var),
@@ -472,13 +483,10 @@ class ImageSequenceNode(BaseNode):
             except (TypeError, ValueError):
                 values[key] = None
 
-        # In Pattern mode Start/End are the numbers substituted into the
-        # pattern to CREATE the file list ("Edit file list"), so they must
-        # not be limited by the list that exists now -- otherwise an empty
-        # list could never be created and an existing one never extended.
-        # (Running past the end of the list is caught when frames are
-        # emitted: "frame expression out of range".)
-        limit = None if self._method_var.get() == "pattern" else count
+        # Positions are always positions in the CURRENT source (the list --
+        # "Numbered names" makes the list explicitly -- or the video), so
+        # every value is limited to 1..number of frames.
+        limit = count
 
         def in_range(v):
             return v is not None and v >= 1 and (limit is None or v <= limit)
@@ -508,9 +516,11 @@ class ImageSequenceNode(BaseNode):
             valid[key] = (
                 offset is not None
                 and bool(loop_indices)
+                # frame number = index + offset (or a constant): monotonic, so
+                # the smallest and largest index decide (lists can be 10k+ long)
                 and all(
                     in_range(self._expression_frame_number(offset, index))
-                    for index in loop_indices
+                    for index in (min(loop_indices), max(loop_indices))
                 )
             )
 
@@ -523,7 +533,7 @@ class ImageSequenceNode(BaseNode):
     def _update_batch_navigation(self, loop_indices: list[int],
                                  valid: dict[str, bool]) -> None:
         """Disable manual navigation at the inclusive loop boundaries."""
-        if not self._file_paths:
+        if not self._frame_total():
             states = {
                 "first": tk.DISABLED, "prev": tk.DISABLED,
                 "current": tk.DISABLED, "next": tk.DISABLED,
@@ -611,6 +621,8 @@ class ImageSequenceNode(BaseNode):
             return
         indices = self._batch_range()
         if not indices:
+            return
+        if not self._confirm_video_jump(int(self._batch_current_var.get())):
             return
         self._stop_play()
         self._batch_indices = indices
@@ -713,8 +725,8 @@ class ImageSequenceNode(BaseNode):
 
         frame_1_index = self._expression_frame_number(frame_1_expression, loop_index) - 1
         frame_2_index = self._expression_frame_number(frame_2_expression, loop_index) - 1
-        if not (0 <= frame_1_index < len(self._file_paths)
-                and 0 <= frame_2_index < len(self._file_paths)):
+        total = self._frame_total()
+        if not (0 <= frame_1_index < total and 0 <= frame_2_index < total):
             self._stop_batch("frame expression out of range")
             return
 
@@ -749,8 +761,10 @@ class ImageSequenceNode(BaseNode):
                 "frame_index_1": float(frame_1_index + 1),
                 "frame_index_2": float(frame_2_index + 1),
                 "files": self._absolute_file_paths(),
-                "frame_count": float(len(self._file_paths)),
+                "frame_count": float(self._frame_total()),
             }
+            if self._is_video():
+                self._update_video_labels()
             if emit_trigger:
                 # _emit_trigger_pulse() delivers `outputs` on its high edge, so a
                 # separate plain push_output() here would recompute downstream twice.
@@ -769,7 +783,7 @@ class ImageSequenceNode(BaseNode):
                 pending[key] = self._last_frame_2
                 _finish()
                 return
-            if self._method_var.get() == "pattern":
+            if self._waits_for_files():
                 self._status_var.set(f"waiting for frame {index + 1}...")
 
             def _on_ready(frame, key=key):
@@ -787,7 +801,7 @@ class ImageSequenceNode(BaseNode):
             if self._last_frame_1 is not None and self._last_frame_1_index == frame_1_index:
                 _on_ready_shared(self._last_frame_1)
             else:
-                if self._method_var.get() == "pattern":
+                if self._waits_for_files():
                     self._status_var.set(f"waiting for frame {frame_1_index + 1}...")
                 self._fetch_frame_async(frame_1_index, _on_ready_shared)
         else:
@@ -804,6 +818,9 @@ class ImageSequenceNode(BaseNode):
         self._pat_frame = None
         self._fld_frame = None
         self._batch_frame = None
+        self._images_panel = None
+        self._video_panel = None
+        self._video_access_label = None
         self._loop_entries = {}
         self._batch_first_btn = None
         self._batch_prev_btn = None
@@ -821,21 +838,41 @@ class ImageSequenceNode(BaseNode):
         if self._folder_label is not None and self._folder_label.winfo_exists():
             self._folder_label.configure(wraplength=max(80, int(new_width) - 20))
 
-    # ── method switching ──────────────────────────────────────────
+    # ── source switching ──────────────────────────────────────────
 
-    def _on_method_change(self) -> None:
-        if self._pat_frame is None or self._fld_frame is None:
+    def _on_source_change(self, user: bool = False) -> None:
+        """Show the panel of the selected source. user=True (radio button):
+        restart the batch for the new source and send its first pair."""
+        video = self._is_video()
+        for panel, show in ((self._images_panel, not video), (self._video_panel, video)):
+            if panel is None or not panel.winfo_exists():
+                continue
+            if show and panel.winfo_manager() != "pack":
+                panel.pack(fill="x")
+            elif not show and panel.winfo_manager() == "pack":
+                panel.pack_forget()
+        if not user:
             return
-        if self._method_var.get() == "pattern":
-            if self._fld_frame.winfo_manager() == "pack":
-                self._fld_frame.pack_forget()
-            if self._pat_frame.winfo_manager() != "pack":
-                self._pat_frame.pack(fill="x", pady=(0, 6))
-        else:
-            if self._pat_frame.winfo_manager() == "pack":
-                self._pat_frame.pack_forget()
-            if self._fld_frame.winfo_manager() != "pack":
-                self._fld_frame.pack(fill="x", pady=(0, 6))
+        self._stop_batch("ready")
+        self._reset_batch_defaults(self._frame_total())
+        self._refresh_current_file_display()
+        if self._frame_total() and self._validate_loop_fields():
+            self._emit_batch_frames(1)
+
+    def _on_method_change(self) -> None:          # legacy name (old projects / callers)
+        self._on_source_change(user=False)
+
+    def _reset_batch_defaults(self, n: int) -> None:
+        """Batch fields for a new source: i = 1..n, Frame 1 = 1, Frame 2 = i."""
+        self._batch_start_var.set("1")
+        self._batch_end_var.set(str(max(1, n)))
+        self._batch_step_var.set("1")
+        self._batch_current_var.set("1")
+        self._batch_frame_1_var.set("1")
+        self._batch_frame_2_var.set("i")
+
+    def _waits_for_files(self) -> bool:
+        return (not self._is_video()) and bool(self._wait_files_var.get())
 
     @staticmethod
     def _show_warning_with_terminal_log(title: str, message: str) -> None:
@@ -843,55 +880,74 @@ class ImageSequenceNode(BaseNode):
         print(f"[ImageSequenceNode][Warning] {title}: {message}", flush=True)
         messagebox.showwarning(title, message)
 
-    # ── method A: pattern ─────────────────────────────────────────
+    def _dialog_parent(self):
+        win = getattr(self, "_inspector_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                return win
+        except tk.TclError:
+            pass
+        return self.canvas.winfo_toplevel()
 
-    def _edit_pattern_file_list(self) -> None:
-        """Build the pattern-substituted path list from the Batch sequence's
-        Start/End numbers, then open the shared file-list editor for review.
+    # ── image list: summary ───────────────────────────────────────
 
-        Unlike Folder mode, paths are not required to exist yet -- an
-        external process may still be generating them (see 'Wait for file').
-        """
-        if not self._validate_loop_fields():
-            messagebox.showwarning(
-                "Edit File List",
-                "Fix the red Batch sequence fields (Start/End/Step) first -- "
-                "they define which numbers get substituted into the pattern.")
+    _MISSING_CHECK_MAX = 20000        # existence is checked for at most this many files
+
+    def _update_list_summary(self) -> None:
+        """'523 images: a.png ... b.png / in <folder> / all exist' (or how
+        many are missing and whether the node waits for them)."""
+        n = len(self._file_paths)
+        if not n:
+            self._list_summary_var.set(
+                "No images yet. Make the list with Folder..., Files... or Numbered names...")
             return
+        absp = self._absolute_file_paths()
+        key = (n, absp[0], absp[-1], id(self._file_paths))
+        if self._missing_cache[0] != key:
+            checked = absp[: self._MISSING_CHECK_MAX]
+            missing = self._count_missing(checked)
+            self._missing_cache = (key, missing, len(checked) == n)
+        _key, missing, complete = self._missing_cache
+        folders = {os.path.dirname(path) for path in absp[:2000]}
+        where = next(iter(folders)) if len(folders) == 1 else f"{len(folders)}+ folders"
+        if missing == 0:
+            status = "all exist" if complete else f"first {self._MISSING_CHECK_MAX} exist"
+        elif self._wait_files_var.get():
+            status = f"{missing} not there yet -- the node will wait for them"
+        else:
+            status = (f"{missing} not there yet -- turn on 'Wait for files...' if another program "
+                      f"will write them")
+        self._list_summary_var.set(
+            f"{n} images:  {Path(absp[0]).name}  ...  {Path(absp[-1]).name}\nin {where}\n{status}")
 
-        pattern = self._pattern_var.get().strip()
-        end = int(self._batch_end_var.get())
-        # Generate every frame the batch will read: Frame 2 = i+1 needs one
-        # file past End at the last step (End = 5 -> image_0006).
-        loop_indices = self._build_batch_indices(
-            int(self._batch_start_var.get()), end, int(self._batch_step_var.get()))
-        needed = [end]
-        for var in (self._batch_frame_1_var, self._batch_frame_2_var):
-            expression = self._parse_batch_expression(var.get())
-            if expression is not None:
-                needed += [self._expression_frame_number(expression, i) for i in loop_indices]
-        last = max(needed)
-        paths = []
-        for i in range(1, last + 1):
+    @staticmethod
+    def _count_missing(paths: list[str]) -> int:
+        """How many of `paths` do not exist. Each FOLDER is listed once
+        (os.scandir) instead of asking the file system about every file --
+        thousands of os.path.exists calls took seconds per project load on
+        external / network drives."""
+        by_folder: dict[str, list[str]] = {}
+        for path in paths:
+            folder, name = os.path.split(path)
+            by_folder.setdefault(folder, []).append(name)
+        missing = 0
+        for folder, names in by_folder.items():
+            if len(names) < 8:                       # a few files: stat is cheaper
+                missing += sum(1 for name in names if not os.path.isfile(os.path.join(folder, name)))
+                continue
             try:
-                paths.append(pattern % i)
-            except (TypeError, ValueError):
-                messagebox.showerror(
-                    "Invalid Pattern",
-                    "Pattern must contain a printf-style "
-                    "integer format specifier such as %04d.")
-                return
+                with os.scandir(folder or ".") as it:
+                    present = {os.path.normcase(e.name) for e in it if not e.is_dir()}
+            except OSError:
+                missing += len(names)                # folder does not exist (yet)
+                continue
+            missing += sum(1 for name in names if os.path.normcase(name) not in present)
+        return missing
 
-        # The batch fields defined this list: keep them (do not reset to the
-        # 1 / i defaults that a newly loaded folder gets).
-        self._set_file_paths(paths, reset_batch=False)
-        self._edit_file_list(preserve_batch=True)
-
-    # ── method B: folder ─────────────────────────────────────────
+    # ── image list: folder / files / numbered names ───────────────
 
     def _browse_folder(self) -> None:
-        folder = filedialog.askdirectory(
-            title="Select image folder")
+        folder = filedialog.askdirectory(title="Select image folder", parent=self._dialog_parent())
         if not folder:
             return
 
@@ -908,6 +964,360 @@ class ImageSequenceNode(BaseNode):
 
         self._folder_var.set(self._to_relative(self._to_absolute(folder, base), base))
         self._set_file_paths(paths)
+
+    def _browse_files(self) -> None:
+        exts = " ".join(f"*{e}" for e in sorted(self._IMG_EXTS))
+        names = filedialog.askopenfilenames(
+            title="Select image files", parent=self._dialog_parent(),
+            filetypes=[("Image files", exts), ("All files", "*.*")])
+        if not names:
+            return
+        self._set_file_paths(sorted(names))
+
+    @staticmethod
+    def _numbered_paths(pattern: str, first: int, last: int, step: int) -> list[str]:
+        """Names for numbers first..last (inclusive) by step, e.g. img_%04d.png.
+        Raises ValueError for a pattern without exactly one integer field."""
+        if step == 0:
+            raise ValueError("Step must not be 0.")
+        if (step > 0 and first > last) or (step < 0 and first < last):
+            raise ValueError("The number range is empty (check First / Last / Step).")
+        fields = re.findall(r"%[-+ 0#]*\d*[diu]", pattern)
+        if len(fields) != 1 or pattern.count("%") != 1:
+            raise ValueError("The pattern needs exactly one number field such as %d or %04d "
+                             "(and no other % sign).")
+        stop = last + (1 if step > 0 else -1)
+        return [pattern % k for k in range(first, stop, step)]
+
+    def _open_pattern_dialog(self) -> None:
+        """Make the list from numbered names (the files may not exist yet)."""
+        top = tk.Toplevel(self._dialog_parent())
+        top.title("Numbered names")
+        top.transient(self._dialog_parent())
+        f = tk.Frame(top, padx=10, pady=8)
+        f.pack(fill="both", expand=True)
+        tk.Label(f, justify="left", anchor="w", wraplength=520, font=("Arial", 8), fg="#444444", text=(
+            "Make the list from a name PATTERN and a NUMBER RANGE. Use one printf number field: "
+            "%d (1, 2, ...) or %04d (0001, 0002, ...).  Example: C:/data/img_%04d.png with numbers "
+            "1 to 500 gives img_0001.png ... img_0500.png.  The files may not exist yet: another "
+            "program can write them later.")).grid(row=0, column=0, columnspan=4, sticky="w")
+        tk.Label(f, text="Pattern:", font=("Arial", 9)).grid(row=1, column=0, sticky="w", pady=(8, 2))
+        tk.Entry(f, textvariable=self._pattern_var, width=58, font=("Arial", 9)).grid(
+            row=1, column=1, columnspan=2, sticky="ew", pady=(8, 2))
+
+        def browse_dir():
+            d = filedialog.askdirectory(title="Folder of the numbered files", parent=top)
+            if d:
+                name = Path(self._pattern_var.get().strip()).name or "img_%04d.png"
+                self._pattern_var.set(str(Path(d) / name))
+        tk.Button(f, text="Folder...", font=("Arial", 8), command=browse_dir).grid(
+            row=1, column=3, sticky="w", padx=(4, 0), pady=(8, 2))
+        rng = tk.Frame(f)
+        rng.grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 2))
+        for label, var in (("First number:", self._pattern_first_var), ("Last number:", self._pattern_last_var),
+                           ("Step:", self._pattern_step_var)):
+            tk.Label(rng, text=label, font=("Arial", 9)).pack(side="left", padx=(0, 2))
+            tk.Entry(rng, textvariable=var, width=8, font=("Arial", 9)).pack(side="left", padx=(0, 12))
+        preview = tk.StringVar(value="")
+        tk.Label(f, textvariable=preview, justify="left", anchor="w", wraplength=520,
+                 font=("Arial", 8, "bold"), fg="#2f3e5c").grid(row=3, column=0, columnspan=4, sticky="w",
+                                                              pady=(4, 6))
+        state = {"paths": None}
+
+        def update(*_a):
+            try:
+                paths = self._numbered_paths(self._pattern_var.get().strip(), int(self._pattern_first_var.get()),
+                                             int(self._pattern_last_var.get()), int(self._pattern_step_var.get()))
+            except (ValueError, TypeError) as e:
+                state["paths"] = None
+                preview.set(f"Not valid: {e}")
+                return
+            state["paths"] = paths
+            base = self._get_project_base()
+            sample = paths[:5000]
+            exist = sum(1 for path in sample if os.path.exists(self._to_absolute(path, base)))
+            checked = "" if len(sample) == len(paths) else f" (checked the first {len(sample)})"
+            preview.set(f"-> {len(paths)} names:  {Path(paths[0]).name}  ...  {Path(paths[-1]).name}\n"
+                        f"   exist now: {exist}{checked}, not yet: {len(sample) - exist}")
+        for var in (self._pattern_var, self._pattern_first_var, self._pattern_last_var, self._pattern_step_var):
+            var.trace_add("write", update)
+        update()
+
+        def create():
+            paths = state["paths"]
+            if not paths:
+                return
+            # Names of files still to come: turn waiting on BEFORE the list is
+            # set, so the first frame is waited for instead of failing to read.
+            base = self._get_project_base()
+            if any(not os.path.exists(self._to_absolute(path, base)) for path in paths[:5000]):
+                self._wait_files_var.set(True)
+            self._set_file_paths(paths)
+            top.destroy()
+        btns = tk.Frame(f)
+        btns.grid(row=4, column=0, columnspan=4, sticky="e")
+        tk.Button(btns, text="Make the list", font=("Arial", 9, "bold"), command=create).pack(side="left")
+        tk.Button(btns, text="Cancel", font=("Arial", 9), command=top.destroy).pack(side="left", padx=(6, 0))
+        top.bind("<Escape>", lambda _e: top.destroy())
+
+    # ── video ─────────────────────────────────────────────────────
+
+    def _browse_video(self) -> None:
+        exts = " ".join(f"*{e}" for e in VIDEO_EXTS)
+        path = filedialog.askopenfilename(title="Open video", parent=self._dialog_parent(),
+                                          filetypes=[("Video files", exts), ("All files", "*.*")])
+        if path:
+            self._open_video(path, reset_batch=True)
+
+    def _close_video(self) -> None:
+        reader, self._video_reader = self._video_reader, None
+        if reader is not None:
+            reader.close()
+
+    def _open_video(self, path: str, reset_batch: bool = True, show_errors: bool = True) -> bool:
+        base = self._get_project_base()
+        abs_path = self._to_absolute(path, base)
+        self._stop_batch("ready")
+        self._close_video()
+        try:
+            reader = VideoFrameReader(abs_path)
+        except Exception as e:
+            self._status_var.set("cannot open video")
+            self._video_name_var.set(f"Cannot open: {abs_path}")
+            if show_errors:
+                messagebox.showerror("Open video", f"{e}", parent=self._dialog_parent())
+            return False
+        self._video_reader = reader
+        self._video_path_var.set(self._to_relative(abs_path, base))
+        self._source_var.set("video")
+        self._on_source_change(user=False)
+        if reset_batch:
+            self._reset_batch_defaults(reader.count_known())
+        # Count the frames exactly + fingerprint them, in the background.
+        threading.Thread(target=reader.build_index, daemon=True, name="video-index").start()
+        self._poll_video_index(reader)
+        self._update_video_labels()
+        self._status_var.set(f"video: {Path(abs_path).name}")
+        if self._validate_loop_fields():
+            self._emit_batch_frames(int(self._batch_current_var.get()))
+        return True
+
+    def _poll_video_index(self, reader) -> None:
+        if reader is not self._video_reader or self._destroyed:
+            return
+        self._update_video_labels()
+        if reader.index_ready or reader.index_error:
+            exact = reader.frame_count
+            if exact is not None and exact != reader.reported_count:
+                # The header's count was wrong: an End that meant "the last
+                # frame" follows the exact count.
+                if self._batch_end_var.get().strip() == str(reader.reported_count):
+                    self._batch_end_var.set(str(exact))
+            self._validate_loop_fields()
+            return
+        try:
+            self.canvas.after(300, lambda: self._poll_video_index(reader))
+        except tk.TclError:
+            pass
+
+    def _update_video_labels(self) -> None:
+        r = self._video_reader
+        if r is None:
+            self._video_name_var.set("No video. Use Open video...")
+            self._video_info_var.set("")
+            self._video_access_var.set("")
+            return
+        self._video_name_var.set(r.path)
+        count = (f"{r.frame_count} frames (counted)" if r.index_ready else
+                 f"~{r.reported_count} frames (from the file header; counting ... "
+                 f"{r.index_progress * 100:.0f}%)")
+        dur = f"  |  {r.count_known() / r.fps:.2f} s" if r.fps > 0 else ""
+        self._video_info_var.set(f"{r.width} x {r.height}  |  {r.fps:.3f} fps  |  codec {r.codec}  |  {count}{dur}")
+        if r.index_error:
+            text, color = (f"Frame access: the index failed ({r.index_error}); every jump is decoded "
+                           f"in order from the start (exact, but slow).", "#b36b00")
+        elif not r.index_ready:
+            text, color = ("Frame access: building the frame index ... until it is ready, jumps are "
+                           "decoded in order (exact).", "#666666")
+        elif not r.seek_reliable():
+            text, color = (f"Frame access: seeking is NOT reliable for this file ({r.seek_failures} of "
+                           f"{r.seeks} jumps failed the check); jumps are decoded from the start (exact, "
+                           f"slow). Play / Next are fast. Extracting the frames to images avoids this.",
+                           "#b36b00")
+        else:
+            checked = f" ({r.seeks - r.seek_failures}/{r.seeks} jumps verified)" if r.seeks else ""
+            text, color = (f"Frame access: exact. Jumps use seeking, each frame checked against the "
+                           f"index{checked}.", "#2e7d32")
+        self._video_access_var.set(text)
+        if self._video_access_label is not None and self._video_access_label.winfo_exists():
+            self._video_access_label.configure(fg=color)
+
+    def _confirm_video_jump(self, loop_index: int) -> bool:
+        """Before a UI-initiated step: if a frame will need slow in-order
+        decoding of many frames, explain it once per video and ask."""
+        r = self._video_reader
+        if not self._is_video() or r is None:
+            return True
+        cost = 0
+        for var in (self._batch_frame_1_var, self._batch_frame_2_var):
+            expr = self._parse_batch_expression(var.get())
+            if expr is not None:
+                cost = max(cost, r.slow_cost(self._expression_frame_number(expr, loop_index) - 1))
+        if cost <= r.SLOW_WARN_FRAMES or r.path in self._video_warned:
+            return True
+        self._video_warned.add(r.path)
+        reason = ("the frame index of this video is still being built" if not r.index_ready
+                  else "seeking is not reliable for this video")
+        return messagebox.askokcancel(
+            "Video: slow jump",
+            f"The requested frame is far from the current position and {reason}.\n\n"
+            f"To be sure it is exactly the right frame, the video will be decoded in order: "
+            f"about {cost} frames, which can take a while.\n\n"
+            f"Playing / Next (in order) is always fast. For frequent jumps use "
+            f"'Extract frames to image files'.\n\nThis message is shown once per video. Continue?",
+            icon="warning", parent=self._dialog_parent())
+
+    def _open_extract_dialog(self) -> None:
+        """Write the video's frames as image files, then optionally use them."""
+        r = self._video_reader
+        if r is None:
+            messagebox.showinfo("Extract frames", "Open a video first.", parent=self._dialog_parent())
+            return
+        stem = Path(r.path).stem
+        top = tk.Toplevel(self._dialog_parent())
+        top.title("Extract video frames to image files")
+        top.transient(self._dialog_parent())
+        f = tk.Frame(top, padx=10, pady=8)
+        f.pack(fill="both", expand=True)
+        folder_var = tk.StringVar(value=str(Path(r.path).parent / f"{stem}_frames"))
+        name_var = tk.StringVar(value=f"{stem}_%06d.png")
+        first_var = tk.StringVar(value="1")
+        last_var = tk.StringVar(value=str(r.count_known()))
+        step_var = tk.StringVar(value="1")
+        quality_var = tk.StringVar(value="95")
+        tk.Label(f, justify="left", anchor="w", wraplength=540, font=("Arial", 8), fg="#444444", text=(
+            "Frames are read IN ORDER (always exact). The number in each name is the video frame "
+            "number (1 = first frame). .png = lossless (recommended for measurements), .jpg = smaller "
+            "files.")).grid(row=0, column=0, columnspan=4, sticky="w")
+        tk.Label(f, text="Folder:").grid(row=1, column=0, sticky="w", pady=(8, 2))
+        tk.Entry(f, textvariable=folder_var, width=60).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(8, 2))
+        tk.Button(f, text="...", command=lambda: folder_var.set(
+            filedialog.askdirectory(parent=top) or folder_var.get())).grid(row=1, column=3, padx=(4, 0), pady=(8, 2))
+        tk.Label(f, text="File names:").grid(row=2, column=0, sticky="w", pady=2)
+        tk.Entry(f, textvariable=name_var, width=36).grid(row=2, column=1, sticky="w", pady=2)
+        tk.Label(f, text="JPG quality:").grid(row=2, column=2, sticky="e", pady=2)
+        tk.Entry(f, textvariable=quality_var, width=5).grid(row=2, column=3, sticky="w", pady=2)
+        rr = tk.Frame(f)
+        rr.grid(row=3, column=0, columnspan=4, sticky="w", pady=2)
+        for label, var in (("Frames from:", first_var), ("to:", last_var), ("every:", step_var)):
+            tk.Label(rr, text=label).pack(side="left", padx=(0, 2))
+            tk.Entry(rr, textvariable=var, width=8).pack(side="left", padx=(0, 10))
+        progress = tk.StringVar(value="")
+        tk.Label(f, textvariable=progress, anchor="w", justify="left", font=("Arial", 8, "bold"),
+                 fg="#2f3e5c").grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 4))
+        btns = tk.Frame(f)
+        btns.grid(row=5, column=0, columnspan=4, sticky="e")
+        job = {"cancel": threading.Event(), "done": 0, "total": 0, "error": None,
+               "finished": False, "paths": []}
+
+        def worker(abs_video, out_dir, pattern, first, last, step, quality):
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                cap = cv2.VideoCapture(abs_video)
+                wanted = set(range(first, last + 1, step))
+                job["total"] = len(wanted)
+                ext = Path(pattern).suffix.lower()
+                params = [cv2.IMWRITE_JPEG_QUALITY, quality] if ext in (".jpg", ".jpeg") else []
+                k = 0
+                while k < last and not job["cancel"].is_set():
+                    ok = cap.grab()
+                    if not ok:
+                        break
+                    k += 1
+                    if k in wanted:
+                        ok, frame = cap.retrieve()
+                        if not ok:
+                            break
+                        out = os.path.join(out_dir, pattern % k)
+                        ok, buf = cv2.imencode(ext, frame, params)
+                        if not ok:
+                            raise IOError(f"cannot encode {out}")
+                        buf.tofile(out)                      # also works for non-ASCII paths
+                        job["paths"].append(out)
+                        job["done"] += 1
+                cap.release()
+            except Exception as e:
+                job["error"] = f"{type(e).__name__}: {e}"
+            finally:
+                job["finished"] = True
+
+        def poll():
+            if not top.winfo_exists():
+                return
+            progress.set(f"Written {job['done']} / {job['total']} images ...")
+            if not job["finished"]:
+                top.after(200, poll)
+                return
+            start_btn.configure(state=tk.NORMAL)
+            if job["error"]:
+                progress.set(f"Failed: {job['error']}")
+                return
+            msg = ("Stopped" if job["cancel"].is_set() else "Done") + f": {job['done']} images written."
+            progress.set(msg)
+            if job["paths"] and messagebox.askyesno(
+                    "Extract frames", f"{msg}\n\nUse these images as this node's source now?", parent=top):
+                self._set_file_paths(job["paths"])
+                top.destroy()
+
+        def start():
+            try:
+                pattern = name_var.get().strip()
+                self._numbered_paths(pattern, 1, 1, 1)           # validates the number field
+                first, last, step = int(first_var.get()), int(last_var.get()), int(step_var.get())
+                quality = max(1, min(100, int(quality_var.get())))
+                if Path(pattern).suffix.lower() not in self._IMG_EXTS:
+                    raise ValueError("File names must end with an image extension such as .png or .jpg.")
+                if not (1 <= first <= last) or step < 1:
+                    raise ValueError("Use 1 <= from <= to and every >= 1.")
+            except (ValueError, TypeError) as e:
+                progress.set(f"Not valid: {e}")
+                return
+            job.update(done=0, total=0, error=None, finished=False, paths=[])
+            job["cancel"].clear()
+            start_btn.configure(state=tk.DISABLED)
+            threading.Thread(target=worker, daemon=True, args=(r.path, folder_var.get().strip(), pattern,
+                                                               first, last, step, quality)).start()
+            poll()
+        start_btn = tk.Button(btns, text="Extract", font=("Arial", 9, "bold"), command=start)
+        start_btn.pack(side="left")
+        tk.Button(btns, text="Stop", command=job["cancel"].set).pack(side="left", padx=(6, 0))
+        tk.Button(btns, text="Close", command=lambda: (job["cancel"].set(), top.destroy())).pack(
+            side="left", padx=(6, 0))
+
+    # ── help ──────────────────────────────────────────────────────
+
+    def _open_help(self) -> None:
+        if self._help_popup is not None:
+            try:
+                if self._help_popup.winfo_exists():
+                    self._help_popup.lift()
+                    return
+            except tk.TclError:
+                pass
+        popup = tk.Toplevel(self._dialog_parent())
+        popup.title("Image Sequence - Help")
+        popup.geometry("760x640")
+        body = tk.Frame(popup, padx=8, pady=8)
+        body.pack(fill="both", expand=True)
+        txt = tk.Text(body, font=("Courier", 9), wrap=tk.WORD, relief=tk.FLAT)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", self.HELP_TEXT)
+        txt.configure(state="disabled")
+        popup.bind("<Escape>", lambda _e: popup.destroy())
+        self._help_popup = popup
 
     @staticmethod
     def _popup_position_near_pointer(pointer_x: int, pointer_y: int, width: int, height: int,
@@ -933,8 +1343,8 @@ class ImageSequenceNode(BaseNode):
         if not self._file_paths:
             messagebox.showinfo(
                 "Edit File List",
-                "No files loaded yet. "
-                "Use Browse Folder first.")
+                "The list is empty. Make it with Folder..., Files... or Numbered names... first.",
+                parent=self._dialog_parent())
             return
 
         win = tk.Toplevel()
@@ -970,10 +1380,9 @@ class ImageSequenceNode(BaseNode):
             lines = [l.strip()
                      for l in txt.get("1.0", tk.END).splitlines()
                      if l.strip()]
-            # Pattern-mode paths are allowed to not exist yet (an external
-            # process may still be generating them), so only Folder mode
-            # warns about missing files here.
-            if self._method_var.get() != "pattern":
+            # With "Wait for files" on, missing paths are expected (another
+            # program may still write them); otherwise ask before applying.
+            if not self._wait_files_var.get():
                 bad = [l for l in lines
                        if not Path(self._to_absolute(l, base)).exists()]
                 if bad:
@@ -1005,32 +1414,27 @@ class ImageSequenceNode(BaseNode):
         self._batch_fetch_token += 1
         base = self._get_project_base()
         # Keep canonical stored paths project-relative when possible.
-        normalized = [
-            self._to_relative(self._to_absolute(p, base), base)
-            for p in paths
-        ]
+        normalized = self._normalize_paths(paths, base)
 
         self._file_paths    = normalized
         self._current_index = 0
         self._stop_batch("ready")
+        self._source_var.set("images")
+        self._on_source_change(user=False)
 
         n = len(normalized)
         if reset_batch:
-            self._batch_start_var.set("1")
             # Default pair 1 / i: frame 1 is the first frame, frame 2 runs over
             # every frame, so End is the last frame.
-            self._batch_end_var.set(str(max(1, n)))
-            self._batch_step_var.set("1")
-            self._batch_current_var.set("1")
-            self._batch_frame_1_var.set("1")
-            self._batch_frame_2_var.set("i")
+            self._reset_batch_defaults(n)
         if self._slider is not None and self._slider.winfo_exists():
             self._slider.configure(from_=0, to=max(0, n - 1))
         self._slider_var.set(0)
         self._count_var.set(f"/ {n}")
         self._info_var.set(
             f"{n} files  "
-            f"{Path(normalized[0]).name} ... {Path(normalized[-1]).name}")
+            f"{Path(normalized[0]).name} ... {Path(normalized[-1]).name}" if n else "no files")
+        self._update_list_summary()
         self._idx_var.set("1")
         self._fname_var.set("")
         self._size_var.set("")
@@ -1054,20 +1458,38 @@ class ImageSequenceNode(BaseNode):
             return None
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+    def _frame_label(self, index: int) -> str:
+        """Display name of a position: file name, or 'frame k  (t s)' for a video."""
+        if self._is_video():
+            r = self._video_reader
+            t = r.time_of(index) if r is not None else None
+            return f"frame {index + 1}" + (f"  (t = {t:.3f} s)" if t is not None else "")
+        if 0 <= index < len(self._file_paths):
+            return Path(self._file_paths[index]).name
+        return ""
+
+    def _read_index_once(self, index: int):
+        """Decode one position now (any thread). None if it cannot be read."""
+        if self._is_video():
+            reader = self._video_reader
+            return reader.read(index) if reader is not None else None
+        if not (0 <= index < len(self._file_paths)):
+            return None
+        return self._decode_frame(self._to_absolute(self._file_paths[index], self._get_project_base()))
+
     def _request_decode(self, index: int) -> None:
-        if not self._file_paths:
+        total = self._frame_total()
+        if not total:
             return
 
-        index = max(0, min(index, len(self._file_paths) - 1))
+        index = max(0, min(index, total - 1))
         self._current_index = index
-
-        base = self._get_project_base()
-        abs_path = self._to_absolute(self._file_paths[index], base)
+        label = self._frame_label(index)
 
         with self._decode_lock:
             self._decode_request_id += 1
             req_id = self._decode_request_id
-            self._decode_pending_req = (req_id, abs_path, index)
+            self._decode_pending_req = (req_id, label, index)
 
         self._try_start_decode()
 
@@ -1082,19 +1504,19 @@ class ImageSequenceNode(BaseNode):
                 return
             self._decode_pending_req = None
 
-            req_id, abs_path, index = req
-            fut = self._DECODE_POOL.submit(self._decode_frame, abs_path)
+            req_id, label, index = req
+            fut = self._DECODE_POOL.submit(self._read_index_once, index)
             self._decode_future = fut
 
-        def _done_cb(future, rid=req_id, path=abs_path, idx=index):
+        def _done_cb(future, rid=req_id, lab=label, idx=index):
             try:
-                self.canvas.after(0, lambda: self._on_decode_done(rid, path, idx, future))
+                self.canvas.after(0, lambda: self._on_decode_done(rid, lab, idx, future))
             except tk.TclError:
                 pass
 
         fut.add_done_callback(_done_cb)
 
-    def _on_decode_done(self, req_id: int, abs_path: str, index: int, future) -> None:
+    def _on_decode_done(self, req_id: int, label: str, index: int, future) -> None:
         with self._decode_lock:
             self._decode_future = None
             destroyed = self._destroyed
@@ -1116,8 +1538,7 @@ class ImageSequenceNode(BaseNode):
             return
 
         if frame_rgb is None:
-            self._info_var.set(
-                f"cannot read: {Path(abs_path).name}")
+            self._info_var.set(f"cannot read: {label}")
             self._size_var.set("read error")
             self._try_start_decode()
             return
@@ -1135,7 +1556,7 @@ class ImageSequenceNode(BaseNode):
             "image_1":       frame_rgb,
             "frame_index_1": float(index + 1),
             "files": self._absolute_file_paths(),
-            "frame_count": float(len(self._file_paths)),
+            "frame_count": float(self._frame_total()),
         })
 
         self._try_start_decode()
@@ -1146,21 +1567,22 @@ class ImageSequenceNode(BaseNode):
     # ── slider callbacks ──────────────────────────────────────────
 
     def _refresh_current_file_display(self) -> None:
-        """Keep the inspector's filename/size text aligned with the active frame pair."""
-        if not self._file_paths:
-            self._fname_var.set("frame 1: \nframe2: ")
+        """Keep the inspector's 'Now sending' text aligned with the active frame pair."""
+        total = self._frame_total()
+        if not total:
+            self._fname_var.set("frame 1: \nframe 2: ")
             self._size_var.set("")
             return
 
-        idx = max(0, min(self._current_index, len(self._file_paths) - 1))
-        name_1 = Path(self._file_paths[idx]).name
+        idx = max(0, min(self._current_index, total - 1))
         name_2 = ""
-        if (0 <= self._last_frame_2_index < len(self._file_paths)
-                and self._last_frame_2 is not None):
-            name_2 = Path(self._file_paths[self._last_frame_2_index]).name
-        self._fname_var.set(f"frame 1: {name_1}\nframe 2: {name_2}")
+        if 0 <= self._last_frame_2_index < total and self._last_frame_2 is not None:
+            name_2 = self._frame_label(self._last_frame_2_index)
+        self._fname_var.set(f"frame 1: {self._frame_label(idx)}\nframe 2: {name_2}")
 
         frame = self._last_frame if self._last_frame_index == idx else None
+        if frame is None and self._last_frame_1 is not None and self._last_frame_1_index == idx:
+            frame = self._last_frame_1
         if frame is None and self._last_frame_2 is not None and self._last_frame_2_index == idx:
             frame = self._last_frame_2
         if frame is None:
@@ -1185,7 +1607,7 @@ class ImageSequenceNode(BaseNode):
         if self._frame_index_input_connected:
             return
         self._slider_dragging = False
-        if self._file_paths:
+        if self._frame_total():
             self._load_and_push(self._slider_var.get())
 
     # ── frame index entry ─────────────────────────────────────────
@@ -1198,7 +1620,7 @@ class ImageSequenceNode(BaseNode):
             idx_1based = int(self._idx_var.get())
         except ValueError:
             return
-        if self._file_paths:
+        if self._frame_total():
             idx_0based = max(0, idx_1based - 1)
             self._load_and_push(idx_0based)
 
@@ -1219,8 +1641,9 @@ class ImageSequenceNode(BaseNode):
     def _send_current_batch_frame(self) -> None:
         self._move_batch_current("current")
 
-    def _move_batch_current(self, action: str) -> None:
-        """Navigate the configured loop manually and emit the selected pair."""
+    def _move_batch_current(self, action: str, ask: bool = True) -> None:
+        """Navigate the configured loop manually and emit the selected pair.
+        ask=False (trigger-driven moves) never opens the slow-jump dialog."""
         if self._frame_index_input_connected:
             self._status_var.set("disconnect index inputs for batch")
             return
@@ -1242,9 +1665,11 @@ class ImageSequenceNode(BaseNode):
         elif action == "next":
             position = min(len(values) - 1, position + 1)
 
+        loop_index = values[position]
+        if ask and not self._confirm_video_jump(loop_index):
+            return
         if self._batch_running:
             self._stop_batch("manual batch control")
-        loop_index = values[position]
         self._batch_current_var.set(str(loop_index))
         self._emit_batch_frames(loop_index, emit_trigger=True)
         if not self._batch_running:
@@ -1272,7 +1697,7 @@ class ImageSequenceNode(BaseNode):
             return
 
         next_idx = self._current_index + 1
-        if next_idx >= len(self._file_paths):
+        if next_idx >= self._frame_total():
             # reached end — stop
             self._stop_play()
             return
@@ -1357,7 +1782,7 @@ class ImageSequenceNode(BaseNode):
         self._set_external_index_connected(
             has_external_index or has_external_index_2)
 
-        if not self._file_paths:
+        if not self._frame_total():
             return {}
 
         # When indices are connected, decode both requested frames in this
@@ -1396,14 +1821,14 @@ class ImageSequenceNode(BaseNode):
                 "frame_index_1": float(requested_index + 1),
                 "frame_index_2": float(requested_index_2 + 1),
                 "files": self._absolute_file_paths(),
-                "frame_count": float(len(self._file_paths)),
+                "frame_count": float(self._frame_total()),
             }
 
         if trigger_is_linked or current_trigger_is_linked:
             if trigger_is_linked and self._truthy_trigger(inputs.get("trigger")):
-                self._move_batch_current("next")
+                self._move_batch_current("next", ask=False)
             if current_trigger_is_linked and self._truthy_trigger(inputs.get("current_trigger")):
-                self._move_batch_current("current")
+                self._move_batch_current("current", ask=False)
             # A truthy pulse already pushed frame output and the trigger pulse
             # through push_output(). Avoid emitting a second sync-path payload
             # that could race with trigger propagation (also applies to the
@@ -1419,7 +1844,7 @@ class ImageSequenceNode(BaseNode):
             "image_1": self._last_frame,
             "frame_index_1": float(self._current_index + 1),
             "files": self._absolute_file_paths(),
-            "frame_count": float(len(self._file_paths)),
+            "frame_count": float(self._frame_total()),
         }
         if self._last_frame_2 is not None:
             outputs["image_2"] = self._last_frame_2
@@ -1445,18 +1870,16 @@ class ImageSequenceNode(BaseNode):
         except (TypeError, ValueError, OverflowError):
             self._status_var.set(f"invalid {input_name} input")
             return None
-        return max(0, min(index, len(self._file_paths) - 1))
+        return max(0, min(index, self._frame_total() - 1))
 
     def _frame_for_index(self, index: int, cached_frame,
                          cached_index: int) -> np.ndarray | None:
         """Return a decoded frame, reusing the matching index cache."""
         if cached_frame is not None and cached_index == index:
             return cached_frame
-        abs_path = self._to_absolute(
-            self._file_paths[index], self._get_project_base())
-        frame = self._decode_frame(abs_path)
+        frame = self._read_index_once(index)
         if frame is None:
-            self._status_var.set(f"cannot read: {Path(abs_path).name}")
+            self._status_var.set(f"cannot read: {self._frame_label(index)}")
         return frame
 
     @staticmethod
@@ -1494,18 +1917,28 @@ class ImageSequenceNode(BaseNode):
         thread. In Pattern mode this waits for/retries a file that has not
         finished being generated yet; in Folder mode it is a one-shot decode.
         """
-        abs_path = self._to_absolute(self._file_paths[index], self._get_project_base())
-        is_pattern = self._method_var.get() == "pattern"
-        wait_s = float(self._pattern_wait_var.get())
         token = self._batch_fetch_token
 
         def _cancelled() -> bool:
             return self._destroyed or self._batch_fetch_token != token
 
-        def _task():
-            if is_pattern:
-                return self._read_frame_blocking(abs_path, wait_s, _cancelled)
-            return self._decode_frame(abs_path)
+        if self._is_video():
+            reader = self._video_reader
+
+            def _task():
+                return reader.read(index) if reader is not None else None
+        else:
+            abs_path = self._to_absolute(self._file_paths[index], self._get_project_base())
+            waits = self._waits_for_files()
+            try:
+                wait_s = float(self._pattern_wait_var.get())
+            except (tk.TclError, ValueError):
+                wait_s = 0.5
+
+            def _task():
+                if waits:
+                    return self._read_frame_blocking(abs_path, wait_s, _cancelled)
+                return self._decode_frame(abs_path)
 
         future = self._DECODE_POOL.submit(_task)
 
@@ -1524,6 +1957,24 @@ class ImageSequenceNode(BaseNode):
         future.add_done_callback(_done)
 
     # ── serialization ─────────────────────────────────────────────
+
+    def _normalize_paths(self, paths, base: Path | None) -> list[str]:
+        """_to_relative(_to_absolute(p)) for a whole list, computed once per
+        FOLDER (a sequence has thousands of files in a few folders)."""
+        folders: dict[str, tuple[str, str]] = {}
+        out = []
+        for p in paths:
+            folder, name = os.path.split(str(p))
+            if not name or name in (".", ".."):
+                out.append(self._to_relative(self._to_absolute(p, base), base))
+                continue
+            conv = folders.get(folder)
+            if conv is None:
+                # Convert a probe path in this folder and keep its folder part.
+                probe = self._to_relative(self._to_absolute(os.path.join(folder, "x"), base), base)
+                conv = folders[folder] = (os.path.split(probe)[0],)
+            out.append(os.path.join(conv[0], name) if conv[0] else name)
+        return out
 
     def _to_relative(self, path: str,
                      base: Path | None) -> str:
@@ -1559,12 +2010,27 @@ class ImageSequenceNode(BaseNode):
         several times per load/save and on every frame emit, that was ~80k
         disk queries and 10-17 s per project load/save (worse on slow or
         external drives)."""
-        p = Path(path)
-        if p.is_absolute():
-            return str(p)
-        if base is None:
-            return str(p)
-        return os.path.normpath(os.path.join(str(base), str(p)))
+        folder, name = os.path.split(str(path))
+        if not name or name in (".", ".."):          # rare (folder fields): no per-folder cache
+            p = Path(path)
+            if p.is_absolute() or base is None:
+                return str(p)
+            return os.path.normpath(os.path.join(str(base), str(p)))
+        cache = self.__dict__.setdefault("_abspath_cache", {})
+        key = (folder, None if base is None else str(base))
+        abs_folder = cache.get(key)
+        if abs_folder is None:
+            p = Path(folder) if folder else None
+            if p is None:
+                abs_folder = "" if base is None else os.path.normpath(str(base))
+            elif p.is_absolute() or base is None:
+                abs_folder = str(p)
+            else:
+                abs_folder = os.path.normpath(os.path.join(str(base), str(p)))
+            if len(cache) > 1000:
+                cache.clear()
+            cache[key] = abs_folder
+        return os.path.join(abs_folder, name) if abs_folder else name
 
     def _get_project_base(self) -> Path | None:
         return get_project_directory()
@@ -1574,6 +2040,8 @@ class ImageSequenceNode(BaseNode):
 
         Called on every frame emit, so the converted list is cached and only
         rebuilt when the file list or the project folder changes."""
+        if self._is_video():
+            return []                      # a video has no file list
         base = self._get_project_base()
         key = (str(base), tuple(self._file_paths))
         cache = getattr(self, "_abs_paths_cache", None)
@@ -1602,10 +2070,14 @@ class ImageSequenceNode(BaseNode):
         if project_dir is None:
             return False
         path = project_dir / filename
+        text = "\n".join(paths) + "\n"
+        if self._sidecar_unchanged(path, text):
+            return True                              # same content already on disk
         tmp = path.with_name(path.name + ".tmp")
         try:
-            tmp.write_text("\n".join(paths) + "\n", encoding="utf-8")
+            tmp.write_text(text, encoding="utf-8")
             tmp.replace(path)
+            self._remember_sidecar(path, text)
             return True
         except OSError:
             try:
@@ -1619,21 +2091,47 @@ class ImageSequenceNode(BaseNode):
         if project_dir is None or Path(filename).name != filename:
             return None
         try:
-            return (project_dir / filename).read_text(encoding="utf-8")
+            text = (project_dir / filename).read_text(encoding="utf-8")
         except OSError:
             return None
+        self._remember_sidecar(project_dir / filename, text)
+        return text
+
+    # The side file is skipped on save when its text equals what was last
+    # read / written AND the file was not touched since (same size + mtime).
+    # Opening a file costs tens of ms on some drives (antivirus, USB, network).
+    def _remember_sidecar(self, path: Path, text: str) -> None:
+        try:
+            st = os.stat(path)
+            self._sidecar_known = (str(path), hash(text), st.st_size, st.st_mtime_ns)
+        except OSError:
+            self._sidecar_known = None
+
+    def _sidecar_unchanged(self, path: Path, text: str) -> bool:
+        known = getattr(self, "_sidecar_known", None)
+        if not known or known[0] != str(path) or known[1] != hash(text):
+            return False
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        return (st.st_size, st.st_mtime_ns) == known[2:]
 
     def get_params(self) -> dict:
         base  = self._get_project_base()
-        paths = [self._to_relative(self._to_absolute(p, base), base)
-                 for p in self._file_paths]
-        method = self._method_var.get()
+        key = (str(base), tuple(self._file_paths))
+        cached = getattr(self, "_params_paths_cache", None)
+        if cached is None or cached[0] != key:
+            cached = (key, self._normalize_paths(self._file_paths, base))
+            self._params_paths_cache = cached
+        paths = cached[1]
+        method = "pattern" if self._wait_files_var.get() else "folder"
         pattern = self._to_relative(self._pattern_var.get().strip(), base)
 
         folder_value = self._folder_var.get().strip()
         if folder_value and folder_value != "(no folder)":
             folder_value = self._to_relative(self._to_absolute(folder_value, base), base)
-        elif self._method_var.get() == "folder" and self._file_paths:
+        elif self._file_paths:
             # If folder text was lost/stale, infer it from current file list.
             abs_files = [Path(self._to_absolute(p, base)) for p in self._file_paths]
             if abs_files:
@@ -1657,11 +2155,19 @@ class ImageSequenceNode(BaseNode):
             elif method == "folder":
                 file_list_text = ""          # last resort: the folder re-scan
 
+        video_value = self._video_path_var.get().strip()
+        if video_value:
+            video_value = self._to_relative(self._to_absolute(video_value, base), base)
         return {
-            "method":        method,
+            "source":        self._source_var.get(),            # "images" | "video"
+            "wait_for_files": bool(self._wait_files_var.get()),
+            "video":         video_value,
+            "pattern_first": self._pattern_first_var.get(),
+            "pattern_last":  self._pattern_last_var.get(),
+            "pattern_step":  self._pattern_step_var.get(),
+            # Older versions read "method": pattern = wait for files, folder = do not.
+            "method":        "pattern" if self._wait_files_var.get() else "folder",
             "pattern":       pattern,
-            "start":         self._start_var.get(),
-            "end":           self._end_var.get(),
             "pattern_wait":  self._pattern_wait_var.get(),
             "folder":        folder_value or "(no folder)",
             "file_list":     file_list_text,
@@ -1680,15 +2186,20 @@ class ImageSequenceNode(BaseNode):
         self._init_ui_state()
         method = params.get("method", "pattern")
         self._method_var.set(method)
-        self._on_method_change()
+        # Projects saved before the redesign have no "source" / "wait_for_files":
+        # Pattern mode waited for files, Folder mode did not.
+        source = str(params.get("source", "images"))
+        self._wait_files_var.set(bool(params.get("wait_for_files", method == "pattern")))
+        for key, var, default in (("pattern_first", self._pattern_first_var, "1"),
+                                  ("pattern_last", self._pattern_last_var, "100"),
+                                  ("pattern_step", self._pattern_step_var, "1")):
+            var.set(str(params.get(key, default)))
 
         base = self._get_project_base()
         pattern_value = str(params.get("pattern", "") or "")
         self._pattern_var.set(
             self._to_relative(self._to_absolute(pattern_value, base), base)
         )
-        self._start_var.set(str(params.get("start", "0")))
-        self._end_var.set(str(params.get("end", "0")))
         try:
             self._pattern_wait_var.set(float(params.get("pattern_wait", 0.5)))
         except (TypeError, ValueError):
@@ -1704,6 +2215,14 @@ class ImageSequenceNode(BaseNode):
         except (TypeError, ValueError):
             self._fps_var.set("5")
 
+        # A video source: open it (the batch fields are restored below).
+        if source == "video":
+            video = str(params.get("video", "") or "")
+            if video and not self._open_video(video, reset_batch=False, show_errors=False):
+                self._status_var.set("saved video not found")
+            self._source_var.set("video")
+            self._on_source_change(user=False)
+
         # Restore file list first. This is the most explicit source of truth:
         # inline, or (long lists) from the side file written by get_params.
         file_list = params.get("file_list", "")
@@ -1713,10 +2232,8 @@ class ImageSequenceNode(BaseNode):
             file_list = self._read_file_list_sidecar(sidecar) or ""
             sidecar_missing = not file_list
         if file_list:
-            paths = [
-                self._to_relative(self._to_absolute(p.strip(), base), base)
-                for p in file_list.splitlines()
-                if p.strip()]
+            paths = self._normalize_paths(
+                [p.strip() for p in file_list.splitlines() if p.strip()], base)
             if paths:
                 if method == "folder" and (folder_value == "(no folder)" or not folder_value):
                     # Recover folder label from file list for older payloads.
@@ -1728,6 +2245,18 @@ class ImageSequenceNode(BaseNode):
                 self._load_and_push(idx)
         # Folder-mode fallback for legacy/broken params_json payloads where
         # file_list may be missing but folder was persisted.
+        elif source != "video" and method == "pattern" and params.get("pattern"):
+            # Old Pattern-mode project without a saved list: list position i
+            # was pattern % i for i = 1 .. batch End (the old semantics).
+            try:
+                end = int(params.get("batch_end", 0))
+                paths = self._numbered_paths(str(params.get("pattern")), 1, end, 1) if end >= 1 else []
+            except (TypeError, ValueError):
+                paths = []
+            if paths:
+                self._pattern_first_var.set("1")
+                self._pattern_last_var.set(str(end))
+                self._set_file_paths(paths)
         elif method == "folder" and folder_value and folder_value != "(no folder)":
             try:
                 abs_folder = self._to_absolute(folder_value, base)
@@ -1754,7 +2283,7 @@ class ImageSequenceNode(BaseNode):
 
         self._batch_start_var.set(str(params.get("batch_start", "1")))
         self._batch_end_var.set(str(params.get(
-            "batch_end", max(1, len(self._file_paths) - 1))))
+            "batch_end", max(1, self._frame_total() - 1))))
         self._batch_step_var.set(str(params.get("batch_step", "1")))
         self._batch_current_var.set(str(params.get(
             "batch_current", self._batch_start_var.get())))
@@ -1763,7 +2292,10 @@ class ImageSequenceNode(BaseNode):
         # New file lists get the 1 / i defaults from _set_file_paths().
         self._batch_frame_1_var.set(str(params.get("batch_frame_1", "i")))
         self._batch_frame_2_var.set(str(params.get("batch_frame_2", "i+1")))
-        if self._validate_loop_fields() and self._file_paths:
+        if source == "video":
+            self._source_var.set("video")
+            self._on_source_change(user=False)
+        if self._validate_loop_fields() and self._frame_total():
             self._emit_batch_frames(int(self._batch_current_var.get()))
 
     def on_destroy(self) -> None:
@@ -1772,4 +2304,5 @@ class ImageSequenceNode(BaseNode):
             self._decode_pending_req = None
         self._stop_play()
         self._stop_batch("destroyed")
+        self._close_video()
         super().on_destroy()

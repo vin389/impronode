@@ -34,6 +34,16 @@ PINS
                 (Replaces the old single-point 'coords' output; projects that
                 used it are reconnected to 'points' automatically.)
 
+QUICK START (first time here?)
+  1. Move the mouse over the image. The MAGNIFIER (top right) shows the
+     area under the cursor, strongly zoomed; its red cross is exactly at
+     the cursor position, which is written next to it (x, y, pixel value).
+  2. Want a precise point? Tick "Corners" (Alt+C) in the magnifier, move
+     close to the corner, then press S: the detected corner nearest to the
+     cross is added to the output points (no clicking, no hand shake).
+  3. Mode "Pick points" (Alt+I): click to add points. Mode "Pan" (Alt+P):
+     drag to move the image. Every button has an Alt+key (underlined letter).
+
 IMAGE VIEW (left side of the inspector)
   Wheel or + / -   zoom at the cursor         Left-drag   pan
   Fit / 1:1        fit the window / 1 image pixel = 1 screen pixel
@@ -45,14 +55,53 @@ IMAGE VIEW (left side of the inspector)
   Interpolation    used when zoomed in (zooming out always averages).
   The status bar shows the cursor position in image pixels and the pixel
   value. Coordinates follow OpenCV: (0, 0) is the CENTRE of the top-left
-  pixel.
+  pixel. The dashed orange square on the image is the magnifier's area.
+
+MAGNIFIER (top right) -- a zoomed look around the cursor
+  What you see
+    The image around the "probe" point, enlarged 1X..64X (16X: every image
+    pixel is 16 x 16 screen pixels), drawn with the same Interp. method as
+    the main view (NEAREST = sharp blocks, LINEAR / CUBIC / LANCZOS4 =
+    smooth; AREA is shown as LINEAR here). The thin red CROSS never moves:
+    it marks the probe exactly; the zoomed pixels slide under it -- as many
+    times faster than your mouse as the zoom, so you see sub-pixel positions.
+  The probe
+    = the cursor while it is over the image. When the mouse LEAVES the
+    image, the probe stays where it was (a small orange cross marks it), so
+    you can look at the magnifier and use the keys without touching the
+    mouse. Arrow keys move the probe by 1 pixel, Shift+arrows by 0.1 pixel
+    (click on the image or the magnifier first, so it has keyboard focus).
+  Zoom
+    Buttons 1X 2X 4X 8X 16X 32X 64X, or Alt+0 ... Alt+6 (Alt+0 = 1X,
+    Alt+4 = 16X, Alt+6 = 64X), or the mouse wheel over the magnifier.
+  Detect (instant, re-run every time the magnified area changes)
+    Corners   cv2.cornerHarris + local maxima; "threshold" = fraction of
+              the strongest corner response (0.05 = keep corners at least
+              5 % as strong as the best one); "sub-pixel" refines them with
+              cv2.cornerSubPix. Drawn as CYAN circles.
+    ArUco     cv2.aruco marker detector with the chosen dictionary (it MUST
+              match the printed markers, e.g. DICT_4X4_50); "sub-pixel"
+              refines the marker corners. Searched in the WHOLE frame
+              (once per frame), so a marker is found even when only part
+              of it is inside the magnifier. Drawn in YELLOW with the
+              id; corner 0 has the thicker square.
+    Features  cv2.goodFeaturesToTrack: "max" points, "quality" = like the
+              corner threshold. It finds corners ON THE PIXEL GRID (whole
+              numbers); "sub-pixel" refines them with cv2.cornerSubPix.
+              Drawn as GREEN plus signs.
+    The detection nearest to the cross is circled in PINK and its position
+    and distance are shown; press S to add it to the output points.
+    Tip: if nothing is found, zoom OUT (Alt+1 or Alt+0): a lower zoom
+    shows (and searches) a bigger area.
+  Drag the bar between the magnifier and the tabs to give either more room;
+  each of the two panels gets a scroll bar when its content does not fit.
 
 POINTS TAB -- two boxes (drag the bar between them to resize)
   Input points (read-only)
     The points arriving on the INPUT pin 'points' (all columns). Select and
     copy with Ctrl+C / Ctrl+A, or "Copy all". Refreshed at most 4 times a
     second; updates pause while you have text selected (so a selection you
-    are copying is not replaced) or when "Live update" is off.
+    are copying is not replaced) or when "Live" is off.
     "-> Add to output" appends their x, y to the Output list and sends it.
   Output points (editable) -- what the OUTPUT pin 'points' sends
     The header says what is sent ("Sent: N points"). Typing in the box does
@@ -62,17 +111,28 @@ POINTS TAB -- two boxes (drag the bar between them to resize)
   Image actions send at once:
     Mode "Pick":  a click adds a point; drag an output point to move it;
                   dragging anywhere else still pans.
-    Key C         (any mode, cursor over the image) adds the point under the
-                  cursor and copies "x, y" to the clipboard.
+    Key C         (any mode) adds the probe point (= under the cursor / at
+                  the magnifier's cross) and copies "x, y" to the clipboard.
+    Key S         adds the detection nearest to the magnifier's cross
+                  (snap; needs Corners / ArUco / Features ticked).
     Ctrl+Z        removes the last point.   Right-click: add / remove / copy.
-    While the Output box has unsent edits these are refused (Apply or Revert
-    first), so they never overwrite your typing or send it unasked.
+    If the Output box has typed edits that are not sent yet, an image action
+    first APPLIES (sends) them, then adds / moves / removes the point -- your
+    typing is never lost. Only if a typed line is not a valid "x, y" is the
+    action refused; a message on the image says so (fix the line or Revert).
   Saving the project stores the SENT list.
 
 ANALYSIS TAB -- runs ONCE on the shown frame when you press Apply
   Good features  cv2.goodFeaturesToTrack (corners), optional sub-pixel refine
   Chessboard     cv2.findChessboardCorners (inner corners: cols x rows),
                  optional cornerSubPix
+  ArUco markers  cv2.aruco detector (dictionary must match the markers).
+                 FIVE points per marker: corners 0, 1, 2, 3 (clockwise from
+                 the marker's own top-left corner) and the centre. Centre =
+                 intersection of the diagonals (true centre of the square,
+                 also in perspective) or the plain mean of the 4 corners.
+                 Markers sorted by id (or as detected). Corner refinement:
+                 subpix (recommended), contour, apriltag or none.
   Hough lines    Canny edges, then cv2.HoughLinesP (segments) or
                  cv2.HoughLines (infinite lines given as rho, theta)
   Sobel          |d/dx|, |d/dy| or gradient magnitude, shown as an image
@@ -86,7 +146,50 @@ ANALYSIS TAB -- runs ONCE on the shown frame when you press Apply
 DISPLAY TAB
   Cursor read-out and frame rate in the status bar; marker, colour and line
   width of the input 'points' overlay.
+
+KEYBOARD SHORTCUTS
+  Alt+key works anywhere in the inspector (the underlined letter in a label
+  is its key). Plain keys work while the image or the magnifier has the
+  keyboard focus (move the mouse over it or click it).
+  View            Alt+T  fit             Alt+O  1:1
+                  Alt+E  freeze on/off   Alt+G  grid on/off
+                  Alt+L  next interpolation method
+                  + / -  zoom in / out   wheel  zoom at the cursor
+  Mode            Alt+P  Pan             Alt+I  Pick points
+  Magnifier       Alt+0 .. Alt+6   zoom 1X .. 64X  (wheel over it too)
+                  Alt+C  Corners     Alt+A  ArUco     Alt+F  Features
+                  arrows  move the probe 1 px    Shift+arrows  0.1 px
+  Points          C  add the probe point (and copy it)
+                  S  add the nearest detection (snap)
+                  Ctrl+Z  remove the last point
+                  Ctrl+Enter  Apply (send) the edited Output box
+  Analysis        Ctrl+R  Apply the selected analysis
+  Tabs            Ctrl+Tab / Ctrl+Shift+Tab   next / previous tab
+  Help            Ctrl+H
 """
+
+
+ARUCO_DICT_NAMES = (
+    "DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
+    "DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
+    "DICT_6X6_50", "DICT_6X6_100", "DICT_6X6_250", "DICT_6X6_1000",
+    "DICT_7X7_50", "DICT_7X7_100", "DICT_7X7_250", "DICT_7X7_1000",
+    "DICT_ARUCO_ORIGINAL", "DICT_APRILTAG_16h5", "DICT_APRILTAG_25h9",
+    "DICT_APRILTAG_36h10", "DICT_APRILTAG_36h11", "DICT_ARUCO_MIP_36h12")
+
+
+def _aruco_center(quad: np.ndarray, mode: str = "diagonal intersection") -> np.ndarray:
+    """Centre of a marker's 4 corners. 'diagonal intersection' (corner 0-2
+    crossed with corner 1-3) is the true centre of the square even under
+    perspective; 'mean of 4 corners' is shifted towards the far side."""
+    q = np.asarray(quad, dtype=np.float64).reshape(4, 2)
+    if mode.startswith("mean"):
+        return q.mean(axis=0)
+    h = lambda a: np.array([a[0], a[1], 1.0])                     # noqa: E731
+    pt = np.cross(np.cross(h(q[0]), h(q[2])), np.cross(h(q[1]), h(q[3])))
+    if abs(pt[2]) < 1e-12:                                        # degenerate quad
+        return q.mean(axis=0)
+    return pt[:2] / pt[2]
 
 
 def _parse_point_lines(text: str):
@@ -143,6 +246,16 @@ class ImageDisplayNode(BaseNode):
     _FACE_REFRESH_S = 0.25
     _MAX_LISTED = 500              # result lines listed in the result box
 
+    # Magnifier (loupe): a fixed-size canvas showing the image around the
+    # PROBE point (the cursor, or where it was last / was moved with keys).
+    _LOUPE_SIZE = 216
+    _LOUPE_ZOOMS = (1, 2, 4, 8, 16, 32, 64)    # radio buttons; Alt+0..6 = 1X..64X
+    _LOUPE_CORNER_COLOR = "#00e5ff"
+    _LOUPE_FEATURE_COLOR = "#7cfc00"
+    _LOUPE_ARUCO_COLOR = "#ffd23f"
+    _LOUPE_NEAREST_COLOR = "#ff4dd2"
+    _ARUCO_DICTS = ARUCO_DICT_NAMES
+
     # Analysis tools: key -> (label, [(param, label, default, kind)]);
     # kind: "int" | "float" | "bool" | "choice:a|b|c".
     _TOOLS = {
@@ -174,6 +287,16 @@ class ImageDisplayNode(BaseNode):
             ("threshold", "Accumulator threshold", 80, "int"),
             ("min_length", "Min line length (px, segments)", 30.0, "float"),
             ("max_gap", "Max line gap (px, segments)", 10.0, "float"),
+        ]),
+        "aruco": ("ArUco markers (4 corners + centre)", [
+            ("dictionary", "Dictionary", "DICT_4X4_50", "choice:" + "|".join(ARUCO_DICT_NAMES)),
+            ("refine", "Corner refinement", "subpix", "choice:subpix|contour|apriltag|none"),
+            ("center", "5th point (centre)", "diagonal intersection",
+             "choice:diagonal intersection|mean of 4 corners"),
+            ("order", "Marker order", "by id", "choice:by id|as detected"),
+            ("win_min", "Adaptive threshold window min (px)", 3, "int"),
+            ("win_max", "Adaptive threshold window max (px)", 23, "int"),
+            ("min_perimeter", "Min marker perimeter (x image size)", 0.03, "float"),
         ]),
         "sobel": ("Sobel gradient", [
             ("output", "Output", "magnitude", "choice:magnitude|d/dx|d/dy"),
@@ -212,6 +335,12 @@ class ImageDisplayNode(BaseNode):
         self._result_serial = 0
         self._last_pick = (0.0, None)            # (time, (x, y)) -- ignore double-click duplicates
         self._cursor_xy = None                   # cursor position over the view, canvas px
+        self._probe = None                       # (x, y) image px shown in the magnifier
+        self._loupe_pending = False
+        self._loupe_photo = None
+        self._loupe_nearest = None               # (kind, x, y) nearest detection to the probe
+        self._aruco_cache = (None, None)         # (settings key, cv2.aruco.ArucoDetector)
+        self._aruco_frame_cache = (None, [])     # (frame + settings key, [(id, 4x2 corners)])
         self._last_input_refresh = 0.0
         self._help_popup = None
         self._reset_widget_refs()
@@ -235,6 +364,22 @@ class ImageDisplayNode(BaseNode):
         self._show_picked_var = tk.BooleanVar(value=True)
         self._show_numbers_var = tk.BooleanVar(value=True)
         self._input_live_var = tk.BooleanVar(value=True)
+        # Magnifier.
+        self._loupe_zoom_var = tk.IntVar(value=16)
+        self._det_corners_var = tk.BooleanVar(value=False)
+        self._det_aruco_var = tk.BooleanVar(value=False)
+        self._det_features_var = tk.BooleanVar(value=False)
+        self._corner_subpix_var = tk.BooleanVar(value=True)
+        self._corner_thresh_var = tk.StringVar(value="0.05")
+        self._aruco_dict_var = tk.StringVar(value="DICT_4X4_50")
+        self._aruco_refine_var = tk.BooleanVar(value=True)
+        self._feat_max_var = tk.StringVar(value="20")
+        self._feat_quality_var = tk.StringVar(value="0.01")
+        self._feat_subpix_var = tk.BooleanVar(value=True)
+        for var in (self._feat_subpix_var, self._loupe_zoom_var, self._det_corners_var, self._det_aruco_var, self._det_features_var,
+                    self._corner_subpix_var, self._corner_thresh_var, self._aruco_dict_var,
+                    self._aruco_refine_var, self._feat_max_var, self._feat_quality_var):
+            var.trace_add("write", lambda *_a: (self._request_loupe(), self._request_render()))
         self._input_live_var.trace_add("write", lambda *_a: self._refresh_input_text(force=True))
         self._tool_var = tk.StringVar(value="gftt")
         self._show_result_var = tk.BooleanVar(value=True)
@@ -272,6 +417,10 @@ class ImageDisplayNode(BaseNode):
         self._add_points_btn = None
         self._result_image_cb = None
         self._text_dirty = False
+        self._c_loupe = None
+        self._loupe_info_var = None
+        self._loupe_nearest_var = None
+        self._loupe_zoom_label_var = None
 
     # ── pins ──────────────────────────────────────────────────────────
     def get_pin_schema(self) -> PinSchema:
@@ -402,7 +551,7 @@ class ImageDisplayNode(BaseNode):
         win = self._inspector_win
         if win is not None:
             sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-            win.geometry(f"{min(1300, sw - 80)}x{min(820, sh - 120)}")
+            win.geometry(f"{min(1300, sw - 80)}x{min(900, sh - 110)}")
             win.minsize(min(900, sw - 80), min(520, sh - 120))
             for seq in ("<Control-h>", "<Control-H>"):
                 win.bind(seq, lambda _e: self._open_help())
@@ -411,20 +560,39 @@ class ImageDisplayNode(BaseNode):
         panes.pack(fill="both", expand=True)
         left, right = tk.Frame(panes), tk.Frame(panes)
         panes.add(left, minsize=420, stretch="always")
-        panes.add(right, width=420, minsize=340, stretch="never")
+        panes.add(right, width=465, minsize=380, stretch="never")
         self._build_view(left)
 
-        nb = ttk.Notebook(right)
+        # Right side: the magnifier on top, the tabs below (drag the bar between them).
+        rpanes = tk.PanedWindow(right, orient=tk.VERTICAL, sashwidth=6, sashrelief=tk.RAISED)
+        rpanes.pack(fill="both", expand=True)
+        mag = tk.Frame(rpanes)
+        tabs = tk.Frame(rpanes)
+        rpanes.add(mag, minsize=200, stretch="never")
+        rpanes.add(tabs, minsize=200, stretch="always")
+        mag_inner = self._scroll_area(mag)
+        self._build_magnifier(mag_inner)
+        mag_inner.update_idletasks()
+        rpanes.paneconfigure(mag, height=mag_inner.winfo_reqheight() + 6)
+        nb = ttk.Notebook(tabs)
         nb.pack(fill="both", expand=True)
+        nb.enable_traversal()                        # Ctrl+Tab / Ctrl+Shift+Tab switch tabs
         for title, builder in (("Points", self._build_points_tab),
                                ("Analysis", self._build_analysis_tab),
                                ("Display", self._build_display_tab)):
-            tab = tk.Frame(nb, padx=6, pady=6)
-            nb.add(tab, text=title)
+            page = tk.Frame(nb)
+            nb.add(page, text=title)
+            # Each tab scrolls on its own (the notebook is as tall as its
+            # TALLEST tab, so one scroll area around it made short tabs scroll).
+            tab = tk.Frame(self._scroll_area(page), padx=6, pady=6)
+            tab.pack(fill="both", expand=True)
             builder(tab)
         self._sync_text_from_points()
         self._show_result_text()
+        if win is not None:
+            self._bind_shortcuts(win)
         self._request_render()
+        self._request_loupe()
 
     def close_inspector(self) -> None:
         self._close_help()
@@ -435,18 +603,19 @@ class ImageDisplayNode(BaseNode):
     def _build_view(self, parent) -> None:
         bar = tk.Frame(parent)
         bar.pack(fill="x", pady=(0, 3))
-        tk.Checkbutton(bar, text="Freeze", variable=self._freeze_var,
+        # Underlined letter = Alt+letter shortcut (see Help / Keys).
+        tk.Checkbutton(bar, text="Freeze", underline=2, variable=self._freeze_var,
                        font=("Arial", 9, "bold")).pack(side="left")
-        tk.Button(bar, text="Fit", width=4, command=self._fit_view).pack(side="left", padx=(8, 0))
-        tk.Button(bar, text="1:1", width=4, command=self._one_to_one).pack(side="left", padx=(2, 0))
+        tk.Button(bar, text="Fit", underline=2, width=4, command=self._fit_view).pack(side="left", padx=(8, 0))
+        tk.Button(bar, text="1:1 (O)", width=6, command=self._one_to_one).pack(side="left", padx=(2, 0))
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
         tk.Label(bar, text="Mode:").pack(side="left")
-        for value, label in (("pan", "Pan"), ("pick", "Pick points")):
-            tk.Radiobutton(bar, text=label, value=value, variable=self._mode_var,
+        for value, label, ul in (("pan", "Pan", 0), ("pick", "Pick points", 1)):
+            tk.Radiobutton(bar, text=label, underline=ul, value=value, variable=self._mode_var,
                            command=self._on_mode_changed).pack(side="left")
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
-        tk.Checkbutton(bar, text="Grid", variable=self._show_grid_var).pack(side="left")
-        tk.Label(bar, text="Interp.").pack(side="left", padx=(8, 2))
+        tk.Checkbutton(bar, text="Grid", underline=0, variable=self._show_grid_var).pack(side="left")
+        tk.Label(bar, text="Interp. (L)").pack(side="left", padx=(8, 2))
         ttk.Combobox(bar, textvariable=self._interp_var, values=tuple(self._INTERPOLATIONS),
                      state="readonly", width=9).pack(side="left")
         tk.Button(bar, text="Help (Ctrl+H)", command=self._open_help).pack(side="right")
@@ -471,8 +640,10 @@ class ImageDisplayNode(BaseNode):
                         ("<KeyPress-minus>", lambda e: self._zoom_at_cursor(1 / self._ZOOM_STEP)),
                         ("<KeyPress-KP_Subtract>", lambda e: self._zoom_at_cursor(1 / self._ZOOM_STEP)),
                         ("<KeyPress-c>", self._on_key_c), ("<KeyPress-C>", self._on_key_c),
+                        ("<KeyPress-s>", self._on_key_s), ("<KeyPress-S>", self._on_key_s),
                         ("<Control-z>", lambda e: self._undo_last()), ("<Control-Z>", lambda e: self._undo_last())):
             c.bind(seq, fn)
+        self._bind_probe_keys(c)
 
         self._status_bar_var = tk.StringVar(value="")
         tk.Label(parent, textvariable=self._status_bar_var, anchor="w", relief=tk.SUNKEN,
@@ -593,7 +764,9 @@ class ImageDisplayNode(BaseNode):
                 self._photo_key = pkey
             c.create_image(ox + x0 * s, oy + y0 * s, image=self._photo, anchor="nw")
         self._draw_overlays(c, w, h, ox, oy, s, (x0, y0, x1, y1))
+        self._draw_probe_marker(c)
         self._update_status_bar()
+        self._request_loupe()
 
     def _to_canvas(self, x, y):
         ox, oy, s = self._view
@@ -621,6 +794,16 @@ class ImageDisplayNode(BaseNode):
                 c.create_line(*self._to_canvas(x1_, y1_), *self._to_canvas(x2_, y2_),
                               fill=self._RESULT_LINE_COLOR, width=2)
             pts = res.get("points")
+            if res.get("aruco_ids") is not None and pts is not None and len(pts):
+                for m, mid in enumerate(res["aruco_ids"]):
+                    quad = [self._to_canvas(*q) for q in pts[5 * m:5 * m + 4]]
+                    c.create_polygon(*[v for q in quad for v in q], outline=self._RESULT_LINE_COLOR,
+                                     fill="", width=2)
+                    c.create_rectangle(quad[0][0] - 4, quad[0][1] - 4, quad[0][0] + 4, quad[0][1] + 4,
+                                       outline=self._RESULT_LINE_COLOR, width=2)    # corner 0
+                    cx, cy = self._to_canvas(*pts[5 * m + 4])
+                    c.create_text(cx + 6, cy - 6, text=str(mid), anchor="sw", fill=self._RESULT_LINE_COLOR,
+                                  font=("Arial", 10, "bold"))
             if pts is not None and len(pts):
                 if res.get("ordered"):                   # chessboard: one line per corner row
                     cols = int(res.get("cols") or len(pts))
@@ -688,16 +871,12 @@ class ImageDisplayNode(BaseNode):
             return
         parts = []
         src = self._display_source()
-        if self._show_coords_var.get() and self._cursor_xy is not None and src is not None and self._view:
-            x, y = self._to_image(*self._cursor_xy)
-            h, w = src.shape[:2]
-            if -0.5 <= x < w - 0.5 and -0.5 <= y < h - 0.5:
-                value = src[int(round(y)), int(round(x))]
-                val = (", ".join(f"{v:g}" for v in np.ravel(value)) if np.ndim(value)
-                       else f"{float(value):g}")
-                parts.append(f"x={x:9.3f}  y={y:9.3f}  value=({val})")
-            else:
-                parts.append("cursor outside the image")
+        if self._show_coords_var.get() and self._probe is not None and src is not None:
+            x, y = self._probe
+            val = self._pixel_value_text(src, x, y)
+            where = "" if self._cursor_xy is not None else "  (probe)"
+            parts.append(f"x={x:9.3f}  y={y:9.3f}  value=({val}){where}" if val is not None
+                         else "cursor outside the image")
         if self._shown is not None:
             h, w = self._shown.shape[:2]
             parts.append(f"{w} x {h} {self._shown.dtype}")
@@ -712,11 +891,16 @@ class ImageDisplayNode(BaseNode):
     # ── mouse / keys on the view ──────────────────────────────────────
     def _on_motion(self, event) -> None:
         self._cursor_xy = (event.x, event.y)
+        if self._view is not None:
+            self._set_probe(*self._to_image(event.x, event.y), from_mouse=True)
         self._update_status_bar()
 
     def _on_leave(self, _event) -> None:
+        # The probe (and so the magnifier) STAYS where the cursor was, so you
+        # can move the mouse to other widgets while looking at the magnifier.
         self._cursor_xy = None
         self._update_status_bar()
+        self._request_render()
 
     def _nearest_picked(self, X, Y, radius):
         best, best_d = None, radius * radius
@@ -754,6 +938,7 @@ class ImageDisplayNode(BaseNode):
             self._view = (ox + dx, oy + dy, s)
             self._user_view = True
         self._cursor_xy = (event.x, event.y)
+        self._set_probe(*self._to_image(event.x, event.y), from_mouse=True)
         self._request_render()
 
     def _on_release(self, event) -> None:
@@ -795,11 +980,24 @@ class ImageDisplayNode(BaseNode):
             self._zoom_at(X, Y, factor)
         return "break"
 
-    def _on_key_c(self, _event) -> str:
-        """C: add the point under the cursor and copy 'x, y' (any mode)."""
-        if self._cursor_xy is None or self._view is None or self._shown is None:
+    def _on_key_c(self, _event=None) -> str:
+        """C: add the probe point (cursor / magnifier centre) and copy 'x, y'."""
+        if self._probe is None or self._shown is None:
             return "break"
-        x, y = self._to_image(*self._cursor_xy)
+        x, y = self._probe
+        if self._add_point(x, y):
+            self._copy_to_clipboard(f"{x:.3f}, {y:.3f}")
+        return "break"
+
+    def _on_key_s(self, _event=None) -> str:
+        """S: add the detection nearest to the magnifier's cross (snap)."""
+        near = self._loupe_nearest
+        if near is None:
+            if self._loupe_nearest_var is not None:
+                self._loupe_nearest_var.set("S: nothing detected to snap to -- tick Corners / ArUco / "
+                                            "Features first.")
+            return "break"
+        _kind, x, y = near
         if self._add_point(x, y):
             self._copy_to_clipboard(f"{x:.3f}, {y:.3f}")
         return "break"
@@ -832,15 +1030,445 @@ class ImageDisplayNode(BaseNode):
         except tk.TclError:
             pass
 
+    # ── vertically scrollable panel ───────────────────────────────────
+    _NO_WHEEL_SCROLL = ("Text", "Listbox", "TCombobox", "Scrollbar", "TScrollbar")
+
+    def _scroll_area(self, parent) -> tk.Frame:
+        """A frame that fills `parent` and gets a vertical scroll bar when its
+        content is taller than the space (when there is room, the content
+        still stretches to fill it). The mouse wheel scrolls it, except over
+        text boxes / lists / the magnifier, which use the wheel themselves."""
+        outer = tk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        cv = tk.Canvas(outer, highlightthickness=0, borderwidth=0, width=20, height=20)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(cv)
+        item = cv.create_window(0, 0, window=inner, anchor="nw")
+        state = {"size": None, "bound": set()}
+
+        def wheel(event):
+            if inner.winfo_reqheight() > cv.winfo_height() + 1:
+                cv.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+
+        def bind_wheel(w):
+            for child in w.winfo_children():
+                name = str(child)
+                if name not in state["bound"]:
+                    state["bound"].add(name)
+                    if (child.winfo_class() not in self._NO_WHEEL_SCROLL and child is not self._c_loupe):
+                        child.bind("<MouseWheel>", wheel, add="+")
+                bind_wheel(child)
+
+        def layout(_e=None):
+            try:
+                w, h, need = cv.winfo_width(), cv.winfo_height(), inner.winfo_reqheight()
+            except tk.TclError:
+                return
+            size = (w, max(h, need))
+            if size != state["size"]:
+                state["size"] = size
+                cv.itemconfigure(item, width=w, height=size[1])
+                cv.configure(scrollregion=(0, 0, w, size[1]))
+            if need <= h:
+                cv.yview_moveto(0)
+
+        def poll():                                  # content height changes (tabs, tool fields)
+            try:
+                if not cv.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            layout()
+            bind_wheel(inner)
+            cv.after(400, poll)
+
+        cv.bind("<Configure>", layout)
+        cv.bind("<MouseWheel>", wheel)
+        inner.bind("<MouseWheel>", wheel)
+        cv.after(50, poll)
+        return inner
+
+    # ── magnifier ─────────────────────────────────────────────────────
+    def _build_magnifier(self, parent) -> None:
+        box = tk.LabelFrame(parent, text="Magnifier  (follows the cursor; stays when the mouse leaves)",
+                            padx=4, pady=3)
+        box.pack(fill="both", expand=True)
+        top = tk.Frame(box)
+        top.pack(fill="x")
+        L = self._LOUPE_SIZE
+        c = tk.Canvas(top, width=L, height=L, bg="#15151d", highlightthickness=1,
+                      highlightbackground="#33384a", cursor="crosshair")
+        c.pack(side="left")
+        c.bind("<Enter>", lambda _e: c.focus_set())
+        c.bind("<KeyPress-c>", self._on_key_c)
+        c.bind("<KeyPress-C>", self._on_key_c)
+        c.bind("<KeyPress-s>", self._on_key_s)
+        c.bind("<KeyPress-S>", self._on_key_s)
+        self._bind_probe_keys(c)
+        c.bind("<MouseWheel>", self._on_loupe_wheel)
+        self._c_loupe = c
+
+        side = tk.Frame(top, padx=6)
+        side.pack(side="left", fill="both", expand=True)
+        self._loupe_zoom_label_var = tk.StringVar(value="")
+        tk.Label(side, textvariable=self._loupe_zoom_label_var, font=("Arial", 8, "bold"),
+                 anchor="w", justify="left").pack(fill="x")
+        zr = tk.Frame(side)
+        zr.pack(fill="x")
+        for i, z in enumerate(self._LOUPE_ZOOMS):
+            tk.Radiobutton(zr, text=f"{z}X", value=z, variable=self._loupe_zoom_var, font=("Arial", 8),
+                           padx=0, pady=0).grid(row=i // 4, column=i % 4, sticky="w")
+        tk.Label(side, text="Alt+0..6 = 1X..64X, or the wheel here", font=("Arial", 7), fg="#666666",
+                 anchor="w").pack(fill="x")
+        self._loupe_info_var = tk.StringVar(value="")
+        tk.Label(side, textvariable=self._loupe_info_var, font=("Consolas", 8), anchor="w",
+                 justify="left").pack(fill="x", pady=(4, 0))
+        self._loupe_nearest_var = tk.StringVar(value="")
+        tk.Label(side, textvariable=self._loupe_nearest_var, font=("Arial", 8), anchor="w",
+                 justify="left", wraplength=190, fg="#7a1f63").pack(fill="x", pady=(4, 0))
+
+        # Detectors (run on the magnifier area every time it changes).
+        det = tk.Frame(box)
+        det.pack(fill="x", pady=(4, 0))
+        tk.Label(det, text="Detect:", font=("Arial", 8, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Checkbutton(det, text="Corners", underline=0, variable=self._det_corners_var,
+                       fg="#00799a").grid(row=0, column=1, sticky="w")
+        tk.Checkbutton(det, text="ArUco", underline=0, variable=self._det_aruco_var,
+                       fg="#8a6d00").grid(row=0, column=2, sticky="w")
+        tk.Checkbutton(det, text="Features", underline=0, variable=self._det_features_var,
+                       fg="#3b7d00").grid(row=0, column=3, sticky="w")
+        opts = tk.Frame(box)
+        opts.pack(fill="x")
+        r1 = tk.Frame(opts)
+        r1.pack(fill="x")
+        tk.Label(r1, text="Corners (Harris):", font=("Arial", 8), width=15, anchor="w").pack(side="left")
+        tk.Label(r1, text="threshold", font=("Arial", 8)).pack(side="left")
+        tk.Entry(r1, textvariable=self._corner_thresh_var, width=5, font=("Arial", 8)).pack(side="left", padx=(2, 6))
+        tk.Checkbutton(r1, text="sub-pixel", variable=self._corner_subpix_var, font=("Arial", 8)).pack(side="left")
+        r2 = tk.Frame(opts)
+        r2.pack(fill="x")
+        tk.Label(r2, text="ArUco:", font=("Arial", 8), width=15, anchor="w").pack(side="left")
+        ttk.Combobox(r2, textvariable=self._aruco_dict_var, values=self._ARUCO_DICTS, state="readonly",
+                     width=19, font=("Arial", 8)).pack(side="left", padx=(0, 6))
+        tk.Checkbutton(r2, text="sub-pixel", variable=self._aruco_refine_var, font=("Arial", 8)).pack(side="left")
+        r3 = tk.Frame(opts)
+        r3.pack(fill="x")
+        tk.Label(r3, text="Features (GFTT):", font=("Arial", 8), width=15, anchor="w").pack(side="left")
+        tk.Label(r3, text="max", font=("Arial", 8)).pack(side="left")
+        tk.Entry(r3, textvariable=self._feat_max_var, width=4, font=("Arial", 8)).pack(side="left", padx=(2, 6))
+        tk.Label(r3, text="quality", font=("Arial", 8)).pack(side="left")
+        tk.Entry(r3, textvariable=self._feat_quality_var, width=5, font=("Arial", 8)).pack(side="left", padx=(2, 6))
+        tk.Checkbutton(r3, text="sub-pixel", variable=self._feat_subpix_var, font=("Arial", 8)).pack(side="left")
+        tk.Label(box, font=("Arial", 7), fg="#555555", anchor="w", justify="left", wraplength=400, text=(
+            "Arrows: move cross (Shift: 0.1 px)   C: add cross point   S: add pink-circled   Ctrl+H: all keys"
+            )).pack(
+            fill="x", pady=(3, 0))
+
+    def _set_probe(self, x: float, y: float, from_mouse: bool = False) -> None:
+        self._probe = (float(x), float(y))
+        self._request_loupe()
+        if not from_mouse:
+            self._update_status_bar()
+            self._request_render()                   # move the marker on the main view
+
+    def _on_loupe_wheel(self, event) -> str:
+        zs = self._LOUPE_ZOOMS
+        cur = self._loupe_zoom_var.get()
+        i = min(range(len(zs)), key=lambda k: abs(zs[k] - cur))
+        i = min(len(zs) - 1, i + 1) if event.delta > 0 else max(0, i - 1)
+        self._loupe_zoom_var.set(zs[i])
+        return "break"
+
+    def _bind_probe_keys(self, widget) -> None:
+        # A plain <KeyPress-c> binding ALSO catches Alt+C / Ctrl+C (Tk matches
+        # extra modifiers) and its "break" stopped the window's Alt+C
+        # (Corners). These more specific do-nothing bindings win at this
+        # widget and let the event go on to the window bindings.
+        for letter in "cCsS":
+            for mod in ("Alt", "Control"):
+                widget.bind(f"<{mod}-KeyPress-{letter}>", lambda _e: None)
+        for key, dx, dy in (("Left", -1, 0), ("Right", 1, 0), ("Up", 0, -1), ("Down", 0, 1)):
+            widget.bind(f"<KeyPress-{key}>", lambda e, a=dx, b=dy: self._nudge_probe(a, b))
+            widget.bind(f"<Shift-KeyPress-{key}>", lambda e, a=dx, b=dy: self._nudge_probe(a * 0.1, b * 0.1))
+
+    def _nudge_probe(self, dx: float, dy: float) -> str:
+        if self._probe is None:
+            src = self._display_source()
+            if src is None:
+                return "break"
+            h, w = src.shape[:2]
+            self._probe = ((w - 1) / 2.0, (h - 1) / 2.0)
+        self._set_probe(self._probe[0] + dx, self._probe[1] + dy)
+        return "break"
+
+    @staticmethod
+    def _pixel_value_text(src, x, y):
+        h, w = src.shape[:2]
+        if not (-0.5 <= x < w - 0.5 and -0.5 <= y < h - 0.5):
+            return None
+        value = src[int(round(y)), int(round(x))]
+        return (", ".join(f"{v:g}" for v in np.ravel(value)) if np.ndim(value) else f"{float(value):g}")
+
+    def _draw_probe_marker(self, c) -> None:
+        """Main view: outline of the magnifier area around the probe."""
+        if self._probe is None or self._view is None or self._c_loupe is None:
+            return
+        z = max(1, int(self._loupe_zoom_var.get() or 16))
+        half = self._LOUPE_SIZE / (2.0 * z)
+        px, py = self._probe
+        ox, oy, s = self._view
+        X0, Y0 = ox + (px + 0.5 - half) * s, oy + (py + 0.5 - half) * s
+        X1, Y1 = ox + (px + 0.5 + half) * s, oy + (py + 0.5 + half) * s
+        c.create_rectangle(X0, Y0, X1, Y1, outline="#ff8c00", dash=(3, 2))
+        if self._cursor_xy is None:                  # probe moved by keys / mouse elsewhere
+            X, Y = ox + (px + 0.5) * s, oy + (py + 0.5) * s
+            c.create_line(X - 7, Y, X + 7, Y, fill="#ff8c00")
+            c.create_line(X, Y - 7, X, Y + 7, fill="#ff8c00")
+
+    def _request_loupe(self) -> None:
+        c = self._c_loupe
+        if c is None or self._loupe_pending:
+            return
+        self._loupe_pending = True
+        try:
+            c.after_idle(self._render_loupe)
+        except tk.TclError:
+            self._loupe_pending = False
+
+    def _render_loupe(self) -> None:
+        """Draw the zoomed area around the probe. The cross is FIXED at the
+        centre; the zoomed pixels move under it (sub-pixel accurate)."""
+        self._loupe_pending = False
+        c = self._c_loupe
+        if c is None:
+            return
+        L = self._LOUPE_SIZE
+        try:
+            z = max(1, int(self._loupe_zoom_var.get()))
+        except (tk.TclError, ValueError):
+            z = 16
+        if self._loupe_zoom_label_var is not None:
+            self._loupe_zoom_label_var.set(f"Zoom {z}X\n1 image px = {z}x{z} screen px")
+        c.delete("all")
+        src_key, src = self._display_source_keyed()
+        if src is None or self._probe is None:
+            c.create_text(L / 2, L / 2, fill="#8a92a6", justify="center", width=L - 20,
+                          text="Move the mouse over the image")
+            self._loupe_nearest = None
+            if self._loupe_info_var is not None:
+                self._loupe_info_var.set("")
+                self._loupe_nearest_var.set("")
+            return
+        if self._display_cache[0] != src_key:
+            self._display_cache = (src_key, self._to_display_rgb(src))
+        rgb = self._display_cache[1]
+        px, py = self._probe
+        # Destination pixel u (centre at u + 0.5) samples image x = px + (u + 0.5 - L/2) / z,
+        # with image pixel centres at integer x (OpenCV convention).
+        M = np.array([[1.0 / z, 0.0, px + (0.5 - L / 2.0) / z],
+                      [0.0, 1.0 / z, py + (0.5 - L / 2.0) / z]], dtype=np.float64)
+        interp = self._INTERPOLATIONS.get(self._interp_var.get(), cv2.INTER_NEAREST)
+        if interp == cv2.INTER_AREA:
+            interp = cv2.INTER_LINEAR                 # warpAffine has no AREA mode
+        patch = cv2.warpAffine(rgb, M, (L, L), flags=interp | cv2.WARP_INVERSE_MAP,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=(21, 21, 29))
+        self._loupe_photo = ImageTk.PhotoImage(Image.fromarray(patch), master=c)
+        c.create_image(0, 0, image=self._loupe_photo, anchor="nw")
+
+        def to_l(x, y):                              # image px -> magnifier canvas
+            return L / 2.0 + (x - px) * z, L / 2.0 + (y - py) * z
+
+        dets, err = self._loupe_detect(src, px, py, z)
+        nearest, best = None, None
+        for kind, color, pts in (("corner", self._LOUPE_CORNER_COLOR, dets.get("corners")),
+                                 ("feature", self._LOUPE_FEATURE_COLOR, dets.get("features"))):
+            for x, y in (pts if pts is not None else ()):
+                X, Y = to_l(x, y)
+                r = 5 if kind == "corner" else 4
+                if kind == "corner":
+                    c.create_oval(X - r, Y - r, X + r, Y + r, outline=color, width=2)
+                else:
+                    c.create_line(X - r, Y, X + r, Y, fill=color, width=2)
+                    c.create_line(X, Y - r, X, Y + r, fill=color, width=2)
+                d = (x - px) ** 2 + (y - py) ** 2
+                if best is None or d < best:
+                    best, nearest = d, (kind, float(x), float(y))
+        for mid, quad in dets.get("markers", ()):
+            pts = [to_l(x, y) for x, y in quad]
+            c.create_polygon(*[v for p in pts for v in p], outline=self._LOUPE_ARUCO_COLOR, fill="", width=2)
+            cx = sum(p[0] for p in pts) / 4.0
+            cy = sum(p[1] for p in pts) / 4.0
+            c.create_text(cx, cy, text=str(mid), fill=self._LOUPE_ARUCO_COLOR, font=("Arial", 10, "bold"))
+            for k, (x, y) in enumerate(quad):
+                X, Y = to_l(x, y)
+                c.create_rectangle(X - 3, Y - 3, X + 3, Y + 3, outline=self._LOUPE_ARUCO_COLOR,
+                                   width=2 if k == 0 else 1)
+                d = (x - px) ** 2 + (y - py) ** 2
+                if best is None or d < best:
+                    best, nearest = d, (f"ArUco id {mid} corner {k}", float(x), float(y))
+        if nearest is not None:                      # highlight the snap target
+            X, Y = to_l(nearest[1], nearest[2])
+            c.create_oval(X - 9, Y - 9, X + 9, Y + 9, outline=self._LOUPE_NEAREST_COLOR, width=2)
+        self._loupe_nearest = nearest
+
+        # Picked (output) points in view.
+        for i, (x, y) in enumerate(self._picked, start=1):
+            X, Y = to_l(x, y)
+            if -10 <= X <= L + 10 and -10 <= Y <= L + 10:
+                c.create_oval(X - 6, Y - 6, X + 6, Y + 6, outline=self._PICK_COLOR, width=1)
+                c.create_text(X + 8, Y - 8, text=str(i), anchor="sw", fill=self._PICK_COLOR,
+                              font=("Arial", 8, "bold"))
+
+        # The fixed thin cross (with a small gap so the centre pixel stays visible).
+        m, g = L / 2.0, 4
+        for x0, y0, x1, y1 in ((0, m, m - g, m), (m + g, m, L, m), (m, 0, m, m - g), (m, m + g, m, L)):
+            c.create_line(x0, y0, x1, y1, fill="#000000", width=3)
+            c.create_line(x0, y0, x1, y1, fill="#ff3b3b", width=1)
+
+        val = self._pixel_value_text(src, px, py)
+        if self._loupe_info_var is not None:
+            self._loupe_info_var.set(f"x = {px:10.3f}\ny = {py:10.3f}\nvalue = ({val})" if val is not None
+                                     else f"x = {px:10.3f}\ny = {py:10.3f}\n(outside the image)")
+            if err:
+                text = err
+            elif nearest is not None:
+                d = best ** 0.5
+                text = (f"Nearest {nearest[0]}:\n({nearest[1]:.3f}, {nearest[2]:.3f})  "
+                        f"d = {d:.2f} px\nS adds it to the output points")
+            elif self._det_corners_var.get() or self._det_aruco_var.get() or self._det_features_var.get():
+                text = "Nothing detected in the magnifier area."
+            else:
+                text = "Tick Corners / ArUco / Features to detect in this area."
+            self._loupe_nearest_var.set(text)
+
+    def _loupe_detect(self, src, px, py, z):
+        """Run the ticked detectors on the image around the probe.
+        Corners / features: the magnifier area (+ a small margin). ArUco: the
+        whole frame once (cached), so a marker only partly inside the
+        magnifier is still found. Returns ({corners, features, markers}, error text)."""
+        dets, errors = {}, []
+        if not (self._det_corners_var.get() or self._det_aruco_var.get() or self._det_features_var.get()):
+            return dets, ""
+        h, w = src.shape[:2]
+
+        def region(half):
+            x0, y0 = max(0, int(np.floor(px - half))), max(0, int(np.floor(py - half)))
+            x1, y1 = min(w, int(np.ceil(px + half)) + 1), min(h, int(np.ceil(py + half)) + 1)
+            return x0, y0, x1, y1
+
+        half = self._LOUPE_SIZE / (2.0 * z) + 6
+        x0, y0, x1, y1 = region(half)
+        if x1 - x0 >= 8 and y1 - y0 >= 8:
+            gray = self._gray_u8(src[y0:y1, x0:x1])
+            origin = np.array([x0, y0], dtype=np.float64)
+            if self._det_corners_var.get():
+                try:
+                    thr = float(self._corner_thresh_var.get())
+                    resp = cv2.cornerHarris(np.float32(gray), 2, 3, 0.04)
+                    peak = float(resp.max())
+                    pts = np.empty((0, 2))
+                    if peak > 0:
+                        local = resp == cv2.dilate(resp, np.ones((3, 3), np.uint8))
+                        ys, xs = np.nonzero(local & (resp > thr * peak))
+                        order = np.argsort(-resp[ys, xs])[:200]
+                        pts = np.stack([xs[order], ys[order]], axis=1).astype(np.float32)
+                        if self._corner_subpix_var.get() and len(pts):
+                            crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
+                            pts = cv2.cornerSubPix(gray, pts.reshape(-1, 1, 2), (3, 3), (-1, -1), crit).reshape(-1, 2)
+                    dets["corners"] = pts.astype(np.float64) + origin
+                except (ValueError, cv2.error) as e:
+                    errors.append(f"Corners: {e}")
+            if self._det_features_var.get():
+                try:
+                    found = cv2.goodFeaturesToTrack(gray, maxCorners=max(1, int(self._feat_max_var.get())),
+                                                    qualityLevel=float(self._feat_quality_var.get()),
+                                                    minDistance=3)
+                    # goodFeaturesToTrack picks maxima on the PIXEL GRID (whole
+                    # numbers); cornerSubPix moves them to the sub-pixel corner.
+                    if found is not None and len(found) and self._feat_subpix_var.get():
+                        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
+                        found = cv2.cornerSubPix(gray, found.astype(np.float32), (3, 3), (-1, -1), crit)
+                    dets["features"] = (np.empty((0, 2)) if found is None
+                                        else found.reshape(-1, 2).astype(np.float64) + origin)
+                except (ValueError, cv2.error) as e:
+                    errors.append(f"Features: {e}")
+        if self._det_aruco_var.get():
+            try:
+                key = (self._display_source_keyed()[0], self._aruco_dict_var.get(),
+                       bool(self._aruco_refine_var.get()))
+                if self._aruco_frame_cache[0] != key:      # whole frame, once per frame / setting
+                    corners, ids, _rej = self._aruco_detector().detectMarkers(self._gray_u8(src))
+                    markers = ([] if ids is None else
+                               [(int(mid), quad.reshape(4, 2).astype(np.float64))
+                                for quad, mid in zip(corners, ids.ravel())])
+                    self._aruco_frame_cache = (key, markers)
+                reach = 2 * half                           # markers touching the magnifier area
+                dets["markers"] = [(mid, q) for mid, q in self._aruco_frame_cache[1]
+                                   if q[:, 0].min() - reach <= px <= q[:, 0].max() + reach
+                                   and q[:, 1].min() - reach <= py <= q[:, 1].max() + reach]
+            except (ValueError, cv2.error, AttributeError) as e:
+                errors.append(f"ArUco: {e}")
+        return dets, "; ".join(errors)
+
+    def _aruco_detector(self):
+        key = (self._aruco_dict_var.get(), bool(self._aruco_refine_var.get()))
+        if self._aruco_cache[0] != key:
+            dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, key[0]))
+            params = cv2.aruco.DetectorParameters()
+            if key[1]:
+                params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            self._aruco_cache = (key, cv2.aruco.ArucoDetector(dictionary, params))
+        return self._aruco_cache[1]
+
+    # ── keyboard shortcuts (whole inspector window) ───────────────────
+    def _bind_shortcuts(self, win) -> None:
+        """Alt+letter / Alt+digit work wherever the focus is in the inspector;
+        the underlined letters in the labels show them."""
+        def toggle(var):
+            return lambda _e: (var.set(not var.get()), "break")[1]
+
+        def cycle_interp(_e):
+            names = list(self._INTERPOLATIONS)
+            cur = self._interp_var.get()
+            self._interp_var.set(names[(names.index(cur) + 1) % len(names)] if cur in names else names[0])
+            return "break"
+
+        def set_mode(mode):
+            def _f(_e):
+                self._mode_var.set(mode)
+                self._on_mode_changed()
+                return "break"
+            return _f
+
+        def run(fn):
+            return lambda _e: (fn(), "break")[1]
+
+        table = {
+            "e": toggle(self._freeze_var), "t": run(self._fit_view), "o": run(self._one_to_one),
+            "p": set_mode("pan"), "i": set_mode("pick"), "g": toggle(self._show_grid_var),
+            "l": cycle_interp, "c": toggle(self._det_corners_var), "a": toggle(self._det_aruco_var),
+            "f": toggle(self._det_features_var),
+        }
+        for letter, fn in table.items():
+            win.bind(f"<Alt-KeyPress-{letter}>", fn)
+            win.bind(f"<Alt-KeyPress-{letter.upper()}>", fn)
+        for digit, z in enumerate(self._LOUPE_ZOOMS):        # Alt+0 = 1X ... Alt+6 = 64X
+            win.bind(f"<Alt-KeyPress-{digit}>", lambda _e, z=z: (self._loupe_zoom_var.set(z), "break")[1])
+        win.bind("<Control-r>", run(self._run_analysis))
+        win.bind("<Control-R>", run(self._run_analysis))
+
     # ── points tab: input (read-only) and output (editable) ────────────
     _INPUT_REFRESH_S = 0.25        # input box refresh at most 4x/s (live streams)
     _OUT_BG, _OUT_BG_EDITED = "#ffffff", "#fff6d6"
 
     def _build_points_tab(self, tab) -> None:
-        tk.Label(tab, justify="left", anchor="w", wraplength=360, fg="#34405a", text=(
-            "Mode 'Pick points': click on the image to add an output point, drag one to move it.  "
-            "C adds the point under the cursor.  Ctrl+Z removes the last one.  "
-            "Image actions send at once; typed edits are sent only with Apply.")).pack(fill="x")
+        tk.Label(tab, justify="left", anchor="w", wraplength=410, fg="#34405a", text=(
+            "Pick mode: click = add, drag = move.  C = point at the cross, S = nearest detection, "
+            "Ctrl+Z = undo.  Image actions send at once; typed edits are sent by Apply.")).pack(fill="x")
 
         pw = tk.PanedWindow(tab, orient=tk.VERTICAL, sashwidth=6, sashrelief=tk.RAISED)
         pw.pack(fill="both", expand=True, pady=(6, 0))
@@ -848,18 +1476,18 @@ class ImageDisplayNode(BaseNode):
         # Input points: what arrives on the input pin -- read-only, copyable.
         box = tk.LabelFrame(pw, text="Input points  (from input pin 'points' - read-only)",
                             padx=4, pady=3, fg="#2f4f2f")
-        pw.add(box, minsize=110, height=180, stretch="always")
+        pw.add(box, minsize=80, height=100, stretch="always")
         row = tk.Frame(box)
         row.pack(fill="x")
         self._input_info_var = tk.StringVar(value="")
         tk.Label(row, textvariable=self._input_info_var, anchor="w", fg="#2f4f2f").pack(side="left")
         tk.Button(row, text="-> Add to output", command=self._add_input_points).pack(side="right")
         tk.Button(row, text="Copy all", command=self._copy_input_points).pack(side="right", padx=(0, 4))
-        tk.Checkbutton(box, text="Live update (pauses while text is selected)",
-                       variable=self._input_live_var).pack(anchor="w")
+        # "Live": refresh the box (pauses while text is selected).
+        tk.Checkbutton(row, text="Live", variable=self._input_live_var).pack(side="right", padx=(0, 2))
         frm = tk.Frame(box)
         frm.pack(fill="both", expand=True)
-        tin = tk.Text(frm, height=6, width=32, font=("Consolas", 9), wrap="none", bg="#f2f5f2",
+        tin = tk.Text(frm, height=3, width=32, font=("Consolas", 9), wrap="none", bg="#f2f5f2",
                       fg="#2f4f2f", relief=tk.SUNKEN, cursor="arrow")
         vsb = ttk.Scrollbar(frm, orient="vertical", command=tin.yview)
         tin.configure(yscrollcommand=vsb.set, state=tk.DISABLED)   # read-only; selection + Ctrl+C still work
@@ -879,7 +1507,7 @@ class ImageDisplayNode(BaseNode):
         self._out_state.pack(fill="x")
         frm = tk.Frame(box)
         frm.pack(fill="both", expand=True)
-        txt = tk.Text(frm, height=10, width=32, font=("Consolas", 10), undo=True, wrap="none",
+        txt = tk.Text(frm, height=4, width=32, font=("Consolas", 10), undo=True, wrap="none",
                       bg=self._OUT_BG)
         vsb = ttk.Scrollbar(frm, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vsb.set)
@@ -888,16 +1516,14 @@ class ImageDisplayNode(BaseNode):
         txt.bind("<<Modified>>", self._on_text_modified)
         txt.bind("<Control-Return>", lambda _e: (self._apply_text_edits(), "break")[1])
         self._points_text = txt
-        row = tk.Frame(box)                          # sending
+        row = tk.Frame(box)                          # sending | list tools (these send at once)
         row.pack(fill="x", pady=(4, 0))
-        tk.Button(row, text="Apply (send)", font=("Arial", 9, "bold"), bg="#dcebdc", width=12,
+        tk.Button(row, text="Apply (send)", font=("Arial", 9, "bold"), bg="#dcebdc",
                   command=self._apply_text_edits).pack(side="left")
-        tk.Button(row, text="Revert", width=8, command=self._revert_text).pack(side="left", padx=(4, 0))
-        row = tk.Frame(box)                          # list tools (these send at once)
-        row.pack(fill="x", pady=(3, 0))
-        tk.Button(row, text="Undo last", command=self._undo_last).pack(side="left")
-        tk.Button(row, text="Clear all", command=self._clear_points).pack(side="left", padx=(4, 0))
-        tk.Button(row, text="Copy all", command=self._copy_all).pack(side="left", padx=(4, 0))
+        tk.Button(row, text="Revert", command=self._revert_text).pack(side="left", padx=(3, 0))
+        tk.Button(row, text="Copy all", command=self._copy_all).pack(side="right")
+        tk.Button(row, text="Clear all", command=self._clear_points).pack(side="right", padx=(0, 3))
+        tk.Button(row, text="Undo last", command=self._undo_last).pack(side="right", padx=(0, 3))
         self._points_msg_var = tk.StringVar(value="")
         self._points_msg = tk.Label(box, textvariable=self._points_msg_var, anchor="w", justify="left",
                                     wraplength=350)
@@ -1028,14 +1654,38 @@ class ImageDisplayNode(BaseNode):
         self._set_points_msg("Edits discarded; the list shows what is sent.")
 
     def _check_no_unsent_edits(self) -> bool:
-        """Image actions (pick, drag, C, undo, ...) change and SEND the list.
-        While the box has typed edits that were not sent, refuse them instead
-        of overwriting the typing or sending it unasked."""
+        """Image actions (pick, drag, C, S, undo, ...) change and SEND the list.
+        If the Output box has typed edits that were not sent yet, they are
+        applied (sent) FIRST, so the action works on what you typed and the
+        typing is never lost. Only when a typed line is not valid is the
+        action refused -- with a message ON the image, where you are looking."""
         if not self._text_dirty:
             return True
-        self._set_points_msg("You have edits that are not sent yet: press Apply to send them "
-                             "or Revert to discard them first.", "#c62828")
+        if self._apply_text_edits():
+            self._set_points_msg("Your typed edits were applied (sent) first, then the image action.",
+                                 "#2e7d32")
+            self._flash_view("Typed edits in the Output box were applied first", "#2e7d32")
+            return True
+        self._flash_view("Not done: the Output box has typed lines that are not 'x, y'.\n"
+                         "Fix them (Points tab) or press Revert.", "#c62828")
         return False
+
+    def _flash_view(self, text: str, color: str = "#334477", ms: int = 3500) -> None:
+        """A short message over the top of the image view."""
+        c = self._c_view
+        if c is None:
+            return
+        old = getattr(self, "_flash_label", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except tk.TclError:
+                pass
+        lbl = tk.Label(c, text=text, bg="#fffbe6", fg=color, font=("Arial", 9, "bold"),
+                       relief="solid", borderwidth=1, padx=8, pady=3, justify="center")
+        lbl.place(relx=0.5, y=8, anchor="n")
+        self._flash_label = lbl
+        lbl.after(ms, lambda: lbl.destroy() if lbl.winfo_exists() else None)
 
     def _picked_changed(self, rewrite_text: bool = True) -> None:
         if rewrite_text:
@@ -1118,7 +1768,7 @@ class ImageDisplayNode(BaseNode):
         tk.Label(tab, text="Result", font=("Arial", 9, "bold"), anchor="w").pack(fill="x", pady=(6, 2))
         frm = tk.Frame(tab)
         frm.pack(fill="both", expand=True)
-        txt = tk.Text(frm, height=12, width=32, font=("Consolas", 9), wrap="none", bg="#f6f6f6")
+        txt = tk.Text(frm, height=6, width=32, font=("Consolas", 9), wrap="none", bg="#f6f6f6")
         vsb = ttk.Scrollbar(frm, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vsb.set, state=tk.DISABLED)
         vsb.pack(side="right", fill="y")
@@ -1241,6 +1891,35 @@ class ImageDisplayNode(BaseNode):
                 "header": f"board found: {len(pts)} corners ({p['cols']} x {p['rows']}), "
                           f"row by row from the larger mark\n"}
 
+    def _run_aruco(self, gray, p) -> dict:
+        dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, p["dictionary"]))
+        params = cv2.aruco.DetectorParameters()
+        params.cornerRefinementMethod = {
+            "subpix": cv2.aruco.CORNER_REFINE_SUBPIX, "contour": cv2.aruco.CORNER_REFINE_CONTOUR,
+            "apriltag": cv2.aruco.CORNER_REFINE_APRILTAG}.get(p["refine"], cv2.aruco.CORNER_REFINE_NONE)
+        if not 3 <= p["win_min"] <= p["win_max"]:
+            raise ValueError("adaptive threshold windows: need 3 <= min <= max")
+        params.adaptiveThreshWinSizeMin = p["win_min"]
+        params.adaptiveThreshWinSizeMax = p["win_max"]
+        params.minMarkerPerimeterRate = max(0.001, p["min_perimeter"])
+        corners, ids, _rejected = cv2.aruco.ArucoDetector(dictionary, params).detectMarkers(gray)
+        if ids is None or not len(ids):
+            return {"points": np.empty((0, 2)), "aruco_ids": np.empty(0, int),
+                    "header": f"no {p['dictionary']} marker found\n"}
+        ids = ids.ravel().astype(int)
+        quads = [q.reshape(4, 2).astype(np.float64) for q in corners]
+        order = np.argsort(ids, kind="stable") if p["order"] == "by id" else np.arange(len(ids))
+        pts = []
+        for k in order:
+            pts.extend(quads[k])
+            pts.append(_aruco_center(quads[k], p["center"]))
+        ids = ids[order]
+        return {"points": np.array(pts, dtype=np.float64), "aruco_ids": ids, "group": 5,
+                "header": (f"{len(ids)} marker(s), ids {', '.join(str(i) for i in ids[:30])}"
+                           f"{' ...' if len(ids) > 30 else ''}\n"
+                           f"5 points each: corners 0-3 (clockwise from the marker's top-left), "
+                           f"then the centre ({p['center']})\n")}
+
     def _run_hough(self, gray, p) -> dict:
         edges = cv2.Canny(gray, p["canny1"], p["canny2"])
         theta = np.deg2rad(p["theta_deg"])
@@ -1309,7 +1988,17 @@ class ImageDisplayNode(BaseNode):
         if res is not None:
             lines.append(res.get("header", "").rstrip())
             pts, segs = res.get("points"), res.get("lines")
-            if res.get("polar") is not None:
+            if res.get("aruco_ids") is not None and pts is not None and len(pts):
+                names = ("corner 0", "corner 1", "corner 2", "corner 3", "centre  ")
+                n = 0
+                for m, mid in enumerate(res["aruco_ids"]):
+                    if n >= self._MAX_LISTED:
+                        break
+                    for j in range(5):
+                        n += 1
+                        x, y = pts[5 * m + j]
+                        lines.append(f"{n:4d}  id {mid:<4d} {names[j]}  {x:10.3f}, {y:10.3f}")
+            elif res.get("polar") is not None:
                 for i, (rho, th) in enumerate(res["polar"][: self._MAX_LISTED], start=1):
                     lines.append(f"{i:4d}  rho {rho:9.2f}  theta {np.degrees(th):8.3f}")
             elif segs is not None and len(segs):
@@ -1432,6 +2121,17 @@ class ImageDisplayNode(BaseNode):
             "show_numbers": bool(self._show_numbers_var.get()),
             "mode": self._mode_var.get(),
             "picked_points": [[round(x, 4), round(y, 4)] for x, y in self._picked],
+            "magnifier": {"zoom": int(self._loupe_zoom_var.get()),
+                          "corners": bool(self._det_corners_var.get()),
+                          "aruco": bool(self._det_aruco_var.get()),
+                          "features": bool(self._det_features_var.get()),
+                          "corner_subpix": bool(self._corner_subpix_var.get()),
+                          "corner_threshold": self._corner_thresh_var.get(),
+                          "aruco_dict": self._aruco_dict_var.get(),
+                          "aruco_subpix": bool(self._aruco_refine_var.get()),
+                          "feature_max": self._feat_max_var.get(),
+                          "feature_quality": self._feat_quality_var.get(),
+                          "feature_subpix": bool(self._feat_subpix_var.get())},
             "analysis_tool": self._tool_var.get(),
             "analysis_params": {tool: {k: v.get() for k, v in vs.items()}
                                 for tool, vs in self._tool_vars.items()},
@@ -1471,6 +2171,23 @@ class ImageDisplayNode(BaseNode):
             if np.isfinite(x) and np.isfinite(y):
                 picked.append((x, y))
         self._picked = picked
+        mag = params.get("magnifier") or {}
+        try:                                             # snap (older projects: 10X..90X)
+            z = float(mag.get("zoom", 16))
+            self._loupe_zoom_var.set(min(self._LOUPE_ZOOMS, key=lambda v: abs(np.log2(v) - np.log2(max(z, 1)))))
+        except (TypeError, ValueError):
+            self._loupe_zoom_var.set(16)
+        for key, var in (("corners", self._det_corners_var), ("aruco", self._det_aruco_var),
+                         ("features", self._det_features_var), ("corner_subpix", self._corner_subpix_var),
+                         ("aruco_subpix", self._aruco_refine_var), ("feature_subpix", self._feat_subpix_var)):
+            if key in mag:
+                var.set(bool(mag[key]))
+        for key, var in (("corner_threshold", self._corner_thresh_var), ("feature_max", self._feat_max_var),
+                         ("feature_quality", self._feat_quality_var)):
+            if key in mag:
+                var.set(str(mag[key]))
+        if mag.get("aruco_dict") in self._ARUCO_DICTS:
+            self._aruco_dict_var.set(mag["aruco_dict"])
         tool = params.get("analysis_tool", "gftt")
         self._tool_var.set(tool if tool in self._TOOLS else "gftt")
         for t, saved in (params.get("analysis_params") or {}).items():
