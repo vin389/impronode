@@ -513,7 +513,7 @@ class NodeEditorApp:
         """
         category = self._toolbox_register_category
         for display_name, cls in node_types:
-            self._node_type_map[cls.NODE_TYPE] = cls
+            self._register_node_type(cls)
             entry_category = category or (getattr(cls, "CATEGORY", "misc") or "misc")
             self._ensure_toolbox_category(entry_category)
 
@@ -528,7 +528,14 @@ class NodeEditorApp:
                           registry: dict[str, list[tuple[str, Type[BaseNode]]]]) -> None:
         for entries in registry.values():
             for _display_name, cls in entries:
-                self._node_type_map[cls.NODE_TYPE] = cls
+                self._register_node_type(cls)
+
+    def _register_node_type(self, cls: Type[BaseNode]) -> None:
+        """Map the node's type -- and its former type names (NODE_TYPE_ALIASES:
+        a renamed node keeps loading old projects) -- to the class."""
+        self._node_type_map[cls.NODE_TYPE] = cls
+        for alias in getattr(cls, "NODE_TYPE_ALIASES", ()):
+            self._node_type_map.setdefault(alias, cls)
 
     @staticmethod
     def _normalized_search_keywords(cls: Type[BaseNode]) -> list[str]:

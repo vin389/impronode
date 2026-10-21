@@ -11,12 +11,12 @@ import numpy as np
 import pytest
 
 from node_editor import project_data
-from node_editor.nodes.camera_calibration_unified_node import CameraCalibrationUnifiedNode, new_row
+from node_editor.nodes.camera_calibration_node import CameraCalibrationNode, new_row
 from node_editor.project_context import set_project_file_path
 from node_editor.project_io import CHUNK, DATA_SHEET, load_project, save_project
 
 from project_roundtrip import restore, save_and_load
-from test_calibration_unified_search import POSES, render_view
+from test_camera_calibration_search import POSES, render_view
 
 
 # ── project_io ────────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ def test_calibration_node_round_trip_through_one_xlsx(tmp_path, root):
     proj_dir.mkdir()
     try:
         canvas = tk.Canvas(root, width=300, height=200)
-        node = CameraCalibrationUnifiedNode("node_3", canvas)
+        node = CameraCalibrationNode("node_3", canvas)
         node.build_body()
         set_project_file_path(str(proj_dir / "calib.xlsx"))
         node._cb_manual_files = paths
@@ -121,10 +121,10 @@ def test_calibration_node_round_trip_through_one_xlsx(tmp_path, root):
         node._loo_base = {"K": node._res["K"], "D": node._res["D"]}
         node._loo_text = "Done: 2 solves"
 
-        params, stored = save_and_load(proj_dir / "calib.xlsx", node, "camera_calibration_unified")
+        params, stored = save_and_load(proj_dir / "calib.xlsx", node, "camera_calibration")
         assert "cb_file" not in params and "rows_file" not in params
 
-        node2 = CameraCalibrationUnifiedNode("node_3", canvas)
+        node2 = CameraCalibrationNode("node_3", canvas)
         node2.build_body()
         restore(node2, params, stored)
 
@@ -163,7 +163,7 @@ def test_old_projects_with_side_files_still_load(tmp_path, root):
     """A project saved before the Data sheet (chessboard .npz side file)."""
     try:
         canvas = tk.Canvas(root)
-        node = CameraCalibrationUnifiedNode("n", canvas)
+        node = CameraCalibrationNode("n", canvas)
         node.build_body()
         corners = np.random.default_rng(1).uniform(0, 500, (3, 6, 9, 2)).astype(np.float32)
         side = "old.n.chessboard.npz"

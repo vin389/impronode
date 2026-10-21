@@ -1,6 +1,6 @@
 """
 Brute-force chessboard detection search (no Tk; used by the Camera
-Calibration (Unified) node).
+Calibration node).
 
 Every image is searched with every combination of the detection settings
 (pattern size, detection width, adaptive threshold / normalize / fast
@@ -34,7 +34,7 @@ its detections ('most reliable' position); corners that the refinement
 moves away (> the matching tolerance) are dropped.
 
 Object points: lattice index (r, c) -> (c * square, r * square, 0), the same
-convention as build_object_grid(). The lattice of an image is shifted so
+convention as chessboard_detect.build_object_grid(). The lattice of an image is shifted so
 its smallest r and c are 0 -- the origin may be a corner that was not
 found. Each image has its own lattice (own origin), which is correct for
 calibration: every board view has its own pose.
@@ -44,19 +44,80 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 
-from node_editor.nodes.chessboard_calibration_node import (
+from node_editor.chessboard_detect import (
     _read_gray, _reshape_corners, auto_subpix_window, canonicalize_corners)
 
 SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 MATCH_FRACTION = 0.25          # matching tolerance = this x the smallest square (px)
 MIN_SHARED = 3                 # shared corners needed to merge a detection
 MAX_IRREGULARITY = 0.3         # see lattice_irregularity()
+
+
+def parse_number_list(text: str) -> np.ndarray | None:
+    """Numbers separated by spaces / commas, with MATLAB-style ranges:
+    '7 8 9', '7:9', '800:400:1600' -> float array, or None if not valid.
+    (Moved here from the retired calib_nodes.py.)"""
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw or raw.lower() in {"none", "null"}:
+        return None
+
+    # Treat the ghost-text placeholder as empty so it cannot be mistaken for real input.
+    if raw.startswith("e.g.,"):
+        return None
+
+    tokens = [p for p in re.split(r"[\s,]+", raw) if p.strip()]
+    if not tokens:
+        return None
+
+    values: list[float] = []
+    for token in tokens:
+        if ":" not in token:
+            try:
+                values.append(float(token))
+            except ValueError:
+                return None
+            continue
+
+        colon_parts = [part.strip() for part in token.split(":") if part.strip()]
+        if not colon_parts:
+            continue
+        if len(colon_parts) == 1:
+            try:
+                values.append(float(colon_parts[0]))
+            except ValueError:
+                return None
+            continue
+
+        try:
+            start = float(colon_parts[0])
+            stop = float(colon_parts[-1])
+            if len(colon_parts) == 2:
+                step = 1.0 if stop >= start else -1.0
+            else:
+                step = float(colon_parts[1])
+                if step == 0:
+                    return None
+        except ValueError:
+            return None
+
+        if step > 0:
+            arr = np.arange(start, stop + step, step, dtype=np.float64)
+        else:
+            arr = np.arange(start, stop + step, step, dtype=np.float64)
+        values.extend(float(v) for v in arr)
+
+    if not values:
+        return None
+    return np.asarray(values, dtype=np.float64)
 
 
 @dataclasses.dataclass(frozen=True)

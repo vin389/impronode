@@ -1,6 +1,6 @@
 # node_editor/calib_engine.py
 """
-Camera calibration engine (no Tk) for the Camera Calibration (Unified) node.
+Camera calibration engine (no Tk) for the Camera Calibration node.
 
 One weighted least-squares problem covers every use case:
 
@@ -756,7 +756,7 @@ def calibrate_opencv(prob: Problem, views: list, user: dict, has_pts: bool):
                                       for r, tt in poses], report
 
 
-# ── solve plans (used by the Camera Calibration (Unified) node; no Tk) ───────
+# ── solve plans (used by the Camera Calibration node; no Tk) ─────────────────
 
 def merge_initial(base_K, base_D, user: dict, prob: Problem):
     """Start values: a value typed by the user wins; a FIXED parameter left

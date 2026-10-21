@@ -28,6 +28,7 @@ class BaseNode(ABC):
     # ── Class attributes overridden by subclasses ──────────────────
     EXECUTION_MODE: ExecutionMode = ExecutionMode.SYNC
     NODE_TYPE:      str           = "base"    # Unique identifier used for serialization
+    NODE_TYPE_ALIASES: tuple      = ()        # former NODE_TYPEs (renamed nodes still load old projects)
     DISPLAY_NAME:   str           = "Base"    # Displayed in the Toolbox and node title
     CATEGORY:       str           = "misc"    # "source" / "process" / "visualize"
     SEARCH_KEYWORDS: tuple[str, ...] = ()      # Optional toolbox-search aliases

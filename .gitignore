@@ -1,0 +1,10 @@
+# Python compiled files: rebuilt automatically, differ per Python version
+__pycache__/
+*.py[cod]
+
+# Test / tool caches
+.pytest_cache/
+
+# Temporary files written during saves (renamed to the real name when complete)
+*.tmp
+*.part
