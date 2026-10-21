@@ -15,6 +15,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
+from node_editor.frame_selector import parse_selector
 from node_editor.project_context import get_project_directory
 from node_editor.video_frame_reader import VideoFrameReader, VIDEO_EXTS
 from node_editor.tooltip import add_tooltip
@@ -111,7 +112,10 @@ Selector (both sources) -- use only some of the images / video frames.
     7                      a single image.
     1:100:5                every 5th image of 1..100.
     200:  /  :50           from 200 to the last  /  from the first to 50.
+    (31-30):(80+50-30)     every number may be an expression with + - * ( );
+                           ':' binds weakest: 1:2+3 is 1:5 (not 4:5).
   Separate items with commas or spaces; they are used in the order given.
+  Spaces inside an expression ('201 : 480 + 20') do not separate items.
   Empty = all images. Press Enter (or leave the box) to apply; the line
   below shows how many are selected. Numbers beyond the last image are
   ignored (and reported).
@@ -457,7 +461,9 @@ Ctrl+H shows this help.
         se.bind("<Return>", self._apply_selector)
         se.bind("<FocusOut>", self._apply_selector)
         add_tooltip(se, "Use only some images / video frames, e.g. 1:30, 61:90, 100:105 "
-                        "(1-based, inclusive; also 1:100:5 for every 5th). Empty = all.\n"
+                        "(1-based, inclusive; also 1:100:5 for every 5th). Numbers may be "
+                        "expressions with + - * ( ), e.g. (31-30):(80+50-30); ':' binds weakest, so "
+                        "1:2+3 is 1:5. Empty = all.\n"
                         "Why: to skip unwanted frames (blurred, before the test started, ...). "
                         "Everything after this -- Start / End / i, the outputs -- then counts "
                         "the selected frames only. Press Enter to apply.")
@@ -638,43 +644,12 @@ Ctrl+H shows this help.
     def _parse_selector(text: str, total: int) -> tuple[list[int] | None, int]:
         """'1:30, 61:90, 100' (1-based, inclusive) -> (0-based source indices
         in the given order, number of requested indices beyond `total` that
-        were dropped). Also 'a:b:step', 'a:' (to the last) and ':b' (from
-        the first). Empty text -> (None, 0) = everything.
-        Raises ValueError for malformed text."""
-        text = re.sub(r"\s*:\s*", ":", (text or "").strip())
-        if not text:
-            return None, 0
-        out: list[int] = []
-        dropped = 0
-        for token in re.split(r"[,;\s]+", text):
-            if not token:
-                continue
-            m = re.fullmatch(r"(\d*)(?::(\d*)(?::(\d+))?)?", token)
-            if m is None or token in (":", "::"):
-                raise ValueError(f"'{token}' is not a number or a range a:b")
-            a_s, b_s, step_s = m.groups()
-            is_range = ":" in token
-            if not is_range:
-                a = b = int(a_s)
-            else:
-                a = int(a_s) if a_s else 1
-                b = int(b_s) if b_s else max(total, a)
-            step = int(step_s) if step_s else 1
-            if a < 1 or b < 1:
-                raise ValueError(f"'{token}': numbers start at 1")
-            if step < 1:
-                raise ValueError(f"'{token}': step must be 1 or more")
-            if a > b:
-                raise ValueError(f"'{token}': the first number is larger than the last")
-            requested = (b - a) // step + 1
-            stop = min(b, total)              # never build a huge range past the source
-            if a <= stop:
-                kept = range(a - 1, stop, step)
-                out.extend(kept)
-                dropped += requested - len(kept)
-            else:
-                dropped += requested
-        return out, dropped
+        were dropped). Also 'a:b:step', 'a:' (to the last), ':b' (from the
+        first), and integer expressions with + - * ( ) in every number,
+        ':' binding weakest ('(31-30):(80+50-30)', '1:2+3' = 1:5). Empty
+        text -> (None, 0) = everything. Raises ValueError for malformed
+        text. See node_editor/frame_selector.py."""
+        return parse_selector(text, total)
 
     def _selection(self) -> tuple[list[int] | None, int]:
         """(source indices of the selected frames or None for all, dropped)

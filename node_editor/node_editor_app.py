@@ -2,6 +2,7 @@
 import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
+import tkinter.font as tkfont
 from pathlib import Path
 import time
 import traceback
@@ -126,6 +127,50 @@ class NodeEditorApp:
 
     # ══ UI construction ═══════════════════════════════════════════
 
+    def _menu_check_images(self) -> tuple:
+        """(blank, check) images for menu check items, sized to the menu font.
+        The native Windows check mark is drawn far too large at higher
+        display scaling and covers the neighbouring items."""
+        if getattr(self, "_check_images", None) is None:
+            try:
+                line = tkfont.nametofont("TkMenuFont").metrics("linespace")
+            except tk.TclError:
+                line = 16
+            s = max(9, int(round(line * 0.6)))
+            blank = tk.PhotoImage(master=self.root, width=s, height=s)       # transparent
+            check = tk.PhotoImage(master=self.root, width=s, height=s)
+            t = max(1.4, s / 7.5)                                            # stroke width
+            pts = [(0.14, 0.54), (0.40, 0.80), (0.88, 0.20)]
+            for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+                n = int(4 * s)
+                for k in range(n + 1):
+                    x = (x0 + (x1 - x0) * k / n) * (s - 1)
+                    y = (y0 + (y1 - y0) * k / n) * (s - 1)
+                    a, b = int(round(x - t / 2)), int(round(y - t / 2))
+                    check.put("#202020", to=(max(0, a), max(0, b), min(s, a + int(round(t))),
+                                             min(s, b + int(round(t)))))
+            self._check_images = (blank, check)
+        return self._check_images
+
+    def _add_menu_check(self, menu: tk.Menu, **options) -> None:
+        """add_checkbutton with a small, crisp check mark (see _menu_check_images)."""
+        blank, check = self._menu_check_images()
+        menu.add_checkbutton(image=blank, selectimage=check, compound="left", indicatoron=False, **options)
+
+    def _add_menu_plain(self, menu: tk.Menu, label: str, command, **options) -> None:
+        """A normal command item whose label lines up with the _add_menu_check
+        items (on Windows a command entry reserves no image column, so it is
+        made the same kind of entry, with a check image that stays blank)."""
+        blank = self._menu_check_images()[0]
+        var = tk.BooleanVar(master=self.root, value=False)
+        self._menu_plain_vars = getattr(self, "_menu_plain_vars", []) + [var]     # keep it alive
+
+        def run():
+            var.set(False)
+            command()
+        menu.add_checkbutton(label=label, image=blank, selectimage=blank, compound="left", indicatoron=False,
+                             variable=var, command=run, **options)
+
     def _build_ui(self) -> None:
         self.root.title("Node Editor")
         self.root.geometry("1100x650")
@@ -155,20 +200,15 @@ class NodeEditorApp:
         menubar.add_cascade(label="File", underline=0, menu=file_menu)
 
         canvas_menu = tk.Menu(menubar, tearoff=0)
-        canvas_menu.add_command(label="Set Canvas Size...", command=self._set_canvas_size_prompt)
-        canvas_menu.add_checkbutton(
-            label="Show/hide &Links",
-            variable=self._links_visible_var,
-            command=self._toggle_link_visibility,
-            accelerator="Alt+L",
-        )
+        self._add_menu_plain(canvas_menu, label="Set Canvas Size...", command=self._set_canvas_size_prompt)
+        # Tk menus show '&' literally: underline= marks the mnemonic letter.
+        self._add_menu_check(canvas_menu, label="Show/hide Links", underline=10,
+                             variable=self._links_visible_var, command=self._toggle_link_visibility,
+                             accelerator="Alt+L")
         canvas_menu.add_separator()
         self._tooltips_var = tooltip_toggle_var(self.root)
-        canvas_menu.add_checkbutton(
-            label="Show tooltips",
-            variable=self._tooltips_var,
-            command=lambda: set_tooltips_enabled(self._tooltips_var.get()),
-        )
+        self._add_menu_check(canvas_menu, label="Show tooltips", variable=self._tooltips_var,
+                             command=lambda: set_tooltips_enabled(self._tooltips_var.get()))
         menubar.add_cascade(label="Canvas", menu=canvas_menu)
         self.root.config(menu=menubar)
 

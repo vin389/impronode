@@ -288,8 +288,10 @@ COPY SELECTED FRAMES TO A FOLDER (below the plot)
   e.g. to make a smaller Image Sequence of them.
   Folder      'Select folder...': where the new files go.
   Frames      1-based, as the Image Sequence selector: '1:100 201:500
-              600:900', '1:1000:10' (every 10th), '5', '700:' (to the last).
-              Valid frames are shaded green on the plot above.
+              600:900', '1:1000:10' (every 10th), '5', '700:' (to the last);
+              numbers may be expressions with + - * ( ): '(31-30):(80+50-30)',
+              ':' binds weakest (1:2+3 = 1:5). Valid frames are shaded green
+              on the plot above.
   Names       original: image files keep their names; video frames become
               <video name>_FRM000123 (the 1-based frame number).
               new: a pattern like selected_%06d, numbered by the original
@@ -2394,7 +2396,8 @@ class MeshTemplateTrackNode(BaseNode):
         e.pack(side="left", fill="x", expand=True, padx=(4, 0))
         add_tooltip(e, "Frames to copy, as in the Image Sequence selector: '1:100 201:500 600:900' "
                        "(inclusive ranges), '1:1000:10' (every 10th), '5' (one frame), '700:' (to the last). "
-                       "Valid frames are shaded green on the plot above.")
+                       "Numbers may be expressions with + - * ( ), e.g. (31-30):(80+50-30); ':' binds "
+                       "weakest, so 1:2+3 is 1:5. Valid frames are shaded green on the plot above.")
         self._copy_info_label = tk.Label(f, textvariable=self._copy_info_var, font=small, anchor="w",
                                          justify="left")
         self._copy_info_label.pack(fill="x", padx=4)
