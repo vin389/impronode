@@ -1,7 +1,7 @@
 # node_editor/nodes/structural_mesh_viewer_node.py
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 
 import numpy as np
 import cv2
@@ -2771,7 +2771,7 @@ class StructuralMeshViewerNode(BaseNode):
             return
         if not self._show_video_settings_dialog():
             return
-        path = filedialog.asksaveasfilename(
+        path = self.ask_save_as_filename(
             title="Save animation as video",
             defaultextension=".mp4",
             filetypes=[("MP4 video", "*.mp4"), ("AVI video", "*.avi"), ("All files", "*.*")])

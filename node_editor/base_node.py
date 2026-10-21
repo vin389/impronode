@@ -7,6 +7,7 @@ from typing import Optional, Callable, Any
 
 from node_editor.pin_types import PinSchema, PinType
 from node_editor.execution import ExecutionMode
+from node_editor import recent_dirs
 
 
 class BaseNode(ABC):
@@ -93,6 +94,7 @@ class BaseNode(ABC):
 
         self.node_style: str = "blue"
         self._last_compute_time: Optional[float] = None
+        self._editor = None              # the NodeEditorApp (set by it); see spawn_node_near()
 
     # ══ 1. Abstract methods subclasses must implement ═════════════
 
@@ -394,8 +396,26 @@ class BaseNode(ABC):
             "y":         self.y,
             "width":     self.width,
             "height":    self.height,
-            "params":    self.get_params(),
+            "params":    self.params_with_recent_dirs(),
         }
+
+    def params_with_recent_dirs(self) -> dict:
+        """get_params() plus the remembered file-dialog folders (relative to
+        the project folder when possible)."""
+        params = self.get_params()
+        dirs = recent_dirs.dirs_to_params(self)
+        if dirs:
+            params = dict(params or {})
+            params[recent_dirs.PARAM_KEY] = dirs
+        return params
+
+    def set_params_with_recent_dirs(self, params: dict) -> None:
+        """Restore the remembered file-dialog folders, then set_params() with
+        the rest."""
+        params = dict(params or {})
+        recent_dirs.dirs_from_params(self, params.pop(recent_dirs.PARAM_KEY, None))
+        if params:
+            self.set_params(params)
 
     def deserialize(self, data: dict) -> None:
         """
@@ -407,7 +427,7 @@ class BaseNode(ABC):
         self.y = data.get("y", 0)
         self.width = int(data.get("width", self.NODE_WIDTH))
         self.height = int(data.get("height", self.NODE_HEIGHT))
-        self.set_params(data.get("params", {}))
+        self.set_params_with_recent_dirs(data.get("params", {}))
 
     def set_size(self, width: int, height: int) -> None:
         self.width = max(self.MIN_WIDTH, int(width))
@@ -434,6 +454,33 @@ class BaseNode(ABC):
         Used for deserialization. Override in subclasses.
         """
         pass
+
+    # ══ Editor services ════════════════════════════════════════════
+    def spawn_node_near(self, node_type: str, params: dict | None = None,
+                        node_name: str = "") -> "BaseNode | None":
+        """Create a new node of `node_type` (restored from `params`) on the
+        canvas, in a free spot next to this node. None when there is no
+        editor (e.g. in tests) or the type is unknown."""
+        editor = getattr(self, "_editor", None)
+        if editor is None:
+            return None
+        return editor.spawn_node_near(self, node_type, params or {}, node_name)
+
+    # ══ File dialogs (remember the last load / save folder) ═════════
+    # Use these instead of tkinter.filedialog.ask*: each node remembers its
+    # last folder per kind ("load" / "save"), saved with the project.
+
+    def ask_open_filename(self, kind: str = "load", **kwargs) -> str:
+        return recent_dirs.ask_open_filename(self, kind, **kwargs)
+
+    def ask_open_filenames(self, kind: str = "load", **kwargs):
+        return recent_dirs.ask_open_filenames(self, kind, **kwargs)
+
+    def ask_save_as_filename(self, kind: str = "save", **kwargs) -> str:
+        return recent_dirs.ask_save_as_filename(self, kind, **kwargs)
+
+    def ask_directory(self, kind: str = "load", **kwargs) -> str:
+        return recent_dirs.ask_directory(self, kind, **kwargs)
 
     # ══ 6. Lifecycle ═══════════════════════════════════════════════
 

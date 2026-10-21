@@ -1,7 +1,7 @@
 # node_editor/nodes/array_accumulator_node.py
 
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk
 import threading
 import csv
 from pathlib import Path
@@ -12,7 +12,8 @@ from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
 from node_editor.tooltip import add_tooltip
-from node_editor.project_context import get_project_directory, get_project_file_path
+from node_editor.project_context import get_project_directory
+from node_editor import project_data
 
 
 _HELP_TEXT = (
@@ -406,7 +407,7 @@ class ArrayAccumulatorNode(BaseNode):
     def _on_browse_save_path(self) -> None:
         base = get_project_directory()
         initial_dir = str(base) if base else "."
-        path = filedialog.asksaveasfilename(
+        path = self.ask_save_as_filename(
             title="Save CSV output file",
             initialdir=initial_dir,
             filetypes=[
@@ -524,7 +525,7 @@ class ArrayAccumulatorNode(BaseNode):
     def _load_csv(self) -> None:
         base = get_project_directory()
         initial_dir = str(Path(self._save_path).parent) if self._save_path else str(base or ".")
-        path = filedialog.askopenfilename(
+        path = self.ask_open_filename(
             title="Load CSV data",
             initialdir=initial_dir,
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
@@ -621,51 +622,6 @@ class ArrayAccumulatorNode(BaseNode):
         self._write_count = 0
         self._update_display_counts()
         self._refresh_inspector_table()
-
-    def _project_sidecar_filename(self) -> str | None:
-        project_path = get_project_file_path()
-        if project_path is None:
-            return None
-        safe_node_id = "".join(
-            character if character.isalnum() or character in ("-", "_") else "_"
-            for character in self.node_id
-        )
-        return f"{project_path.stem}.{safe_node_id}.array_accumulator.csv"
-
-    def _write_project_sidecar(self, filename: str) -> None:
-        project_dir = get_project_directory()
-        if project_dir is None:
-            raise ValueError("project path is required to save accumulator data")
-
-        path = project_dir / filename
-        if not self._rows:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            return
-
-        temporary_path = path.with_name(path.name + ".tmp")
-        col_names = self._col_names_list()
-        header = col_names[:self._n_cols]
-        while len(header) < self._n_cols:
-            header.append(f"col_{len(header)}")
-
-        try:
-            with open(temporary_path, "w", newline="", encoding="utf-8") as file:
-                writer = csv.writer(file)
-                writer.writerow(["row"] + header)
-                for row_number in sorted(self._rows):
-                    values = [format(float(value), ".17g")
-                              for value in self._rows[row_number]]
-                    writer.writerow([row_number] + values)
-            temporary_path.replace(path)
-        except Exception:
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
-            raise
 
     def _load_project_sidecar(self, filename: str) -> bool:
         project_dir = get_project_directory()
@@ -916,14 +872,12 @@ class ArrayAccumulatorNode(BaseNode):
             "n_cols":        self._n_cols,
             "fire_counter":  self._fire_counter,
         }
-        sidecar_filename = self._project_sidecar_filename()
-        if sidecar_filename is not None:
-            self._write_project_sidecar(sidecar_filename)
-            if self._rows:
-                params["accumulator_csv"] = sidecar_filename
-        elif self._rows:
-            params["rows"] = {str(row): data.tolist()
-                              for row, data in self._rows.items()}
+        if self._rows:
+            # Stored inside the project file (its Data sheet), exactly.
+            numbers = sorted(self._rows)
+            params["rows_data"] = project_data.put_arrays(self, "rows", {
+                "row": np.asarray(numbers, dtype=np.int64),
+                "values": np.stack([np.asarray(self._rows[r], dtype=np.float64) for r in numbers])})
         return params
 
     def set_params(self, params: dict) -> None:
@@ -937,6 +891,26 @@ class ArrayAccumulatorNode(BaseNode):
         except Exception:
             self._save_interval_var.set(1)
 
+        stored = project_data.get_arrays(params.get("rows_data"))
+        if stored is not None:
+            try:
+                numbers, values = stored["row"].astype(np.int64), np.asarray(stored["values"], np.float64)
+                rows = {int(r): values[k] for k, r in enumerate(numbers)}
+                n_cols = int(values.shape[1]) if values.ndim == 2 else 0
+                max_row = max(int(params.get("max_row", 0)), max(rows) if rows else 0)
+                if rows and n_cols:
+                    self._restore_table(rows, max_row, n_cols)
+                    self._skip_next_data_write = True
+                    self._status_var.set(f"{max_row} rows restored from project")
+                self._fire_counter = max(0, int(params.get("fire_counter", 0)))
+            except (KeyError, TypeError, ValueError, IndexError):
+                self._status_var.set("stored accumulator data is invalid")
+            return
+        if params.get("rows_data") is not None:
+            self._status_var.set("the accumulator data is missing from the project file")
+            return
+
+        # Projects saved before the Data sheet: a CSV side file next to the project.
         sidecar_filename = str(params.get("accumulator_csv", "")).strip()
         if sidecar_filename:
             if self._load_project_sidecar(sidecar_filename):

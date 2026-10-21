@@ -1,7 +1,7 @@
 # node_editor/nodes/point_tracking_node.py
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 import threading
 import queue
 import time
@@ -508,7 +508,7 @@ class PointTrackingNode(BaseNode):
     def _on_browse_files(self) -> None:
         base = get_project_directory()
         initial = str(base) if base else "."
-        paths = filedialog.askopenfilenames(
+        paths = self.ask_open_filenames(
             title="Select image files",
             initialdir=initial,
             filetypes=[

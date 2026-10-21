@@ -11,6 +11,8 @@ import numpy as np
 from node_editor.nodes.accumulator_nodes import ArrayAccumulatorNode
 from node_editor.project_context import set_project_file_path
 
+from project_roundtrip import restore, save_and_load
+
 
 class TestArrayAccumulatorPersistence(unittest.TestCase):
     def setUp(self):
@@ -94,7 +96,7 @@ class TestArrayAccumulatorPersistence(unittest.TestCase):
         self.assertEqual(second["table"].shape, (2, 2))
         self.assertTrue(np.allclose(second["table"][1], [3.0, 4.0]))
 
-    def test_project_uses_relative_sidecar_csv_instead_of_inline_array(self):
+    def test_project_stores_the_table_inside_the_project_file(self):
         node = self._make_node("node_42")
         data = np.arange(10_000, dtype=np.float64).reshape(100, 100) / 7.0
         node._restore_table(
@@ -105,23 +107,18 @@ class TestArrayAccumulatorPersistence(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_path = Path(temporary_directory) / "experiment.xlsx"
-            set_project_file_path(str(project_path))
-            params = node.get_params()
+            try:
+                params, stored = save_and_load(project_path, node, "array_accumulator")
+            finally:
+                set_project_file_path(None)
 
             self.assertNotIn("rows", params)
-            self.assertEqual(
-                params["accumulator_csv"],
-                "experiment.node_42.array_accumulator.csv",
-            )
+            self.assertNotIn("accumulator_csv", params)
             self.assertLess(len(json.dumps(params)), 32_000)
 
-            sidecar_path = project_path.parent / params["accumulator_csv"]
-            self.assertTrue(sidecar_path.exists())
-            self.assertGreater(sidecar_path.stat().st_size, 32_000)
-
             restored = self._make_node("node_42_restored")
-            restored.set_params(params)
-            self.assertTrue(np.array_equal(restored._build_table(), data))
+            restore(restored, params, stored)
+            self.assertTrue(np.array_equal(restored._build_table(), data))   # exact, bit for bit
 
     def test_empty_project_accumulator_does_not_reference_missing_sidecar(self):
         node = self._make_node("empty")

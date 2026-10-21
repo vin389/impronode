@@ -81,7 +81,7 @@ import threading
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, messagebox, ttk
 
 import cv2
 import numpy as np
@@ -1417,7 +1417,7 @@ class ImageDataSimulatorNode(BaseNode):
         self._lbl(f, "Noise random seed", 14); self._entry(f, 14, 1, ("output", "seed"), cast=int)
 
     def _browse_folder(self) -> None:
-        folder = filedialog.askdirectory(parent=self._inspector_win, title="Select output folder")
+        folder = self.ask_directory("save", parent=self._inspector_win, title="Select output folder")
         if folder:
             # Kept absolute at run time; made project-relative only on save.
             self._trial["output"]["folder"] = os.path.abspath(folder)

@@ -76,7 +76,7 @@ def test_project_progress_close_waits_for_load_and_save(monkeypatch, tmp_path):
 
         app._project_path = str(tmp_path / "save.xlsx")
 
-        def save_while_busy(_path, _nodes, _links, _meta):
+        def save_while_busy(_path, _nodes, _links, _meta, **_kwargs):
             assert app._project_progress_close_button.cget("state") == tk.DISABLED
             app._close_project_progress()
             assert app._project_progress_window.winfo_exists()
@@ -87,7 +87,7 @@ def test_project_progress_close_waits_for_load_and_save(monkeypatch, tmp_path):
         app._project_progress_close_button.invoke()
         assert app._project_progress_window is None
 
-        def failed_save(_path, _nodes, _links, _meta):
+        def failed_save(_path, _nodes, _links, _meta, **_kwargs):
             raise OSError("cannot write")
 
         monkeypatch.setattr(app_module, "save_project", failed_save)

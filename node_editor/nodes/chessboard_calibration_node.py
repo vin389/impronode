@@ -125,7 +125,7 @@ import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 
 import cv2
 import numpy as np
@@ -3129,9 +3129,9 @@ class ChessboardCalibrationNode(BaseNode):
             messagebox.showinfo("Save as", "Nothing to save yet -- run 'Detect & Select' first.",
                                 parent=self._dlg_parent())
             return
-        path = filedialog.asksaveasfilename(parent=self._dlg_parent(), title="Save calibration data",
-                                            defaultextension=".npz", initialfile="chessboard_calibration.npz",
-                                            filetypes=[("Calibration files", "*.npz")])
+        path = self.ask_save_as_filename(parent=self._dlg_parent(), title="Save calibration data",
+                                         defaultextension=".npz", initialfile="chessboard_calibration.npz",
+                                         filetypes=[("Calibration files", "*.npz")])
         if not path:
             return
         final = path if path.lower().endswith(".npz") else path + ".npz"
@@ -3172,8 +3172,8 @@ class ChessboardCalibrationNode(BaseNode):
         self._refresh_file_label()
 
     def _on_load(self) -> None:
-        path = filedialog.askopenfilename(parent=self._dlg_parent(), title="Load calibration data",
-                                          filetypes=[("Calibration files", "*.npz"), ("All files", "*.*")])
+        path = self.ask_open_filename(parent=self._dlg_parent(), title="Load calibration data",
+                                      filetypes=[("Calibration files", "*.npz"), ("All files", "*.*")])
         if not path:
             return
         try:

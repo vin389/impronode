@@ -85,7 +85,10 @@ MAGNIFIER (top right) -- a zoomed look around the cursor
               refines the marker corners. Searched in the WHOLE frame
               (once per frame), so a marker is found even when only part
               of it is inside the magnifier. Drawn in YELLOW with the
-              id; corner 0 has the thicker square.
+              id; corner 0 has the thicker square. Each marker gives 5
+              snap points: its 4 corners and its CENTRE (yellow X) = the
+              intersection of the two diagonals, the true centre of the
+              square even under perspective.
     Features  cv2.goodFeaturesToTrack: "max" points, "quality" = like the
               corner threshold. It finds corners ON THE PIXEL GRID (whole
               numbers); "sub-pixel" refines them with cv2.cornerSubPix.
@@ -604,7 +607,9 @@ class ImageDisplayNode(BaseNode):
         add_tooltips_by_text(mag_inner, {
             "Corners": "Mark corners (Harris) in the magnified area -- helps to place points "
                        "exactly on a corner.",
-            "ArUco": "Find ArUco markers in the whole frame and mark their corners and ids.",
+            "ArUco": "Find ArUco markers in the whole frame and mark their corners, centre "
+                     "(diagonal intersection, yellow X) and ids. Each of the 5 points can be "
+                     "added with S.",
             "Features": "Mark well-trackable points (goodFeaturesToTrack) in the magnified "
                         "area, e.g. to choose points for tracking.",
             "threshold": "Keep corners at least this fraction as strong as the strongest one "
@@ -1337,16 +1342,26 @@ class ImageDisplayNode(BaseNode):
         for mid, quad in dets.get("markers", ()):
             pts = [to_l(x, y) for x, y in quad]
             c.create_polygon(*[v for p in pts for v in p], outline=self._LOUPE_ARUCO_COLOR, fill="", width=2)
-            cx = sum(p[0] for p in pts) / 4.0
-            cy = sum(p[1] for p in pts) / 4.0
-            c.create_text(cx, cy, text=str(mid), fill=self._LOUPE_ARUCO_COLOR, font=("Arial", 10, "bold"))
+            # 5th snap point: the marker centre = intersection of the two
+            # diagonals (corner 0-2 x corner 1-3), the true centre of the
+            # square even under perspective. Drawn as a yellow X; the id
+            # label sits just above-right of it so it does not cover it.
+            ux, uy = _aruco_center(quad)
+            CX, CY = to_l(ux, uy)
+            c.create_line(CX - 5, CY - 5, CX + 5, CY + 5, fill=self._LOUPE_ARUCO_COLOR, width=2)
+            c.create_line(CX - 5, CY + 5, CX + 5, CY - 5, fill=self._LOUPE_ARUCO_COLOR, width=2)
+            c.create_text(CX + 7, CY - 7, text=str(mid), anchor="sw", fill=self._LOUPE_ARUCO_COLOR,
+                          font=("Arial", 10, "bold"))
+            targets = [(f"ArUco id {mid} corner {k}", float(x), float(y)) for k, (x, y) in enumerate(quad)]
+            targets.append((f"ArUco id {mid} centre", float(ux), float(uy)))
             for k, (x, y) in enumerate(quad):
                 X, Y = to_l(x, y)
                 c.create_rectangle(X - 3, Y - 3, X + 3, Y + 3, outline=self._LOUPE_ARUCO_COLOR,
                                    width=2 if k == 0 else 1)
+            for label, x, y in targets:
                 d = (x - px) ** 2 + (y - py) ** 2
                 if best is None or d < best:
-                    best, nearest = d, (f"ArUco id {mid} corner {k}", float(x), float(y))
+                    best, nearest = d, (label, x, y)
         if nearest is not None:                      # highlight the snap target
             X, Y = to_l(nearest[1], nearest[2])
             c.create_oval(X - 9, Y - 9, X + 9, Y + 9, outline=self._LOUPE_NEAREST_COLOR, width=2)

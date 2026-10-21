@@ -2,7 +2,7 @@
 
 import csv
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk
 from pathlib import Path
 
 import numpy as np
@@ -802,7 +802,7 @@ class SharedArrayNode(BaseNode):
 
     def _on_load_csv(self) -> None:
         base = get_project_directory()
-        path = filedialog.askopenfilename(
+        path = self.ask_open_filename(
             title="Load CSV",
             initialdir=str(base) if base else ".",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
@@ -855,7 +855,7 @@ class SharedArrayNode(BaseNode):
         base = get_project_directory()
         initial_dir = str(Path(self._last_csv_path).parent) if self._last_csv_path else (
             str(base) if base else ".")
-        path = filedialog.asksaveasfilename(
+        path = self.ask_save_as_filename(
             title="Save CSV",
             initialdir=initial_dir,
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],

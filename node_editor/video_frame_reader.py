@@ -78,10 +78,16 @@ class VideoFrameReader:
         self._cache_size = cache_size
         # Filled by build_index():
         self._fingerprints: list | None = None
-        self.frame_count: int | None = None        # exact, once indexed
+        self.frame_count: int | None = None        # exact, once indexed (or the end was reached)
         self.index_progress = 0.0
         self.index_error: str | None = None
         self._cancel = threading.Event()
+        self._index_stop = threading.Event()        # stop_index(): reading goes on
+        # Fingerprints LEARNED so far, frame index -> fingerprint: from the
+        # background index as it progresses AND from every in-order decode
+        # by read(). A jump to a frame in here can be verified long before
+        # the full index is ready (dict item assignment is thread-safe).
+        self._known: dict[int, bytes] = {}
         # Statistics shown in the UI.
         self.seeks = 0
         self.seek_failures = 0
@@ -92,9 +98,23 @@ class VideoFrameReader:
     def index_ready(self) -> bool:
         return self._fingerprints is not None
 
+    @property
+    def index_stopped(self) -> bool:
+        return self._index_stop.is_set()
+
     def count_known(self) -> int:
-        """Exact count once indexed; until then the container's report."""
+        """Exact count once indexed or once in-order reading hit the end;
+        until then the container's report."""
         return self.frame_count if self.frame_count is not None else self.reported_count
+
+    def knows(self, k: int) -> bool:
+        """True if a jump to frame k can be verified (its fingerprint is known)."""
+        return self.index_ready or k in self._known
+
+    def stop_index(self) -> None:
+        """Stop the background index (e.g. to give a tracking run the CPU).
+        Fingerprints learned so far stay usable."""
+        self._index_stop.set()
 
     def time_of(self, k: int) -> float | None:
         return k / self.fps if self.fps > 0 else None
@@ -108,13 +128,15 @@ class VideoFrameReader:
             if not cap.isOpened():
                 raise IOError("cannot open the video for indexing")
             prints, total = [], max(1, self.reported_count)
-            while not self._cancel.is_set():
+            while not (self._cancel.is_set() or self._index_stop.is_set()):
                 ok, frame = cap.read()
                 if not ok:
                     break
-                prints.append(frame_fingerprint(frame))
+                fp = frame_fingerprint(frame)
+                self._known[len(prints)] = fp
+                prints.append(fp)
                 self.index_progress = min(0.999, len(prints) / total)
-            if self._cancel.is_set():
+            if self._cancel.is_set() or self._index_stop.is_set():
                 return
             self.frame_count = len(prints)
             self._fingerprints = prints
@@ -134,7 +156,7 @@ class VideoFrameReader:
         """Frames read(k) would have to decode one by one (0 = fast)."""
         if k in self._cache or k == self._next or 0 < k - self._next <= self.FORWARD_DECODE_MAX:
             return 0
-        if self.index_ready and self.seek_reliable():
+        if self.knows(k) and self.seek_reliable():
             return 0                                 # seek + verify (seeking has been working)
         return k - self._next if k > self._next else k
 
@@ -162,6 +184,7 @@ class VideoFrameReader:
     def _grab_to(self, k: int) -> bool:
         while self._next < k:
             if not self._cap.grab():
+                self._reached_end()
                 return False
             self._next += 1
         return True
@@ -169,12 +192,26 @@ class VideoFrameReader:
     def _read_next(self):
         ok, frame = self._cap.read()
         if not ok:
+            self._reached_end()
             return None
+        # The position is always exact here (in-order decode, or a verified
+        # seek), so this frame's fingerprint can be learned.
+        self._known.setdefault(self._next, frame_fingerprint(frame))
         self._next += 1
         return frame
 
+    def _reached_end(self) -> None:
+        """In-order decoding stopped at frame self._next: that is the real
+        frame count (the container's number can be wrong)."""
+        if self.frame_count is None:
+            self.frame_count = self._next
+
     def _verified(self, k: int, frame) -> bool:
-        return self._fingerprints is None or frame_fingerprint(frame) == self._fingerprints[k]
+        if self._fingerprints is not None:
+            expected = self._fingerprints[k]
+        else:
+            expected = self._known.get(k)
+        return expected is None or frame_fingerprint(frame) == expected
 
     def _read_exact(self, k: int):
         if k == self._next:
@@ -183,7 +220,9 @@ class VideoFrameReader:
         if 0 < k - self._next <= self.FORWARD_DECODE_MAX:
             self.last_method = "decoded forward"
             return self._read_next() if self._grab_to(k) else None
-        if self.index_ready and self.seek_reliable():
+        sought = False
+        if self.knows(k) and self.seek_reliable():
+            sought = True
             self.seeks += 1
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, k)
             ok, frame = self._cap.read()
@@ -193,7 +232,7 @@ class VideoFrameReader:
                 return frame
             self.seek_failures += 1
         # Exact fallback: decode in order (from the start if k is behind).
-        if k < self._next or self.index_ready:   # after a failed seek the position is unknown
+        if k < self._next or sought:            # after a failed seek the position is unknown
             self._reopen()
         self.last_method = "decoded from start" if k > 0 else "first frame"
         if not self._grab_to(k):

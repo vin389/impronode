@@ -10,6 +10,8 @@ from node_editor.nodes.array_nodes import ArrayViewerNode
 from node_editor.pin_types import PinType, pins_compatible
 from node_editor.project_context import set_project_file_path
 
+from project_roundtrip import restore, save_and_load
+
 
 class TestArrayViewerCopyButtons(unittest.TestCase):
     def test_array_viewer_copy_csv_uses_full_array_and_selected_slice(self):
@@ -77,8 +79,7 @@ class TestArrayViewerCopyButtons(unittest.TestCase):
         node._update_summary(arr)
 
         saved = node.get_params()
-        self.assertIn("data", saved)
-        self.assertEqual(saved["data"], [[1.0, 2.0], [3.0, 4.0]])
+        self.assertIn("array_data", saved)
 
         restored = ArrayViewerNode("viewer_restored", canvas)
         restored.build_body()
@@ -127,7 +128,7 @@ class TestArrayViewerCopyButtons(unittest.TestCase):
 
         root.destroy()
 
-    def test_array_viewer_project_uses_relative_npy_sidecar(self):
+    def test_array_viewer_project_stores_the_array_inside_the_project_file(self):
         root = tk.Tk()
         root.withdraw()
         canvas = tk.Canvas(root)
@@ -140,20 +141,15 @@ class TestArrayViewerCopyButtons(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 project_path = Path(directory) / "measurement.xlsx"
-                set_project_file_path(str(project_path))
-                params = node.get_params()
+                params, stored = save_and_load(project_path, node, "array_viewer")
 
                 self.assertNotIn("data", params)
-                self.assertEqual(
-                    params["array_viewer_file"],
-                    "measurement.node_17.array_viewer.npy",
-                )
+                self.assertNotIn("array_viewer_file", params)
                 self.assertLess(len(json.dumps(params)), 32_000)
-                self.assertTrue((project_path.parent / params["array_viewer_file"]).exists())
 
                 restored = ArrayViewerNode("node_17_restored", canvas)
                 restored.build_body()
-                restored.set_params(params)
+                restore(restored, params, stored)
 
                 self.assertEqual(restored._current_array.dtype, np.dtype("int16"))
                 self.assertEqual(restored._current_array.shape, (40, 50, 60))

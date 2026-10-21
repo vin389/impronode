@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 
 import cv2
 import numpy as np
@@ -347,7 +347,7 @@ class ImageSaveNode(BaseNode):
     def _on_browse_folder(self) -> None:
         base = self._get_project_base()
         initial = str(base) if base else "."
-        folder = filedialog.askdirectory(title="Select output folder", initialdir=initial)
+        folder = self.ask_directory("save", title="Select output folder", initialdir=initial)
         if not folder:
             return
         existing = self._pattern_var.get().strip()

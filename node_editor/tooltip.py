@@ -7,12 +7,70 @@
 The text is wrapped automatically (pass newlines to force breaks). A
 tooltip also shows on a DISABLED widget -- often exactly when the user
 wonders what it is for.
+
+All tooltips can be switched off (set_tooltips_enabled; e.g. when they
+cover something important); the choice is remembered per user in
+~/.impronode/settings.json.
 """
 
+import json
+import os
 import textwrap
 import tkinter as tk
+from pathlib import Path
 
 _WRAP_CHARS = 60
+_SETTINGS = Path.home() / ".impronode" / "settings.json"
+
+
+def _load_enabled() -> bool:
+    try:
+        return bool(json.loads(_SETTINGS.read_text(encoding="utf-8")).get("tooltips", True))
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+_enabled = _load_enabled()
+_listeners: list = []
+
+
+def tooltips_enabled() -> bool:
+    return _enabled
+
+
+def set_tooltips_enabled(enabled: bool) -> None:
+    """Switch every tooltip on / off (and remember it); listeners added with
+    on_tooltips_changed() are told, e.g. to update their check boxes."""
+    global _enabled
+    _enabled = bool(enabled)
+    try:
+        data = json.loads(_SETTINGS.read_text(encoding="utf-8")) if _SETTINGS.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+        data["tooltips"] = _enabled
+        _SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SETTINGS.with_name(_SETTINGS.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, _SETTINGS)
+    except (OSError, ValueError):
+        pass
+    for fn in list(_listeners):
+        try:
+            fn(_enabled)
+        except (tk.TclError, RuntimeError):         # its widget / variable is gone
+            _listeners.remove(fn)
+
+
+def on_tooltips_changed(fn) -> None:
+    _listeners.append(fn)
+
+
+def tooltip_toggle_var(master) -> tk.BooleanVar:
+    """A BooleanVar that follows the global switch (for a Checkbutton /
+    menu checkbutton: command=lambda: set_tooltips_enabled(var.get()))."""
+    var = tk.BooleanVar(master=master, value=_enabled)
+    on_tooltips_changed(var.set)
+    return var
 
 
 class Tooltip:
@@ -38,6 +96,8 @@ class Tooltip:
 
     def _schedule(self, _e=None):
         self._hide()
+        if not _enabled:
+            return
         try:
             self._after = self._widget.after(self._delay, self._show)
         except tk.TclError:

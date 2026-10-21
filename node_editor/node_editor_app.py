@@ -13,7 +13,10 @@ from node_editor.execution        import ExecutionMode
 from node_editor.data_flow_engine import DataFlowEngine
 from node_editor.project_io       import load_project, save_project, ProjectFormatError
 from node_editor.project_context  import set_project_file_path, get_project_directory
+from node_editor                  import project_data
+from node_editor.recent_projects  import RecentProjects
 from node_editor.ui_style         import apply_notebook_tab_style
+from node_editor.tooltip          import set_tooltips_enabled, tooltip_toggle_var
 from node_editor                  import link_geometry
 
 
@@ -37,6 +40,7 @@ class NodeEditorApp:
     LINK_HOVER_MS = 220
     LINK_HIT_PAD = 6
     SCROLL_UNITS  = 25
+    TOOLBOX_SCROLL_PX = 60     # toolbox: pixels per mouse-wheel notch (~2 entries)
     DEFAULT_CANVAS_WIDTH = 3000
     DEFAULT_CANVAS_HEIGHT = 2000
 
@@ -68,6 +72,8 @@ class NodeEditorApp:
         self._project_node_load_starts: dict[str, float] = {}
         self._project_load_file_ready = False
         self._project_load_execution_done = False
+        self._recent_projects = RecentProjects()
+        self._recent_menu: tk.Menu | None = None
 
         self._node_counter = 0
         # canvas_nodes: node_id -> BaseNode (shared with engine.nodes)
@@ -139,6 +145,10 @@ class NodeEditorApp:
         file_menu.add_command(
             label="Save As...", underline=5, command=self._file_save_as,
         )
+        file_menu.add_separator()
+        self._recent_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Recent Projects", underline=0, menu=self._recent_menu)
+        self._refresh_recent_menu()
         # Tk menu mnemonics use an underlined character rather than a literal
         # ampersand.  This is the native equivalent of "&File" and lets
         # Alt+F open the menu on platforms with a standard menu bar.
@@ -151,6 +161,13 @@ class NodeEditorApp:
             variable=self._links_visible_var,
             command=self._toggle_link_visibility,
             accelerator="Alt+L",
+        )
+        canvas_menu.add_separator()
+        self._tooltips_var = tooltip_toggle_var(self.root)
+        canvas_menu.add_checkbutton(
+            label="Show tooltips",
+            variable=self._tooltips_var,
+            command=lambda: set_tooltips_enabled(self._tooltips_var.get()),
         )
         menubar.add_cascade(label="Canvas", menu=canvas_menu)
         self.root.config(menu=menubar)
@@ -201,6 +218,8 @@ class NodeEditorApp:
             bg="#f0f0f0",
             highlightthickness=0,
             bd=0,
+            width=1,               # take only the width left next to the scrollbar
+            yscrollincrement=1,    # scroll "units" = pixels (Tk's default is 1/10 of the view)
         )
         self.toolbox_v_scroll = tk.Scrollbar(
             self.toolbox_body,
@@ -216,8 +235,10 @@ class NodeEditorApp:
         )
         self.toolbox_canvas.configure(yscrollcommand=self.toolbox_v_scroll.set)
 
-        self.toolbox_canvas.pack(side="left", fill="both", expand=True)
+        # Scrollbar packed FIRST: pack gives space in packing order, and the
+        # expanding canvas packed first left the scrollbar no room at all.
         self.toolbox_v_scroll.pack(side="right", fill="y")
+        self.toolbox_canvas.pack(side="left", fill="both", expand=True)
 
         self.toolbox_content = tk.Frame(self.toolbox_canvas, bg="#f0f0f0")
         self.toolbox_canvas.create_window(
@@ -417,7 +438,7 @@ class NodeEditorApp:
         delta = getattr(event, "delta", 0)
         if delta == 0:
             return "break"
-        self.toolbox_canvas.yview_scroll(int(-delta / 120) * self.SCROLL_UNITS, "units")
+        self.toolbox_canvas.yview_scroll(int(-delta / 120) * self.TOOLBOX_SCROLL_PX, "units")
         return "break"
 
     def _focus_toolbox(self, _event=None) -> None:
@@ -426,7 +447,7 @@ class NodeEditorApp:
 
     def _on_toolbox_arrow_key(self, event) -> str:
         direction = -1 if event.keysym == "Up" else 1
-        self.toolbox_canvas.yview_scroll(direction * 3, "units")
+        self.toolbox_canvas.yview_scroll(direction * self.TOOLBOX_SCROLL_PX // 2, "units")
         return "break"
 
     def _on_canvas_arrow_key(self, event) -> str:
@@ -663,12 +684,55 @@ class NodeEditorApp:
         self._mark_dirty()
         return node
 
+    def spawn_node_near(self, source: BaseNode, node_type: str, params: dict,
+                        node_name: str = "") -> BaseNode | None:
+        """A new node (see BaseNode.spawn_node_near), placed in a free spot
+        next to `source` -- right of it, else below / left / above -- and
+        selected, so it is easy to find."""
+        cls = self._node_type_map.get(node_type)
+        if cls is None:
+            return None
+        node_id = f"node_{self._node_counter}"
+        self._node_counter += 1
+        w, h = cls.NODE_WIDTH, cls(node_id, self.canvas).get_default_height()
+        x, y = self._free_spot_near(source, w, h)
+        node = self._create_node_instance(cls, node_id, x, y, w, h, params, node_name=node_name or None)
+        self.engine.trigger_all()
+        self._mark_dirty()
+        try:
+            self._select_node(node_id)
+        except Exception:                          # selection is a convenience only
+            pass
+        return node
+
+    def _free_spot_near(self, source: BaseNode, w: int, h: int, gap: int = 40) -> tuple[int, int]:
+        rects = [(n.x, n.y, n.x + n.width, n.y + n.height) for n in self.canvas_nodes.values()]
+
+        def free(x, y, margin=15):
+            if x < 0 or y < 0 or x + w > self._canvas_width or y + h > self._canvas_height:
+                return False
+            return not any(x < x1 + margin and x + w + margin > x0 and y < y1 + margin and y + h + margin > y0
+                           for x0, y0, x1, y1 in rects)
+
+        sx, sy, sw, sh = source.x, source.y, source.width, source.height
+        candidates = []
+        for k in range(0, 12):                      # right of the source, going down
+            candidates.append((sx + sw + gap, sy + k * (h + 20)))
+        for k in range(0, 12):                      # below / left / above
+            candidates += [(sx + k * (w + 20), sy + sh + gap), (sx - w - gap, sy + k * (h + 20)),
+                           (sx + k * (w + 20), sy - h - gap)]
+        for x, y in candidates:
+            if free(x, y):
+                return int(x), int(y)
+        return int(min(max(0, sx + sw + gap), max(0, self._canvas_width - w))), int(max(0, sy))
+
     def _create_node_instance(self, cls: Type[BaseNode], node_id: str,
                               x: int, y: int, width: int, height: int,
                               params: dict, node_name: str | None = None) -> BaseNode:
         self._node_counter = max(self._node_counter, self._node_index_from_id(node_id) + 1)
 
         node = cls(node_id, self.canvas)
+        node._editor = self
         node.x = x
         node.y = y
         node.width = max(node.MIN_WIDTH, int(width))
@@ -691,7 +755,7 @@ class NodeEditorApp:
         node_restore_start = time.perf_counter()
         try:
             if params:
-                node.set_params(params)
+                node.set_params_with_recent_dirs(params)
         except Exception as e:
             messagebox.showwarning("Load Warning", f"Node '{node_id}' params could not be fully restored: {e}")
         finally:
@@ -2613,7 +2677,7 @@ class NodeEditorApp:
     # returned and cleared the in-progress flag.
     _FILE_LOAD_DEBOUNCE_SECONDS = 1.0
 
-    def _file_load(self) -> None:
+    def _file_load(self, path: str | None = None) -> None:
         # Defense-in-depth re-entrancy guard. The flag must be set BEFORE any
         # call that can pump the Tk event loop (messagebox, file dialog,
         # window.update() inside the progress reporting) — any of those can
@@ -2633,12 +2697,14 @@ class NodeEditorApp:
             if not self._confirm_discard_if_dirty():
                 return
 
-            path = filedialog.askopenfilename(
-                parent=self.root,
-                title="Load Project",
-                filetypes=[("Excel files", "*.xlsx")],
-                defaultextension=".xlsx",
-            )
+            if path is None:
+                path = filedialog.askopenfilename(
+                    parent=self.root,
+                    title="Load Project",
+                    filetypes=[("Excel files", "*.xlsx")],
+                    defaultextension=".xlsx",
+                    **self._project_dialog_start(),
+                )
             if not path:
                 return
 
@@ -2647,15 +2713,20 @@ class NodeEditorApp:
 
             self._open_project_progress("load")
             try:
+                t0 = time.perf_counter()
                 nodes, links, meta = load_project(selected_path)
+                self._append_project_progress(f"Project file read in {time.perf_counter() - t0:.2f} s.")
                 self._suspend_dirty = True
+                project_data.begin_load(meta.pop("data", None) if isinstance(meta, dict) else None)
                 try:
                     self._set_project_path(selected_path)
                     canvas_size_issue = self._restore_canvas_size(meta)
                     issues = self._load_graph(nodes, links)
                 finally:
+                    project_data.end_load()
                     self._suspend_dirty = False
                 self._set_clean()
+                self._remember_recent_project(selected_path)
                 if canvas_size_issue:
                     issues.append(canvas_size_issue)
                 issues.extend(list(meta.get("load_issues", [])) if isinstance(meta, dict) else [])
@@ -2686,9 +2757,21 @@ class NodeEditorApp:
 
         try:
             self._open_project_progress("save")
-            nodes, links, meta = self._serialize_graph()
-            save_project(self._project_path, nodes, links, meta)
+            project_data.begin_save()
+            t0 = time.perf_counter()
+            try:
+                nodes, links, meta = self._serialize_graph()
+            finally:
+                data = project_data.end_save()
+            t1 = time.perf_counter()
+            save_project(self._project_path, nodes, links, meta, data=data)
+            size = sum(len(v) for v in data.values())
+            self._append_project_progress(
+                f"Node settings collected in {t1 - t0:.2f} s"
+                + (f" ({len(data)} data item(s), {size / 1e6:.1f} MB as text)" if data else "")
+                + f"; project file written in {time.perf_counter() - t1:.2f} s.")
             self._set_clean()
+            self._remember_recent_project(self._project_path)
             self._finish_project_progress("save")
             return True
         except Exception as e:
@@ -2705,6 +2788,7 @@ class NodeEditorApp:
             title="Save Project As",
             filetypes=[("Excel files", "*.xlsx")],
             defaultextension=".xlsx",
+            **self._project_dialog_start(),
         )
         if not path:
             return False
@@ -2715,6 +2799,59 @@ class NodeEditorApp:
         if not ok:
             self._set_project_path(previous_path)
         return ok
+
+    # ── Recent projects ───────────────────────────────────────────
+
+    def _project_dialog_start(self) -> dict:
+        """initialdir for the project Load / Save As dialogs: the current
+        project's folder, else the most recent project's folder."""
+        candidates = [self._project_path] if self._project_path else []
+        recent = getattr(self, "_recent_projects", None)
+        if recent is not None:
+            candidates += recent.paths
+        for p in candidates:
+            folder = Path(p).parent
+            if folder.is_dir():
+                return {"initialdir": str(folder)}
+        return {}
+
+    def _remember_recent_project(self, path: str | None) -> None:
+        recent = getattr(self, "_recent_projects", None)
+        if recent is None or not path:
+            return
+        recent.add(path)
+        self._refresh_recent_menu()
+
+    def _refresh_recent_menu(self) -> None:
+        menu = getattr(self, "_recent_menu", None)
+        recent = getattr(self, "_recent_projects", None)
+        if menu is None or recent is None:
+            return
+        menu.delete(0, tk.END)
+        if not recent.paths:
+            menu.add_command(label="(none)", state=tk.DISABLED)
+            return
+        for i, p in enumerate(recent.paths, start=1):
+            label = f"{i}  {Path(p).name}   [{Path(p).parent}]"
+            menu.add_command(label=label, underline=0 if i < 10 else -1,
+                             command=lambda path=p: self._open_recent_project(path))
+        menu.add_separator()
+        menu.add_command(label="Clear Recent Projects", command=self._clear_recent_projects)
+
+    def _open_recent_project(self, path: str) -> None:
+        if not Path(path).is_file():
+            if messagebox.askyesno(
+                    "Recent Projects",
+                    f"The project file no longer exists:\n{path}\n\nRemove it from the list?",
+                    parent=self.root):
+                self._recent_projects.remove(path)
+                self._refresh_recent_menu()
+            return
+        self._file_load(path)
+
+    def _clear_recent_projects(self) -> None:
+        self._recent_projects.clear()
+        self._refresh_recent_menu()
 
     @staticmethod
     def _parse_pin_tag(tags: tuple, direction: str) -> tuple[str | None, str | None]:

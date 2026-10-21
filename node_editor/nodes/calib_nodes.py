@@ -1,7 +1,7 @@
 # node_editor/nodes/calib_nodes.py
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 import threading
 import os
 import re
@@ -1397,7 +1397,7 @@ class CameraCalibNode(BaseNode):
     def _on_browse_cb(self) -> None:
         base = get_project_directory()
         initial = str(base) if base else "."
-        paths = filedialog.askopenfilenames(
+        paths = self.ask_open_filenames(
             title="Select chessboard images",
             initialdir=initial,
             filetypes=[

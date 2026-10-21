@@ -10,13 +10,20 @@ Tracking strategy
     Two reference styles are available, selected by the "Update template
     every frame" checkbox:
 
+    The mesh is defined on the REFERENCE frame (default: frame 1). Tracking
+    runs outward from it: forward to the end frame and, when the reference
+    lies inside the start..end range, backward to the start frame; each of
+    the two passes starts again from the reference frame and the mesh. With
+    a reference outside the range, tracking starts at the end of the range
+    nearest to it.
+
     * Fixed reference (checkbox off, the default). Every template is cut
-      from the START frame. For frame k the search is centred on the
+      from the REFERENCE frame. For frame k the search is centred on the
       point's last successfully tracked position (next_pts_init), so
       "Search range" only has to cover the motion BETWEEN two consecutive
       frames even though the template itself never changes. Errors do not
       accumulate from frame to frame, but a point whose appearance has
-      drifted far from the start frame (large rotation, out-of-plane
+      drifted far from the reference frame (large rotation, out-of-plane
       deformation, lighting change) may fail to match at all.
 
     * Incremental reference (checkbox on). Each point's template is re-cut,
@@ -42,7 +49,7 @@ Tracking strategy
     template/position it last had and is retried against every following
     frame, so it can reacquire tracking later.
 
-    Frame 0 (the start frame) is the reference itself: its result is the
+    The reference frame's own result (when it is inside the range) is the
     mesh, status 1, confidence 1.
 
 Coordinates
@@ -75,7 +82,7 @@ import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 
 import cv2
 import numpy as np
@@ -84,11 +91,13 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 from PIL import Image, ImageTk
 
+from node_editor import frame_copy
 from node_editor.base_node import BaseNode
 from node_editor.execution import ExecutionMode
 from node_editor.pin_types import PinDef, PinSchema, PinType
 from node_editor.project_context import get_project_directory
 from node_editor.tooltip import add_tooltip
+from node_editor.video_frame_reader import VIDEO_EXTS, VideoFrameReader
 from node_editor.nodes.template_match_node import TEMPLATE_MATCH_TIPS
 
 # calcTemplateMatchPyr lives as a top-level script module (not inside the
@@ -119,6 +128,7 @@ PREVIEW_MAX_SIDE = 2000          # longest side of the cached preview image (px)
 MAX_DRAWN_POINTS = 20000         # above this, dots are not drawn in the preview
 MAX_RESULT_ENTRIES = 20_000_000  # frames * M * N guard (~25 bytes per entry)
 POLL_MS = 250
+_LOADED = object()                # marker: template size just loaded, adopt the mesh as is
 
 GRID_COLOR = "#22ccee"
 SELECT_COLOR = "#ff3d00"
@@ -148,6 +158,22 @@ INPUT PIN
   files   STRING   list of image paths (the 'files' output of the Image
                    Sequence node). Frame numbers are 1-based positions in it.
 
+INPUT WITHOUT THE PIN
+  When the 'files' input delivers no images, the Input group can select
+  the frames directly:
+    Select a video ...   one video file. Nothing is read in advance: the
+                         frame count comes from the file header (corrected
+                         when the real end is reached), and frames are read
+                         in order while tracking -- always exact. With a
+                         backward pass (reference frame after Start), that
+                         stretch is first read once in order so the
+                         reverse reads can jump with verification.
+    Select images ...    several image files, used in file-name order.
+    Clear                forget the selection.
+  The selection is saved in the project with paths relative to the project
+  file (a very long image list goes to a side file next to the project).
+  A connected input with images always takes precedence.
+
 OUTPUT PINS (after Run, or after a result was loaded)
   points       (S, M, N, 2)  tracked (u, v) in pixels, NaN where tracking failed
   status       (S, M, N)     1 = tracked (correlation >= min. correlation)
@@ -156,7 +182,7 @@ OUTPUT PINS (after Run, or after a result was loaded)
 
 ALGORITHM
   Two reference styles, chosen with 'Update template every frame':
-    off (default) - every template is cut from the START frame ('fixed'
+    off (default) - every template is cut from the REFERENCE frame ('fixed'
                     reference), so errors do not accumulate from frame to
                     frame. The search in frame k is still centred on the
                     point's last successfully tracked position, so 'Search
@@ -173,6 +199,10 @@ ALGORITHM
                     out-of-plane deformation, lighting).
   A point that fails is stored as NaN but is not abandoned: it keeps its old
   template/position and is retried on every later frame.
+  Tracking starts at the REFERENCE frame and runs outward: forward to the
+  End frame and backward to the Start frame (each pass starts again from
+  the reference). With a reference before Start / after End, tracking
+  starts at the end of the range nearest to it.
 
 MESH SETTINGS
   Cells        M N   cells along the vertical / horizontal image edge
@@ -191,9 +221,20 @@ MESH SETTINGS
   preview image.
 
 TRACKING SETTINGS
-  Same meaning as in the Template Match node. 'Auto (from mesh)' sets the
+  Reference frame (1-based, default 1): the frame the mesh is defined on --
+  the corners / cells describe the points in THIS frame, and templates are
+  cut from it. Editing it shows that frame in the preview (the slider
+  covers Start..End and the reference frame). Projects saved before this
+  setting existed use their Start frame. 'Update template every frame
+  (else: fixed reference frame)' chooses the reference style (ALGORITHM).
+  The other settings have the same meaning as in the Template Match node.
+  'Auto (from mesh)' sets the
   template size to the mesh cell size (rounded to the nearest integer,
-  minimum 3); the fields can still be edited afterwards. Start / End frame
+  minimum 3); the fields can still be edited afterwards. The same happens
+  automatically whenever the mesh (cells or corners) changes to valid
+  values -- re-type the template size after the mesh is final if you want
+  a different one. A template size loaded with a project / result file is
+  kept until the mesh is changed. Start / End frame
   are 1-based and inclusive (End defaults to the number of frames).
   Invalid values are shown in red; Run stays disabled until all are valid.
 
@@ -211,7 +252,10 @@ RUN / STOP
   the same as with a single process. The read-only "Tracking details" box
   shows the processes in use, the auto-tune timings and the time per frame.
 
-LOAD / SAVE AS
+LOAD / SAVE / SAVE AS
+  Save (Ctrl+S in this window) writes to the result file shown in the
+  "File" field, replacing it; the first time (no file yet) it asks for a
+  name like Save as. Save as always asks.
   A .npz file holds the settings used for the result and the result itself.
   The project file stores the settings plus the (relative) path of the last
   saved/loaded result file and re-loads it when the project is opened. The
@@ -233,10 +277,29 @@ PREVIEW AND PLOT
   Selected point panel: shows the selected cell's row/column and the pixel
   coordinates of its centre, computed from the current mesh settings --
   available even before Run. Plot: u and v of the selected point relative
-  to the first frame. Drag to pan, wheel to zoom; Ctrl+wheel zooms
+  to its position in the reference frame (the mesh point). Drag to pan,
+  wheel to zoom; Ctrl+wheel zooms
   horizontally only, Shift+wheel vertically only. If the mesh settings
   differ from the result's mesh, the plot is disabled to avoid showing a
   different point.
+
+COPY SELECTED FRAMES TO A FOLDER (below the plot)
+  Keep only the frames you need from a long sequence / video as new files,
+  e.g. to make a smaller Image Sequence of them.
+  Folder      'Select folder...': where the new files go.
+  Frames      1-based, as the Image Sequence selector: '1:100 201:500
+              600:900', '1:1000:10' (every 10th), '5', '700:' (to the last).
+              Valid frames are shaded green on the plot above.
+  Names       original: image files keep their names; video frames become
+              <video name>_FRM000123 (the 1-based frame number).
+              new: a pattern like selected_%06d, numbered by the original
+              frame number or 1, 2, 3 ... in the order of the selection.
+  Format      jpg / png (decoded and written), or 'same' for image files:
+              copied byte for byte (exact and fastest). JPEG quality 1-100.
+  'Copy selected frames' runs in the background (progress, time left,
+  Cancel); existing files: overwrite or skip (asked first).
+  'Create Image Sequence node' then adds an Image Sequence node with the
+  copied files next to this node.
 """
 
 
@@ -285,17 +348,148 @@ def read_rgb(path):
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
+def gray_of(rgb):
+    """Grey image for the tracker: cv2.COLOR_BGR2GRAY applied to the RGB
+    frame, exactly as mesh_track_parallel.read_gray does for image files, so
+    video and image sources give identical results."""
+    return None if rgb is None else cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+
+
+class FrameSource:
+    """The frames the node tracks (0-based index): a list of image files, or
+    one video file (exact frame access through VideoFrameReader).
+
+    read_rgb / read_gray may be called from worker threads.
+
+    Video: nothing has to be read before tracking. The frame count comes
+    from the file header at once (corrected automatically when in-order
+    reading reaches the real end). Frames read in order are always exact;
+    a JUMP (seek) is used only to a frame whose fingerprint is already
+    known, and is checked against it (see video_frame_reader.py). A
+    background pass learns fingerprints for the preview slider; it is
+    stopped when tracking starts. Reading BACKWARD (the backward tracking
+    pass) decodes a short block forward per jump and serves it from a
+    small cache; prepare() first reads that stretch once in order so those
+    jumps can be verified."""
+
+    BLOCK = 32                             # frames decoded at once for backward reading
+
+    def __init__(self, kind: str, paths: list[str]):
+        self.kind = kind                   # "images" or "video"
+        self.paths = list(paths)
+        self.reader = None
+        self._lock = threading.Lock()
+        self._gray_cache: dict = {}
+        self._last = None
+        if kind == "video":
+            self.reader = VideoFrameReader(self.paths[0])
+            # Learn fingerprints in the background (fast verified jumps for the
+            # preview slider); nothing waits for it.
+            threading.Thread(target=self.reader.build_index, daemon=True, name="mtt-video-index").start()
+
+    def count(self) -> int:
+        return self.reader.count_known() if self.reader is not None else len(self.paths)
+
+    def stop_background(self) -> None:
+        """Stop the background fingerprint pass (tracking needs the CPU)."""
+        if self.reader is not None:
+            self.reader.stop_index()
+
+    def prepare(self, first: int, last: int, cancelled=lambda: False, progress=None) -> None:
+        """Video: read frames first..last once IN ORDER, so that every one of
+        them can later be reached by a verified jump (the backward pass reads
+        them in reverse). Frames already known are skipped. Images: nothing."""
+        if self.reader is None:
+            return
+        for k in range(first, last + 1):
+            if cancelled():
+                return
+            if not self.reader.knows(k):
+                if self.reader.read(k) is None:
+                    return                          # past the real end
+            if progress is not None:
+                progress(k - first + 1, last - first + 1)
+
+    def read_rgb(self, i: int):
+        if self.reader is not None:
+            return self.reader.read(i)
+        return read_rgb(self.paths[i]) if 0 <= i < len(self.paths) else None
+
+    def read_gray(self, i: int):
+        if self.reader is None:
+            return gray_of(self.read_rgb(i))
+        with self._lock:
+            backward = self._last is not None and i < self._last
+            self._last = i
+            hit = self._gray_cache.pop(i, None)
+            if hit is not None:
+                return hit
+            if not backward:
+                self._gray_cache.clear()
+                return gray_of(self.reader.read(i))
+            # Backward: decode frames i-BLOCK+1 .. i in order (one jump, then
+            # sequential reads) and keep them for the next requests.
+            self._gray_cache.clear()
+            first = max(0, i - self.BLOCK + 1)
+            for k in range(first, i):
+                self._gray_cache[k] = gray_of(self.reader.read(k))
+            return gray_of(self.reader.read(i))
+
+    def read_gray_timed(self, i: int):
+        t = time.perf_counter()
+        gray = self.read_gray(i)
+        return gray, time.perf_counter() - t
+
+    def name(self, i: int) -> str:
+        if self.reader is not None:
+            return f"{os.path.basename(self.paths[0])}  frame {i + 1}"
+        return os.path.basename(self.paths[i]) if 0 <= i < len(self.paths) else ""
+
+    def describe(self) -> str:
+        n = self.count()
+        if self.reader is not None:
+            r = self.reader
+            if r.frame_count is not None:
+                state = f"{n} frames"
+            else:
+                state = f"{n} frames (from the file header)"
+            return (f"Video: {os.path.basename(self.paths[0])}\n"
+                    f"{r.width} x {r.height}, {r.fps:.3f} fps, {state}")
+        return (f"{n} image files\nfirst: {os.path.basename(self.paths[0])}\n"
+                f"last:  {os.path.basename(self.paths[-1])}")
+
+    def close(self) -> None:
+        if self.reader is not None:
+            self.reader.close()
+
+
+def _tracking_passes(S: int, ref_index: int | None, ref_before: bool) -> list[list[int]]:
+    """Order in which the result frames 0..S-1 are tracked: outward from the
+    reference frame, each pass starting again from the reference.
+    ref_index: the reference frame's index in the result, or None when it is
+    outside the tracked range (then ref_before tells on which side)."""
+    if ref_index is not None:
+        return [p for p in (list(range(ref_index + 1, S)), list(range(ref_index - 1, -1, -1))) if p]
+    return [list(range(S))] if ref_before else [list(range(S - 1, -1, -1))]
+
+
 def _tracking_worker(job: dict, result: dict, state: dict) -> None:
     """Background thread: track the mesh through all frames of the job.
-    Writes frame k into the preallocated result arrays and only THEN
-    advances state['done'], so the Tk thread can safely read frames < done.
+    Writes frame k into the preallocated result arrays, marks it in
+    result['filled'] and only THEN advances state['done'] (a count), so the
+    Tk thread can safely read every frame whose 'filled' flag is set.
+
+    The mesh is defined on the REFERENCE frame (job["ref_seq"]). Tracking
+    runs outward from it (see _tracking_passes): forward to the end and,
+    when the reference lies inside the range, backward to the start -- each
+    pass starts again from the reference frame and the mesh positions.
 
     Two reference styles, chosen by job["update_template"] -- see the module
     docstring's "Tracking strategy" section for the full rationale:
 
       * Fixed reference (update_template=False): every point's template
-        always comes from frame 0 at the original mesh position. Only ONE
-        image (frame 0) is ever needed as a template source.
+        always comes from the reference frame at the original mesh position.
+        Only ONE image (the reference) is ever needed as a template source.
       * Incremental reference (update_template=True): each point's template
         is refreshed, every time that point is found, to the frame and
         position it was just found at. Points differ in which past frame
@@ -319,28 +513,47 @@ def _tracking_worker(job: dict, result: dict, state: dict) -> None:
     """
     from node_editor import mesh_track_parallel as mtp
 
+    REF = -1                               # frame-cache key of the reference frame
     info = state["info"]
-    frames: dict = {}                      # template-source frame index -> SharedFrame
+    frames: dict = {}                      # template-source key (REF or result index) -> SharedFrame
     matcher = None
     prefetch = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mtt-read")
     try:
-        files, cfg, update_template = job["files"], job["cfg"], job["update_template"]
-        S = len(files)
-        gray0 = mtp.read_gray(files[0])
-        if gray0 is None:
-            raise RuntimeError(f"cannot read the start frame: {files[0]}")
+        # source: FrameSource (image files or a video); seq[k] = the source's
+        # frame index of result row k.
+        source, seq = job["source"], job["seq"]
+        cfg, update_template = job["cfg"], job["update_template"]
+        S = len(seq)
+        ref_index = job["ref_index"]
+        # A backward pass reads frames in reverse. For a video, first read
+        # that stretch once in order (exact) so the reverse reads can jump
+        # with verification instead of decoding from the start every time.
+        backward = (ref_index > 0) if ref_index is not None else not job["ref_before"]
+        if backward:
+            hi = job["ref_seq"] - 1 if ref_index is not None else seq[-1]
+
+            def _progress(done, total):
+                info["phase"] = f"reading the video in order for the backward pass ({done}/{total})"
+            source.prepare(seq[0], hi, cancelled=state["cancel"].is_set, progress=_progress)
+            if state["cancel"].is_set():
+                return
+        gray_ref = source.read_gray(job["ref_seq"])
+        if gray_ref is None:
+            raise RuntimeError(f"cannot read the reference frame: {source.name(job['ref_seq'])}")
         mesh_pts = job["mesh_pts"]
         M, N = mesh_pts.shape[:2]
         P = M * N
         pts0 = np.ascontiguousarray(mesh_pts.reshape(-1, 2), dtype=np.float64)
 
-        result["points"][0] = mesh_pts
-        result["status"][0] = 1
-        result["confidence"][0] = 1.0
-        state["done"] = 1
+        if ref_index is not None:          # the reference frame's result IS the mesh
+            result["points"][ref_index] = mesh_pts
+            result["status"][ref_index] = 1
+            result["confidence"][ref_index] = 1.0
+            result["filled"][ref_index] = True
+            state["done"] = 1
 
         candidates = mtp.candidate_counts(P, job.get("max_processes") or mtp.max_processes())
-        info.update(points=P, image=f"{gray0.shape[1]} x {gray0.shape[0]}", cpus=os.cpu_count(),
+        info.update(points=P, image=f"{gray_ref.shape[1]} x {gray_ref.shape[0]}", cpus=os.cpu_count(),
                     candidates=candidates, tune={}, processes=candidates[0],
                     phase="starting worker processes" if len(candidates) > 1 else "running")
         matcher = mtp.ParallelMatcher(max(candidates))
@@ -348,91 +561,102 @@ def _tracking_worker(job: dict, result: dict, state: dict) -> None:
         n_now, tuning, tune_pos = candidates[0], len(candidates) > 1, 0
         if tuning:
             info["phase"] = "auto-tuning"
-        frames[0] = mtp.SharedFrame(gray0)
-
-        # template_frame[p] / template_pos[p]: which frame, and which
-        # sub-pixel position within it, point p's template is cut from.
-        # search_center[p]: current best guess of point p's location, used
-        # as next_pts_init -- this always advances to the latest successful
-        # match in BOTH reference styles; only template_frame/template_pos
-        # are held back (never updated) in the fixed style.
-        template_frame = np.zeros(P, dtype=np.int64)
-        template_pos = pts0.copy()
-        search_center = pts0.copy()
+        frames[REF] = mtp.SharedFrame(gray_ref)
         # Per-frame timings (seconds) for the Run panel: total wall-clock time
         # of the frame step, image read+decode (done in the read-ahead thread,
         # overlapping the previous frame's matching), and template matching.
         times = {"total": [], "read": [], "tm": []}
 
-        pending = prefetch.submit(mtp.read_gray_timed, files[1]) if S > 1 else None
-        for k in range(1, S):
+        for order in _tracking_passes(S, ref_index, job["ref_before"]):
             if state["cancel"].is_set():
                 break
-            t_frame = time.perf_counter()
-            gray, t_read = pending.result()
-            pending = prefetch.submit(mtp.read_gray_timed, files[k + 1]) if k + 1 < S else None
-            if gray is None:            # one bad frame must not kill a long run
-                state["bad_frames"] += 1
-                state["done"] = k + 1
-                continue
-            cur = mtp.SharedFrame(gray)
-            alive = {f.shm.name for f in frames.values()} | {cur.shm.name}
+            # Every pass starts from the reference frame and the mesh.
+            for key in [k for k in frames if k != REF]:
+                frames.pop(key).release()
+            # template_frame[p] / template_pos[p]: which frame, and which
+            # sub-pixel position within it, point p's template is cut from.
+            # search_center[p]: current best guess of point p's location, used
+            # as next_pts_init -- this always advances to the latest successful
+            # match in BOTH reference styles; only template_frame/template_pos
+            # are held back (never updated) in the fixed style.
+            template_frame = np.full(P, REF, dtype=np.int64)
+            template_pos = pts0.copy()
+            search_center = pts0.copy()
 
-            nxt_all = np.full((P, 2), np.nan)
-            status_all = np.zeros(P, dtype=np.uint8)
-            conf_all = np.full(P, np.nan)
+            pending = prefetch.submit(source.read_gray_timed, seq[order[0]])
+            for pos, k in enumerate(order):
+                if state["cancel"].is_set():
+                    break
+                t_frame = time.perf_counter()
+                gray, t_read = pending.result()
+                pending = (prefetch.submit(source.read_gray_timed, seq[order[pos + 1]])
+                           if pos + 1 < len(order) else None)
+                if gray is None:            # one bad frame must not kill a long run
+                    state["bad_frames"] += 1
+                    result["filled"][k] = True
+                    state["done"] += 1
+                    continue
+                cur = mtp.SharedFrame(gray)
+                alive = {f.shm.name for f in frames.values()} | {cur.shm.name}
 
-            t_match = time.perf_counter()
-            # Group points by their current template-source frame -- in the
-            # common case (no failures, incremental or fixed) this is a
-            # single group and costs exactly one (parallel) call.
-            for frame_idx in np.unique(template_frame):
-                mask = template_frame == frame_idx
-                nxt, st, cf = matcher.match(frames[int(frame_idx)], cur, template_pos[mask],
-                                            search_center[mask].copy(), cfg, n_now, alive)
-                group_idx = np.nonzero(mask)[0]
-                nxt_all[group_idx] = np.asarray(nxt, dtype=np.float64).reshape(-1, 2)
-                status_all[group_idx] = np.asarray(st).reshape(-1).astype(np.uint8)
-                conf_all[group_idx] = np.asarray(cf, dtype=np.float64).reshape(-1)
-            dt = time.perf_counter() - t_match
+                nxt_all = np.full((P, 2), np.nan)
+                status_all = np.zeros(P, dtype=np.uint8)
+                conf_all = np.full(P, np.nan)
 
-            if tuning:
-                info["tune"][n_now] = dt
-                best = min(info["tune"], key=info["tune"].get)
-                tune_pos += 1
-                # Stop at the end of the list, or as soon as more processes got
-                # clearly slower (beyond that point it only gets worse).
-                if tune_pos >= len(candidates) or (n_now != best and dt > 1.05 * info["tune"][best]):
-                    tuning, n_now = False, best
-                    info["phase"] = "running"
+                t_match = time.perf_counter()
+                # Group points by their current template-source frame -- in the
+                # common case (no failures, incremental or fixed) this is a
+                # single group and costs exactly one (parallel) call.
+                for frame_key in np.unique(template_frame):
+                    mask = template_frame == frame_key
+                    nxt, st, cf = matcher.match(frames[int(frame_key)], cur, template_pos[mask],
+                                                search_center[mask].copy(), cfg, n_now, alive)
+                    group_idx = np.nonzero(mask)[0]
+                    nxt_all[group_idx] = np.asarray(nxt, dtype=np.float64).reshape(-1, 2)
+                    status_all[group_idx] = np.asarray(st).reshape(-1).astype(np.uint8)
+                    conf_all[group_idx] = np.asarray(cf, dtype=np.float64).reshape(-1)
+                dt = time.perf_counter() - t_match
+
+                if tuning:
+                    info["tune"][n_now] = dt
+                    best = min(info["tune"], key=info["tune"].get)
+                    tune_pos += 1
+                    # Stop at the end of the list, or as soon as more processes got
+                    # clearly slower (beyond that point it only gets worse).
+                    if tune_pos >= len(candidates) or (n_now != best and dt > 1.05 * info["tune"][best]):
+                        tuning, n_now = False, best
+                        info["phase"] = "running"
+                    else:
+                        n_now = candidates[tune_pos]
+                info["processes"] = n_now
+
+                good = (status_all != 0) & np.isfinite(nxt_all).all(axis=1)
+                search_center[good] = nxt_all[good]
+                if update_template:
+                    template_frame[good] = k
+                    template_pos[good] = nxt_all[good]
+                    frames[k] = cur
+                    referenced = set(int(v) for v in template_frame)
+                    for cached_key in [i for i in frames if i not in referenced and i != REF]:
+                        frames.pop(cached_key).release()
                 else:
-                    n_now = candidates[tune_pos]
-            info["processes"] = n_now
+                    # Fixed reference: the reference frame is the only template
+                    # source, so the current frame is not needed after this step.
+                    cur.release()
 
-            good = (status_all != 0) & np.isfinite(nxt_all).all(axis=1)
-            search_center[good] = nxt_all[good]
-            if update_template:
-                template_frame[good] = k
-                template_pos[good] = nxt_all[good]
-                frames[k] = cur
-                referenced = set(int(v) for v in template_frame)
-                for cached_idx in [i for i in frames if i not in referenced]:
-                    frames.pop(cached_idx).release()
-            else:
-                # Fixed reference: frame 0 is the only template source, so the
-                # current frame is not needed after this step.
-                cur.release()
+                out = np.where(good[:, None], nxt_all, np.nan)
+                result["points"][k] = out.reshape(M, N, 2)
+                result["status"][k] = good.reshape(M, N).astype(np.uint8)
+                result["confidence"][k] = conf_all.reshape(M, N)
+                result["filled"][k] = True
+                state["done"] += 1
 
-            out = np.where(good[:, None], nxt_all, np.nan)
-            result["points"][k] = out.reshape(M, N, 2)
-            result["status"][k] = good.reshape(M, N).astype(np.uint8)
-            result["confidence"][k] = conf_all.reshape(M, N)
-            state["done"] = k + 1
-
-            for key, value in (("total", time.perf_counter() - t_frame), ("read", t_read), ("tm", dt)):
-                times[key].append(value)
-                info[f"avg_{key}_ms"] = 1000.0 * float(np.mean(times[key][-20:]))   # last 20 frames
-            info["last_total_ms"] = 1000.0 * times["total"][-1]
+                for key, value in (("total", time.perf_counter() - t_frame), ("read", t_read), ("tm", dt)):
+                    times[key].append(value)
+                    info[f"avg_{key}_ms"] = 1000.0 * float(np.mean(times[key][-20:]))   # last 20 frames
+                info["last_total_ms"] = 1000.0 * times["total"][-1]
+            if pending is not None:
+                pending.cancel()
     except Exception as e:              # reported to the UI thread by the poller
         state["error"] = f"{type(e).__name__}: {e}"
     finally:
@@ -472,6 +696,7 @@ class MeshTemplateTrackNode(BaseNode):
         ("_fine_w_var", "fine_w", "fine_w"), ("_fine_h_var", "fine_h", "fine_h"),
         ("_sidelobe_var", "sidelobe", "sidelobe"),
         ("_start_var", "start_frame", "start"), ("_end_var", "end_frame", "end"),
+        ("_ref_var", "reference_frame", "ref"),
     )
     _FIELD_LABELS = {
         "cells": "cells (M, N)", "tl": "top-left corner", "lr": "bottom-right corner",
@@ -480,13 +705,19 @@ class MeshTemplateTrackNode(BaseNode):
         "levels": "number of levels", "min_corr": "min. correlation",
         "fine_w": "fine radius width", "fine_h": "fine radius height",
         "sidelobe": "sidelobe radius", "start": "start frame", "end": "end frame",
+        "ref": "reference frame",
     }
 
     def __init__(self, node_id: str, canvas: tk.Canvas):
         super().__init__(node_id, canvas)
         # Plain Python state only. The toolbox instantiates throw-away nodes
         # while dragging, so Tk variables are created lazily in _init_state().
-        self._files = None
+        self._files = None             # image paths from the 'files' input pin
+        self._pin_source = None        # FrameSource of those files (when the pin delivers any)
+        self._local_spec = None        # {"kind": "images"|"video", "paths": [abs]} chosen in the inspector
+        self._local_source = None      # FrameSource opened from _local_spec (None if it failed)
+        self._local_error = ""
+        self._video_poll_id = None
         self._result = None            # dict, see _new_result()
         self._run_info_last = "Not run yet. Press Run: the number of worker processes\nis chosen automatically on the first frames."
         self._result_path = ""
@@ -499,6 +730,7 @@ class MeshTemplateTrackNode(BaseNode):
         self._destroyed = False
         self._status_item = None
         self._lr_auto = True           # bottom-right follows the image size until edited
+        self._tmpl_mesh_seen = None    # mesh the template size last followed (or _LOADED)
         self._end_auto = True          # end frame follows the sequence length until edited
         self._sel = (0, 0)             # selected cell (row, column)
         self._pick = None              # None, "tl" or "lr": corner being picked in the preview
@@ -520,9 +752,13 @@ class MeshTemplateTrackNode(BaseNode):
         self._view = None              # (ox, oy, scale) image -> canvas mapping, current render
         self._series_user_view = False
         self._last_plot_done = 0
+        self._view_filled_drawn = False
         self._series_match_state = None
         self._suspend_validate = False
         self._programmatic = False
+        self._copy_job = None          # running frame copy: {"state", "kind", ...}
+        self._copy_done = None         # last finished copy: {"files", "dest"} for 'Create Image Sequence node'
+        self._copy_check_id = None
         self._reset_widget_refs()
 
     def _reset_widget_refs(self) -> None:
@@ -547,15 +783,21 @@ class MeshTemplateTrackNode(BaseNode):
         self._progress = None
         self._summary_label = self._result_label = None
         self._btn_run = self._btn_stop = self._btn_load = self._btn_save = None
+        self._btn_save_now = None
+        self._local_buttons = []
         self._btn_pick = {}                   # "tl"/"lr" -> Pick button
         self._help_popup = None
+        self._copy_btn = self._copy_cancel_btn = self._copy_node_btn = None
+        self._copy_info_label = self._copy_sel_entry = self._copy_pattern_entry = None
+        self._copy_number_cb = self._copy_quality_entry = None
 
     @staticmethod
     def _defaults() -> dict:
         return {"cells": "6 8", "tl": "0 0", "lr": "", "tmpl_w": "31", "tmpl_h": "31",
                 "search_w": "48", "search_h": "48", "levels": "3",
                 "method": "TM_CCOEFF_NORMED", "min_corr": "0.5",
-                "fine_w": "4", "fine_h": "4", "sidelobe": "2", "start": "1", "end": ""}
+                "fine_w": "4", "fine_h": "4", "sidelobe": "2", "start": "1", "end": "",
+                "ref": "1"}
 
     def _init_state(self) -> None:
         if hasattr(self, "_cells_var"):
@@ -577,6 +819,7 @@ class MeshTemplateTrackNode(BaseNode):
         self._fine_h_var = tk.StringVar(value=d["fine_h"])
         self._sidelobe_var = tk.StringVar(value=d["sidelobe"])
         self._start_var = tk.StringVar(value=d["start"])
+        self._ref_var = tk.StringVar(value=d["ref"])          # frame the mesh / templates are defined on
         self._end_var = tk.StringVar(value=d["end"])
         self._show_tracked_var = tk.BooleanVar(value=True)
         self._show_cells_var = tk.BooleanVar(value=True)      # cell grid lines in the preview
@@ -591,6 +834,20 @@ class MeshTemplateTrackNode(BaseNode):
         self._frame_label_var = tk.StringVar(value="")
         self._sel_info_var = tk.StringVar(value="")
         self._slider_var = tk.IntVar(value=1)
+        # 'Copy selected frames to a folder'
+        self._copy_dir_var = tk.StringVar(value="")              # absolute folder ("" = none)
+        self._copy_frames_var = tk.StringVar(value="")
+        self._copy_mode_var = tk.StringVar(value="original")     # "original" | "pattern"
+        self._copy_pattern_var = tk.StringVar(value="selected_%06d")
+        self._copy_number_var = tk.StringVar(value=self._COPY_NUMBERING[0])
+        self._copy_format_var = tk.StringVar(value="png")       # "jpg" | "png" | "same"
+        self._copy_quality_var = tk.StringVar(value="95")
+        self._copy_info_var = tk.StringVar(value="")
+        self._copy_status_var = tk.StringVar(value="")
+        self._copy_progress_var = tk.DoubleVar(value=0.0)
+        for var in (self._copy_dir_var, self._copy_frames_var, self._copy_mode_var, self._copy_pattern_var,
+                    self._copy_number_var, self._copy_format_var, self._copy_quality_var):
+            var.trace_add("write", lambda *_a: self._schedule_copy_check())
         for attr, _saved, _key in self._SETTING_KEYS:
             if attr not in ("_lr_var", "_end_var"):
                 getattr(self, attr).trace_add("write", self._on_var_written)
@@ -598,6 +855,7 @@ class MeshTemplateTrackNode(BaseNode):
         self._update_template_var.trace_add("write", self._on_var_written)
         self._lr_var.trace_add("write", self._on_lr_written)
         self._end_var.trace_add("write", self._on_end_written)
+        self._ref_var.trace_add("write", self._on_ref_written)
         self._show_tracked_var.trace_add("write", lambda *_a: self._redraw_preview())
         self._show_cells_var.trace_add("write", lambda *_a: self._redraw_preview())
         self._show_centers_var.trace_add("write", lambda *_a: self._redraw_preview())
@@ -620,6 +878,19 @@ class MeshTemplateTrackNode(BaseNode):
             self._lr_auto = False
         self._validate_all()
 
+    def _on_ref_written(self, *_args) -> None:
+        """A new (valid) reference frame typed by the user: show that frame
+        in the preview, since the mesh is defined on it."""
+        if self._programmatic:
+            return
+        cfg, bad = self._collect()
+        ref = cfg.get("ref")
+        if ref is None or "ref" in bad or not self._n_frames() or ref == self._view_frame:
+            return
+        self._view_frame = ref
+        self._sync_slider(cfg, bad)
+        self._schedule_preview()
+
     def _on_end_written(self, *_args) -> None:
         if not self._programmatic:
             self._end_auto = False
@@ -636,6 +907,14 @@ class MeshTemplateTrackNode(BaseNode):
                 PinDef("frames", PinType.ARRAY, "frames", shape=(-1,), dtype="float64"),
             ],
         )
+
+    # ── frame source: the pin's images, else the inspector's own selection ──
+    def _source(self):
+        return self._pin_source if self._pin_source is not None else self._local_source
+
+    def _n_frames(self) -> int:
+        src = self._source()
+        return src.count() if src is not None else 0
 
     @staticmethod
     def _coerce_files(value):
@@ -655,8 +934,9 @@ class MeshTemplateTrackNode(BaseNode):
         self._init_state()
         files = self._coerce_files(inputs.get("files"))
         if files != self._files:
-            old_n = len(self._files) if self._files else 0
+            old_n = self._n_frames()
             self._files = files
+            self._pin_source = FrameSource("images", files) if files else None
             self._on_files_changed(old_n)
         # Do not push partial data downstream while tracking, and do not
         # re-push unchanged results when only the (unchanged) input file list
@@ -697,6 +977,10 @@ class MeshTemplateTrackNode(BaseNode):
         try:
             for attr, saved, key in self._SETTING_KEYS:
                 self._set_var(getattr(self, attr), str(s.get(saved, d[key])))
+            if "reference_frame" not in s:
+                # Saved before the reference frame existed: the reference
+                # was always the start frame.
+                self._set_var(self._ref_var, str(s.get("start_frame", d["ref"])))
             self._set_var(self._subpixel_var, bool(s.get("subpixel", True)))
             self._set_var(self._show_tracked_var, bool(s.get("show_tracked", True)))
             self._set_var(self._show_cells_var, bool(s.get("show_cells", True)))
@@ -708,17 +992,36 @@ class MeshTemplateTrackNode(BaseNode):
         # the current sequence's image size / length.
         self._lr_auto = False if from_file else bool(s.get("lr_auto", False))
         self._end_auto = False if from_file else bool(s.get("end_auto", False))
+        self._tmpl_mesh_seen = _LOADED    # keep the loaded template size (see _follow_mesh_with_template)
         self._validate_all()
 
     def get_params(self) -> dict:
         base = self._get_project_base()
         path = self._result_path
         rel = self._to_relative(self._to_absolute(path, base), base) if path else ""
-        return {"settings": self._settings_dict(), "result_file": rel}
+        dest = self._copy_dir_var.get().strip() if hasattr(self, "_copy_dir_var") else ""
+        copy_cfg = {} if not hasattr(self, "_copy_dir_var") else {
+            "folder": self._to_relative(dest, base) if dest else "", "frames": self._copy_frames_var.get(),
+            "names": self._copy_mode_var.get(), "pattern": self._copy_pattern_var.get(),
+            "numbering": "frame" if self._copy_number_var.get() == self._COPY_NUMBERING[0] else "sequence",
+            "format": self._copy_format_var.get(), "jpeg_quality": self._copy_quality_var.get()}
+        return {"settings": self._settings_dict(), "result_file": rel,
+                "input": self._local_input_params(), "copy_frames": copy_cfg}
 
     def set_params(self, params: dict) -> None:
         self._init_state()
         self._apply_settings(params.get("settings", {}) or {}, from_file=False)
+        self._restore_local_input(params.get("input"))
+        c = params.get("copy_frames") or {}
+        if c:
+            folder = str(c.get("folder", "") or "")
+            self._copy_dir_var.set(self._to_absolute(folder, self._get_project_base()) if folder else "")
+            self._copy_frames_var.set(str(c.get("frames", "")))
+            self._copy_mode_var.set("pattern" if c.get("names") == "pattern" else "original")
+            self._copy_pattern_var.set(str(c.get("pattern", "selected_%06d")))
+            self._copy_number_var.set(self._COPY_NUMBERING[1 if c.get("numbering") == "sequence" else 0])
+            self._copy_format_var.set(c.get("format") if c.get("format") in self._COPY_FORMATS else "png")
+            self._copy_quality_var.set(str(c.get("jpeg_quality", "95")))
         path = str(params.get("result_file", "") or "")
         if path:
             abs_path = self._to_absolute(path, self._get_project_base())
@@ -763,8 +1066,9 @@ class MeshTemplateTrackNode(BaseNode):
         the input file count -- after the upstream list changed (e.g. 4004 ->
         3911 files) the result still has the old number of frames, which on
         a single line looked like a stale file count."""
-        n = len(self._files) if self._files else 0
-        files = f"{n} files" if n else "no files"
+        n = self._n_frames()
+        src = self._source()
+        files = (f"{n} {'video frames' if src.kind == 'video' else 'files'}" if n else "no input")
         if self._running and self._run_state is not None:
             return f"{files}\ntracking {self._run_state['done']}/{self._run_state['total']}"
         r = self._result
@@ -884,6 +1188,11 @@ class MeshTemplateTrackNode(BaseNode):
         cfg["subpixel"] = bool(self._subpixel_var.get())
         cfg["update_template"] = bool(self._update_template_var.get())
 
+        ref = int_of(self._ref_var, "ref", 1)
+        n_frames = self._n_frames()
+        if ref is not None and n_frames and ref > n_frames:
+            bad.add("ref")
+        cfg["ref"] = ref
         start = int_of(self._start_var, "start", 1)
         if not self._end_var.get().strip() and self._end_auto:
             end = None                               # pending: sequence length unknown yet
@@ -891,8 +1200,8 @@ class MeshTemplateTrackNode(BaseNode):
             end = int_of(self._end_var, "end", 1)
         if start is not None and end is not None and start > end:
             bad.update(("start", "end"))
-        if self._files:
-            n = len(self._files)
+        if n_frames:
+            n = n_frames
             if start is not None and start > n:
                 bad.add("start")
             if end is not None and end > n:
@@ -910,6 +1219,16 @@ class MeshTemplateTrackNode(BaseNode):
         return (M, N, u0, v0, u1, v1)
 
     @staticmethod
+    def _filled(res) -> np.ndarray:
+        """Bool (S,): result frames that have been tracked (or are the
+        reference). Frames are not filled in order: tracking runs outward
+        from the reference frame."""
+        filled = res.get("filled")
+        if filled is None:                  # older in-memory results: a prefix
+            filled = np.arange(res["points"].shape[0]) < res["n_done"]
+        return filled
+
+    @staticmethod
     def _result_matches(res, mesh) -> bool:
         if res is None or mesh is None:
             return False
@@ -921,14 +1240,18 @@ class MeshTemplateTrackNode(BaseNode):
         """Return why Run is not possible right now, or None."""
         if calcTemplateMatchPyr is None:
             return f"calcTemplateMatchPyr could not be imported: {_TRACKER_IMPORT_ERROR}"
-        if not self._files:
-            return "Waiting for the image sequence ('files' input)."
+        src = self._source()
+        if src is None or not src.count():
+            return ("No images: connect the 'files' input, or use 'Select a video ...' / "
+                    "'Select images ...'.")
         if bad:
             return "Fix the values shown in red."
         if cfg["lr"] is None:
             return "Image size not known yet; enter the bottom-right corner."
         if cfg["end"] is None:
             return "End frame is not set."
+        if cfg["ref"] is None:
+            return "Reference frame is not set."
         return None
 
     def _outside_mask(self, mesh, cfg):
@@ -946,6 +1269,7 @@ class MeshTemplateTrackNode(BaseNode):
     def _validate_all(self) -> None:
         if self._suspend_validate:
             return
+        self._follow_mesh_with_template()
         cfg, bad = self._collect()
         for key, entries in self._entries.items():
             color = INVALID_FG if key in bad else NORMAL_FG
@@ -1026,10 +1350,12 @@ class MeshTemplateTrackNode(BaseNode):
 
     # ══ Files / preview image ════════════════════════════════════════════
     def _on_files_changed(self, old_n: int = 0) -> None:
-        n = len(self._files) if self._files else 0
+        """The frame source changed (pin input, own selection, or a video's
+        frame count became exact)."""
+        src = self._source()
+        n = src.count() if src is not None else 0
+        self._update_source_info()
         if n:
-            self._files_info_var.set(f"{n} image files\nfirst: {os.path.basename(self._files[0])}\n"
-                                     f"last:  {os.path.basename(self._files[-1])}")
             # End follows the sequence length when it is automatic, and also
             # when it was set to the OLD last frame ("track to the end"): it is
             # often no longer automatic (after loading a result file or a
@@ -1040,17 +1366,57 @@ class MeshTemplateTrackNode(BaseNode):
                 self._end_auto = True
             if self._end_auto:
                 self._set_var(self._end_var, str(n))
-        else:
-            self._files_info_var.set("No image sequence connected.\n"
-                                     "Connect the 'files' output of an Image Sequence node.")
         self._update_status_item()                   # node face shows the file count
         self._update_result_info()
         self._validate_all()
         self._schedule_preview(60)
+        self._schedule_video_poll()
+
+    def _update_source_info(self) -> None:
+        """Input group text + which own-selection buttons are usable."""
+        pin = self._pin_source is not None
+        if pin:
+            text = ("From the 'files' input:\n" + self._pin_source.describe()
+                    + "\n(The Select buttons are used only when the input has no images.)")
+        elif self._local_source is not None:
+            text = "Selected here:\n" + self._local_source.describe()
+        elif self._local_error:
+            text = self._local_error
+        else:
+            text = ("No input. Connect the 'files' output of an Image Sequence node,\n"
+                    "or select a video or image files below.")
+        self._files_info_var.set(text)
+        for btn in self._local_buttons:
+            self._set_state(btn, tk.DISABLED if (pin or self._running) else tk.NORMAL)
+
+    def _schedule_video_poll(self) -> None:
+        """A selected video starts with the file header's frame count. Watch
+        (cheaply, in the background) for the exact count, which arrives when
+        the background pass or in-order reading reaches the real end; then
+        End / validation follow. Nothing waits for it."""
+        src = self._local_source
+        r = src.reader if src is not None else None
+        if (self._video_poll_id is not None or self._destroyed or r is None
+                or r.frame_count is not None or r.index_error or r.index_stopped):
+            return
+        try:
+            self._video_poll_id = self.canvas.after(1000, self._poll_video, src.count())
+        except tk.TclError:
+            self._video_poll_id = None
+
+    def _poll_video(self, last_count: int) -> None:
+        self._video_poll_id = None
+        src = self._local_source
+        if self._destroyed or src is None or src.reader is None:
+            return
+        if src.count() != last_count:
+            self._on_files_changed(last_count)       # exact count: End / validation follow
+        else:
+            self._schedule_video_poll()
 
     def _frame_text(self, f: int) -> str:
-        files = self._files
-        name = os.path.basename(files[f - 1]) if files and 1 <= f <= len(files) else ""
+        src = self._source()
+        name = src.name(f - 1) if src is not None and 1 <= f <= src.count() else ""
         end = self._end_var.get().strip()
         text = f"Frame {f}" + (f" / {end}" if end.isdigit() else "")
         return text + (f"   {name}" if name else "")
@@ -1060,10 +1426,13 @@ class MeshTemplateTrackNode(BaseNode):
         if sl is None:
             return
         s, e = cfg["start"], cfg["end"]
-        if s is None or e is None or "start" in bad or "end" in bad or not self._files:
+        if s is None or e is None or "start" in bad or "end" in bad or not self._n_frames():
             self._set_state(sl, tk.DISABLED)
             self._frame_label_var.set("Frame range not valid yet")
             return
+        ref = cfg.get("ref")
+        if ref is not None and "ref" not in bad:     # the reference may lie outside start..end
+            s, e = min(s, ref), max(e, ref)
         try:
             sl.configure(state=tk.NORMAL, from_=s, to=e)
         except tk.TclError:
@@ -1105,15 +1474,15 @@ class MeshTemplateTrackNode(BaseNode):
         self._preview_debounce_id = None
         if self._c_img is None or self._destroyed:
             return
-        files, f = self._files, self._view_frame
-        if not files or not (1 <= f <= len(files)):
+        src, f = self._source(), self._view_frame
+        if src is None or not (1 <= f <= src.count()):
             self._preview_rgb = self._image_size = None
             self._preview_msg = ""
             self._photo_key = None
             self._redraw_preview()
             return
         self._preview_token += 1
-        req = {"token": self._preview_token, "frame": f, "path": files[f - 1],
+        req = {"token": self._preview_token, "frame": f, "source": src,
                "image": None, "size": None, "error": None, "done": False}
         self._preview_req = req
         self._frame_label_var.set(self._frame_text(f) + "   (loading ...)")
@@ -1127,7 +1496,7 @@ class MeshTemplateTrackNode(BaseNode):
         try:
             if req["token"] != self._preview_token:          # superseded before it started
                 return
-            rgb = read_rgb(req["path"])
+            rgb = req["source"].read_rgb(req["frame"] - 1)
             if rgb is None:
                 req["error"] = "cannot read image"
                 return
@@ -1165,7 +1534,7 @@ class MeshTemplateTrackNode(BaseNode):
         if req["error"] or req["image"] is None:
             self._preview_rgb = self._image_size = None
             self._preview_frame = None
-            self._preview_msg = f"Cannot read frame {req['frame']}:\n{os.path.basename(req['path'])}"
+            self._preview_msg = f"Cannot read frame {req['frame']}:\n{req['source'].name(req['frame'] - 1)}"
         else:
             self._preview_rgb, self._image_size = req["image"], req["size"]
             self._preview_frame, self._preview_msg = req["frame"], ""
@@ -1190,6 +1559,10 @@ class MeshTemplateTrackNode(BaseNode):
             win.minsize(min(1000, sw - 80), min(560, sh - 120))
             for seq in ("<Control-h>", "<Control-H>"):
                 win.bind(seq, lambda _e: self._open_help())
+            # Ctrl+S in the main window saves the project (node canvas binding);
+            # inside this inspector it saves the tracking result instead.
+            for seq in ("<Control-s>", "<Control-S>"):
+                win.bind(seq, lambda _e: (self._on_save(), "break")[1])
         panes = tk.PanedWindow(parent, orient=tk.HORIZONTAL, sashwidth=6, sashrelief=tk.RAISED)
         panes.pack(fill="both", expand=True)
         left, right = tk.Frame(panes), tk.Frame(panes)
@@ -1262,6 +1635,28 @@ class MeshTemplateTrackNode(BaseNode):
         box.pack(fill="x", **pad)
         tk.Label(box, textvariable=self._files_info_var, font=("Arial", 8), anchor="w",
                  justify="left", wraplength=340).pack(fill="x")
+        # Own selection, used only when the 'files' input delivers no images.
+        sel = tk.Frame(box)
+        sel.pack(fill="x", pady=(4, 0))
+        video_btn = tk.Button(sel, text="Select a video ...", font=("Arial", 8),
+                              command=self._on_select_video)
+        video_btn.pack(side="left")
+        images_btn = tk.Button(sel, text="Select images ...", font=("Arial", 8),
+                               command=self._on_select_images)
+        images_btn.pack(side="left", padx=(4, 0))
+        clear_btn = tk.Button(sel, text="Clear", font=("Arial", 8), command=self._on_clear_local)
+        clear_btn.pack(side="left", padx=(4, 0))
+        self._local_buttons = [video_btn, images_btn, clear_btn]
+        add_tooltip(video_btn, "Track the frames of an existing video file (mp4, avi, mov, ...) "
+                               "directly, without an Image Sequence node. Frames are read in "
+                               "order while tracking (exact); nothing is scanned in advance. "
+                               "Only used when "
+                               "the 'files' input has no images.")
+        add_tooltip(images_btn, "Track existing image files directly, without an Image Sequence "
+                                "node: pick several files (Ctrl / Shift-click); they are used in "
+                                "file-name order. Only used when the 'files' input has no images.")
+        add_tooltip(clear_btn, "Forget the video / images selected here.")
+        self._update_source_info()
 
         box = tk.LabelFrame(f, text="Mesh settings", font=("Arial", 9), padx=6, pady=4)
         box.pack(fill="x", **pad)
@@ -1294,57 +1689,67 @@ class MeshTemplateTrackNode(BaseNode):
         box = tk.LabelFrame(f, text="Tracking settings", font=("Arial", 9), padx=6, pady=4)
         box.pack(fill="x", **pad)
 
+        # Reference frame: the frame the mesh is drawn on and the templates
+        # are cut from; tracking runs outward from it.
+        self._grid_row(box, 0, "Reference frame", [(self._ref_var, "ref", 6)])
+        tk.Checkbutton(box, text="Update template every frame (else: fixed reference frame)",
+                       variable=self._update_template_var, font=("Arial", 8)).grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=2)
+
         # Template size row, with an "Auto (from mesh)" button that fills it
         # from the current cell size -- users can still edit it afterwards.
         tk.Label(box, text="Template size (w,h)", font=("Arial", 8), anchor="w").grid(
-            row=0, column=0, sticky="w", padx=(0, 6), pady=2)
+            row=2, column=0, sticky="w", padx=(0, 6), pady=2)
         tmpl_w_entry = tk.Entry(box, textvariable=self._tmpl_w_var, width=6, justify="center", font=("Arial", 9))
-        tmpl_w_entry.grid(row=0, column=1, sticky="w", pady=2)
+        tmpl_w_entry.grid(row=2, column=1, sticky="w", pady=2)
         tmpl_h_entry = tk.Entry(box, textvariable=self._tmpl_h_var, width=6, justify="center", font=("Arial", 9))
-        tmpl_h_entry.grid(row=0, column=2, sticky="w", padx=(4, 0), pady=2)
+        tmpl_h_entry.grid(row=2, column=2, sticky="w", padx=(4, 0), pady=2)
         self._entries.setdefault("tmpl_w", []).append(tmpl_w_entry)
         self._entries.setdefault("tmpl_h", []).append(tmpl_h_entry)
         auto_btn = tk.Button(box, text="Auto (from mesh)", font=("Arial", 8),
                              command=self._on_auto_window_size)
-        auto_btn.grid(row=0, column=3, sticky="w", padx=(8, 0), pady=2)
+        auto_btn.grid(row=2, column=3, sticky="w", padx=(8, 0), pady=2)
 
-        self._grid_row(box, 1, "Search range (w,h)",
+        self._grid_row(box, 3, "Search range (w,h)",
                        [(self._search_w_var, "search_w", 6), (self._search_h_var, "search_h", 6)])
-        self._grid_row(box, 2, "Num levels", [(self._levels_var, "levels", 6)])
+        self._grid_row(box, 4, "Num levels", [(self._levels_var, "levels", 6)])
         tk.Label(box, text="Match method", font=("Arial", 8), anchor="w").grid(
-            row=3, column=0, sticky="w", padx=(0, 6), pady=2)
+            row=5, column=0, sticky="w", padx=(0, 6), pady=2)
         ttk.Combobox(box, textvariable=self._method_var, values=list(MATCH_METHODS),
-                     width=18, state="readonly").grid(row=3, column=1, columnspan=2, sticky="w", pady=2)
+                     width=18, state="readonly").grid(row=5, column=1, columnspan=2, sticky="w", pady=2)
         tk.Checkbutton(box, text="Subpixel refinement", variable=self._subpixel_var,
-                       font=("Arial", 8)).grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
-        tk.Checkbutton(box, text="Update template every frame (else: fixed reference = start frame)",
-                       variable=self._update_template_var, font=("Arial", 8)).grid(
-            row=5, column=0, columnspan=4, sticky="w", pady=2)
-        self._grid_row(box, 6, "Min correlation (0-1)", [(self._mincorr_var, "min_corr", 6)])
-        self._grid_row(box, 7, "Fine search radius (w,h)",
+                       font=("Arial", 8)).grid(row=6, column=0, columnspan=3, sticky="w", pady=2)
+        self._grid_row(box, 7, "Min correlation (0-1)", [(self._mincorr_var, "min_corr", 6)])
+        self._grid_row(box, 8, "Fine search radius (w,h)",
                        [(self._fine_w_var, "fine_w", 6), (self._fine_h_var, "fine_h", 6)])
-        self._grid_row(box, 8, "Sidelobe exclusion radius", [(self._sidelobe_var, "sidelobe", 6)])
-        self._grid_row(box, 9, "Start frame", [(self._start_var, "start", 6)])
-        self._grid_row(box, 10, "End frame", [(self._end_var, "end", 6)])
+        self._grid_row(box, 9, "Sidelobe exclusion radius", [(self._sidelobe_var, "sidelobe", 6)])
+        self._grid_row(box, 10, "Start frame", [(self._start_var, "start", 6)])
+        self._grid_row(box, 11, "End frame", [(self._end_var, "end", 6)])
         tk.Button(box, text="Reset tracking defaults", font=("Arial", 8),
                   command=self._reset_tracking_defaults).grid(
-            row=11, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        tips = {row: TEMPLATE_MATCH_TIPS[key] for row, key in enumerate(
-            ("template", "search", "levels", "method", "subpixel"))}
-        tips.update({
-            5: "ON: each frame is matched against the patch from the PREVIOUS frame -- follows "
-               "large deformation or lighting changes, but small errors add up (drift).\n"
-               "OFF: always matched against the start frame -- no drift; best for small "
+            row=12, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        tips = {
+            0: "The frame the mesh is defined on: the corners and cells you set describe the "
+               "points in THIS frame, and the templates are cut from it (1-based; default 1 = "
+               "the first frame). Choose a frame where the target is clearly visible. Tracking "
+               "starts here and runs forward to End and backward to Start. Changing it shows "
+               "that frame in the preview.",
+            1: "ON: each frame is matched against the patch from the previous frame tracked -- "
+               "follows large deformation or lighting changes, but small errors add up (drift).\n"
+               "OFF: always matched against the reference frame -- no drift; best for small "
                "deformations.",
-            6: TEMPLATE_MATCH_TIPS["min_corr"], 7: TEMPLATE_MATCH_TIPS["fine"],
-            8: TEMPLATE_MATCH_TIPS["sidelobe"],
-        })
+            2: TEMPLATE_MATCH_TIPS["template"], 3: TEMPLATE_MATCH_TIPS["search"],
+            4: TEMPLATE_MATCH_TIPS["levels"], 5: TEMPLATE_MATCH_TIPS["method"],
+            6: TEMPLATE_MATCH_TIPS["subpixel"], 7: TEMPLATE_MATCH_TIPS["min_corr"],
+            8: TEMPLATE_MATCH_TIPS["fine"], 9: TEMPLATE_MATCH_TIPS["sidelobe"],
+        }
         for row, tip in tips.items():
             for widget in box.grid_slaves(row=row):
                 if widget is not auto_btn:
                     add_tooltip(widget, tip)
         add_tooltip(auto_btn, "Set the template size to the mesh cell size, so neighbouring "
-                              "templates just touch. You can still edit it afterwards.")
+                              "templates just touch. This also happens automatically whenever "
+                              "the cells or corners change; you can still edit it afterwards.")
 
         box = tk.LabelFrame(f, text="Run", font=("Arial", 9), padx=6, pady=4)
         box.pack(fill="x", **pad)
@@ -1375,6 +1780,11 @@ class MeshTemplateTrackNode(BaseNode):
         row.pack(fill="x")
         self._btn_load = tk.Button(row, text="Load ...", width=10, command=self._on_load)
         self._btn_load.pack(side="left")
+        self._btn_save_now = tk.Button(row, text="Save", width=10, command=self._on_save)
+        self._btn_save_now.pack(side="left", padx=(6, 0))
+        add_tooltip(self._btn_save_now, "Save settings and result to the file shown below, "
+                                        "replacing it (Ctrl+S). The first time, asks for a "
+                                        "file name like 'Save as ...'.")
         self._btn_save = tk.Button(row, text="Save as ...", width=10, command=self._on_save_as)
         self._btn_save.pack(side="left", padx=6)
         frow = tk.Frame(box)
@@ -1399,10 +1809,13 @@ class MeshTemplateTrackNode(BaseNode):
         rp.pack(fill="both", expand=True)
         top = tk.LabelFrame(rp, text="Image preview (drag to pan, wheel to zoom, click a cell to select its point)",
                             font=("Arial", 9))
-        bottom = tk.LabelFrame(rp, text="Selected point: displacement relative to the first frame",
+        bottom = tk.LabelFrame(rp, text="Selected point: displacement relative to the reference frame",
                                font=("Arial", 9))
+        copy_box = tk.LabelFrame(rp, text="Copy selected frames to a folder (e.g. to keep only the frames "
+                                          "you need as a new image sequence)", font=("Arial", 9))
         rp.add(top, minsize=220, stretch="always")
         rp.add(bottom, height=280, minsize=160, stretch="never")
+        rp.add(copy_box, height=150, minsize=120, stretch="never")
 
         # Packed (side="bottom") BEFORE the canvas so the canvas, which expands,
         # takes only the space left above the slider and these checkboxes.
@@ -1443,6 +1856,7 @@ class MeshTemplateTrackNode(BaseNode):
                   command=self._on_reset_img_view).pack(side="right")
 
         self._build_series_plot(bottom)
+        self._build_copy_panel(copy_box)
 
     # ══ Preview drawing / selection ══════════════════════════════════════
     def _redraw_preview(self) -> None:
@@ -1594,7 +2008,7 @@ class MeshTemplateTrackNode(BaseNode):
         res = self._result
         if self._show_tracked_var.get() and self._result_matches(res, mesh):
             idx = self._view_frame - res["start"]
-            if 0 <= idx < res["n_done"]:
+            if 0 <= idx < res["points"].shape[0] and self._filled(res)[idx]:
                 pos, tracked = res["points"][idx], True
         outside = None if tracked else self._outside_mask(mesh, cfg)
         show_centers = self._show_centers_var.get()
@@ -1718,7 +2132,9 @@ class MeshTemplateTrackNode(BaseNode):
                 self._c_img.configure(cursor="")
             except tk.TclError:
                 pass
-        self._redraw_preview()
+        # Full pass (not just a redraw): an accepted corner is a mesh change,
+        # so the template size follows it now (it was held while picking).
+        self._validate_all()
 
     def _update_pick(self, event) -> None:
         """Map the cursor to the integer FULL-resolution pixel under it (the
@@ -1882,22 +2298,31 @@ class MeshTemplateTrackNode(BaseNode):
                 message = ("The mesh settings differ from the tracking result.\n"
                            "Run again, or restore the mesh settings used for the result.")
             else:
-                M, N = res["points"].shape[1:3]
+                S, M, N = res["points"].shape[:3]
                 i, j = min(self._sel[0], M - 1), min(self._sel[1], N - 1)
-                n = res["n_done"]
-                frames = res["start"] + np.arange(n)
-                xy = res["points"][:n, i, j, :]
+                n = S
+                frames = res["start"] + np.arange(S)
+                # Frames not tracked yet are NaN, so lines simply stop there.
+                xy = np.where(self._filled(res)[:, None], res["points"][:, i, j, :], np.nan)
+                # Displacement relative to the reference frame (its position is
+                # the mesh point); a reference outside the tracked range uses
+                # the mesh point too. Older results without one: first valid.
+                mesh = res["mesh"]
+                ref_uv = mesh_centers(*mesh)[i, j] if res.get("ref") is not None else None
                 for k, (label, color) in enumerate((("u", "#1f77b4"), ("v", "#d62728"))):
                     series = xy[:, k].copy()
                     finite = np.isfinite(series)
-                    if finite.any():
-                        series = series - series[int(np.argmax(finite))]   # relative to first valid
+                    if ref_uv is not None:
+                        series = series - ref_uv[k]
+                    elif finite.any():
+                        series = series - series[int(np.argmax(finite))]
                     ax.plot(frames, series, color=color, linewidth=1.3, label=label)
                 ax.legend(loc="upper right", fontsize=8)
                 if frames[0] <= self._view_frame <= frames[-1]:
                     ax.axvline(self._view_frame, color="#888888", linestyle="--", linewidth=1)
                 valid = int(np.isfinite(xy[:, 0]).sum())
-                ax.set_title(f"cell (row {i + 1}, col {j + 1}); valid {valid}/{n} frames", fontsize=8)
+                ref_txt = f"; reference frame {res['ref']}" if res.get("ref") is not None else ""
+                ax.set_title(f"cell (row {i + 1}, col {j + 1}); valid {valid}/{n} frames{ref_txt}", fontsize=8)
                 # Frame numbers are 1-based. Without this, matplotlib's 5% x
                 # margin pads the axis to below frame 1 and labels a "0" tick
                 # (and fractional ticks for short runs), which reads as 0-based.
@@ -1920,10 +2345,295 @@ class MeshTemplateTrackNode(BaseNode):
             ax.set_ylabel("displacement (px)", fontsize=8)
             ax.text(0.5, 0.5, message, transform=ax.transAxes, ha="center", va="center",
                     color="#777777", fontsize=9)
+        self._draw_copy_selection(ax, message is not None)
         if keep:
             ax.set_xlim(xlim)
             ax.set_ylim(ylim)
         self._canvas_mpl.draw_idle()
+
+    _COPY_SHADE = "#5cb85c"            # soft green: easy to see, does not hide the u / v lines
+
+    def _draw_copy_selection(self, ax, no_result: bool) -> None:
+        """Shade the frames chosen in 'Copy selected frames' (when the text is
+        valid): one artist for all ranges, behind the curves."""
+        try:
+            n = self._n_frames()
+            sel, _dropped = frame_copy.parse_frames(self._copy_frames_var.get(), n)
+        except (ValueError, AttributeError, tk.TclError):
+            return
+        if not sel:
+            return
+        spans = [(a + 0.5, b - a + 1) for a, b in frame_copy.runs(sel)]       # 1-based a+1 -> a+1-0.5
+        ax.broken_barh(spans, (0, 1), transform=ax.get_xaxis_transform(), facecolors=self._COPY_SHADE,
+                       alpha=0.22, linewidth=0, zorder=0, label=f"to copy ({len(sel)} frames)")
+        if no_result and n > 0:
+            ax.set_xlim(0.5, n + 0.5)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.set_xlabel("frame (1-based)", fontsize=8)
+        ax.legend(loc="upper right", fontsize=8)
+
+    # ══ Copy selected frames to a folder ═══════════════════════════════════
+    _COPY_NUMBERING = ("original frame number", "1, 2, 3 ... (in order)")
+    _COPY_FORMATS = ("png", "jpg", "same")
+
+    def _build_copy_panel(self, f: tk.Frame) -> None:
+        small = ("Arial", 8)
+        row = tk.Frame(f)
+        row.pack(fill="x", padx=4, pady=(2, 0))
+        b = tk.Button(row, text="Select folder...", font=small, command=self._on_copy_select_folder)
+        b.pack(side="left")
+        add_tooltip(b, "Choose the folder the copied frames are written to (an empty folder is best).")
+        lbl = tk.Label(row, textvariable=self._copy_dir_var, font=small, fg="#334455", anchor="w")
+        lbl.pack(side="left", fill="x", expand=True, padx=6)
+        add_tooltip(lbl, "Destination folder of the copied frames.")
+
+        row = tk.Frame(f)
+        row.pack(fill="x", padx=4, pady=(3, 0))
+        tk.Label(row, text="Frames (1-based):", font=small).pack(side="left")
+        self._copy_sel_entry = e = tk.Entry(row, textvariable=self._copy_frames_var, font=small, width=40)
+        e.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        add_tooltip(e, "Frames to copy, as in the Image Sequence selector: '1:100 201:500 600:900' "
+                       "(inclusive ranges), '1:1000:10' (every 10th), '5' (one frame), '700:' (to the last). "
+                       "Valid frames are shaded green on the plot above.")
+        self._copy_info_label = tk.Label(f, textvariable=self._copy_info_var, font=small, anchor="w",
+                                         justify="left")
+        self._copy_info_label.pack(fill="x", padx=4)
+
+        row = tk.Frame(f)
+        row.pack(fill="x", padx=4, pady=(2, 0))
+        tk.Label(row, text="Names:", font=small).pack(side="left")
+        rb = tk.Radiobutton(row, text="original", value="original", variable=self._copy_mode_var, font=small)
+        rb.pack(side="left")
+        add_tooltip(rb, "Image files keep their names. Video frames become <video name>_FRM000123 "
+                        "(the 1-based frame number).")
+        rb = tk.Radiobutton(row, text="new:", value="pattern", variable=self._copy_mode_var, font=small)
+        rb.pack(side="left", padx=(6, 0))
+        add_tooltip(rb, "New names from the pattern on the right.")
+        self._copy_pattern_entry = e = tk.Entry(row, textvariable=self._copy_pattern_var, font=small, width=16)
+        e.pack(side="left")
+        add_tooltip(e, "File name pattern WITHOUT extension, with one number field: selected_%06d -> "
+                       "selected_000001. The extension comes from Format.")
+        self._copy_number_cb = cb = ttk.Combobox(row, textvariable=self._copy_number_var, state="readonly",
+                                                 values=self._COPY_NUMBERING, width=21, font=small)
+        cb.pack(side="left", padx=(4, 0))
+        add_tooltip(cb, "Number in the new names: the ORIGINAL frame number (you can trace each file back), or "
+                        "1, 2, 3 ... in the order of the selection (a gap-free sequence).")
+        tk.Label(row, text="  Format:", font=small).pack(side="left")
+        cb = ttk.Combobox(row, textvariable=self._copy_format_var, state="readonly", values=self._COPY_FORMATS,
+                          width=5, font=small)
+        cb.pack(side="left")
+        add_tooltip(cb, "png: lossless (recommended for measurements). jpg: smaller files. same: image files are "
+                        "copied byte for byte (exact, fastest; not for a video).")
+        tk.Label(row, text=" JPEG quality", font=small).pack(side="left")
+        self._copy_quality_entry = e = tk.Entry(row, textvariable=self._copy_quality_var, font=small, width=4)
+        e.pack(side="left")
+        add_tooltip(e, "1-100 (95 = very good). Only used for jpg.")
+
+        row = tk.Frame(f)
+        row.pack(fill="x", padx=4, pady=(4, 2))
+        self._copy_btn = tk.Button(row, text="Copy selected frames", font=("Arial", 9, "bold"), bg="#d7ecd9",
+                                   state="disabled", command=self._on_copy_start)
+        self._copy_btn.pack(side="left")
+        add_tooltip(self._copy_btn, "Write the chosen frames to the folder (in the background). Enabled when "
+                                    "the folder, the frames and the names are valid.")
+        self._copy_cancel_btn = tk.Button(row, text="Cancel", font=small, state="disabled",
+                                          command=self._on_copy_cancel)
+        self._copy_cancel_btn.pack(side="left", padx=(3, 0))
+        add_tooltip(self._copy_cancel_btn, "Stop copying; the files written so far stay.")
+        ttk.Progressbar(row, variable=self._copy_progress_var, maximum=100.0, length=140).pack(side="left", padx=6)
+        tk.Label(row, textvariable=self._copy_status_var, font=small, fg="#334455", anchor="w").pack(
+            side="left", fill="x", expand=True)
+        self._copy_node_btn = tk.Button(row, text="Create Image Sequence node", font=small, state="disabled",
+                                        command=self._on_copy_create_node)
+        self._copy_node_btn.pack(side="right")
+        add_tooltip(self._copy_node_btn, "Add an Image Sequence node with the copied files to the canvas, next to "
+                                         "this node (enabled after a copy).")
+        self._copy_check()
+        if self._copy_job is not None:
+            self._set_copy_running(True)
+            self._poll_copy()
+
+    def _schedule_copy_check(self) -> None:
+        if self._copy_check_id is not None:
+            return
+        try:
+            self._copy_check_id = self.canvas.after(200, self._copy_check)
+        except tk.TclError:
+            self._copy_check_id = None
+
+    def _copy_plan(self):
+        """(targets, kind, paths, info) for the current fields; ValueError
+        with a message for the user when something is missing / invalid."""
+        src = self._source()
+        if src is None or self._n_frames() <= 0:
+            raise ValueError("no frames: connect an image sequence or select a video / images above")
+        n = self._n_frames()
+        sel, dropped = frame_copy.parse_frames(self._copy_frames_var.get(), n)
+        if not sel:
+            raise ValueError("type the frames to copy, e.g. 1:100 201:500")
+        dest = self._copy_dir_var.get().strip()
+        if not dest:
+            raise ValueError(f"{len(sel)} frames chosen -- select the folder to copy them to")
+        if not os.path.isdir(dest):
+            raise ValueError(f"the folder does not exist: {dest}")
+        if self._copy_format_var.get() == "jpg":
+            try:
+                q = int(self._copy_quality_var.get())
+                if not 1 <= q <= 100:
+                    raise ValueError
+            except ValueError:
+                raise ValueError("JPEG quality must be a whole number 1-100") from None
+        naming = {"mode": self._copy_mode_var.get(), "pattern": self._copy_pattern_var.get(),
+                  "number": "frame" if self._copy_number_var.get() == self._COPY_NUMBERING[0] else "sequence",
+                  "format": self._copy_format_var.get()}
+        targets = frame_copy.plan_targets(src.kind, src.paths, sel, dest, naming)
+        info = f"{len(sel)} frames chosen (of {n}) in {len(frame_copy.runs(sel))} range(s)"
+        if dropped:
+            info += f"; {dropped} numbers beyond the last frame ({n}) are ignored"
+        first = os.path.basename(targets[0][2])
+        info += f"  ->  {first}" + (f" ... {os.path.basename(targets[-1][2])}" if len(targets) > 1 else "")
+        return targets, src.kind, list(src.paths), info
+
+    def _copy_check(self) -> None:
+        """Validate the fields: info line, Copy button, plot shading."""
+        self._copy_check_id = None
+        if not hasattr(self, "_copy_frames_var"):
+            return
+        color, ok = "#2f6b2f", False
+        try:
+            _t, _k, _p, info = self._copy_plan()
+            ok = True
+        except ValueError as e:
+            info, color = str(e), "#b36b00"
+            try:
+                frame_copy.parse_frames(self._copy_frames_var.get(), self._n_frames())
+            except ValueError as pe:
+                info, color = f"Invalid frames: {pe}", "#c62828"
+        self._copy_info_var.set(info)
+        pattern = self._copy_mode_var.get() == "pattern"
+        try:
+            if self._copy_info_label is not None:
+                self._copy_info_label.configure(fg=color)
+            if self._copy_btn is not None:
+                self._copy_btn.configure(state="normal" if ok and self._copy_job is None else "disabled")
+            if self._copy_pattern_entry is not None:
+                self._copy_pattern_entry.configure(state="normal" if pattern else "disabled")
+            if self._copy_number_cb is not None:
+                self._copy_number_cb.configure(state="readonly" if pattern else "disabled")
+            if self._copy_quality_entry is not None:
+                self._copy_quality_entry.configure(state="normal" if self._copy_format_var.get() == "jpg"
+                                                   else "disabled")
+        except tk.TclError:
+            pass
+        self._redraw_series()
+
+    def _on_copy_select_folder(self) -> None:
+        folder = self.ask_directory("save", parent=self._dlg_parent(), title="Folder for the copied frames")
+        if folder:
+            self._copy_dir_var.set(os.path.abspath(folder))
+
+    def _set_copy_running(self, running: bool) -> None:
+        try:
+            if self._copy_btn is not None:
+                self._copy_btn.configure(state="disabled" if running else "normal",
+                                         text="Copying..." if running else "Copy selected frames")
+            if self._copy_cancel_btn is not None:
+                self._copy_cancel_btn.configure(state="normal" if running else "disabled")
+            if self._copy_node_btn is not None:
+                self._copy_node_btn.configure(state="normal" if (self._copy_done and not running) else "disabled")
+        except tk.TclError:
+            pass
+        if not running:
+            self._copy_check()
+
+    def _on_copy_start(self) -> None:
+        if self._copy_job is not None:
+            return
+        try:
+            targets, kind, paths, _info = self._copy_plan()
+        except ValueError as e:
+            messagebox.showerror("Copy selected frames", str(e), parent=self._dlg_parent())
+            return
+        existing = sum(1 for _k, _s, dst, _e in targets if os.path.exists(dst))
+        skip = False
+        if existing:
+            answer = messagebox.askyesnocancel(
+                "Copy selected frames",
+                f"{existing} of the {len(targets)} files already exist in the folder.\n\n"
+                f"Yes = overwrite them\nNo = keep them (skip)\nCancel = do not copy",
+                parent=self._dlg_parent())
+            if answer is None:
+                return
+            skip = not answer
+        quality = int(self._copy_quality_var.get()) if self._copy_quality_var.get().strip().isdigit() else 95
+        state = frame_copy.new_copy_state(len(targets))
+        self._copy_job = {"state": state, "dest": self._copy_dir_var.get().strip()}
+        self._copy_done = None
+        threading.Thread(target=frame_copy.copy_worker, args=(kind, paths, targets, state, quality, skip),
+                         daemon=True, name="mtt-copy-frames").start()
+        self._set_copy_running(True)
+        self._poll_copy()
+
+    def _on_copy_cancel(self) -> None:
+        if self._copy_job is not None:
+            self._copy_job["state"]["cancel"].set()
+
+    def _poll_copy(self) -> None:
+        job = self._copy_job
+        if job is None or self._destroyed:
+            return
+        st = job["state"]
+        done, total = st["done"], max(1, st["total"])
+        elapsed = time.monotonic() - st["t0"]
+        try:
+            self._copy_progress_var.set(100.0 * done / total)
+        except tk.TclError:
+            pass
+        if not st["finished"]:
+            left = ""
+            if done:
+                t = elapsed * (total - done) / done
+                left = f", about {int(t // 60)}:{int(t % 60):02d} left"
+            self._copy_status_var.set(f"{done} / {total} frames{left}")
+            try:
+                self.canvas.after(200, self._poll_copy)
+            except tk.TclError:
+                pass
+            return
+        self._copy_job = None
+        written = st["written"]
+        text = (f"{'Cancelled' if st['cancel'].is_set() else 'Done'}: {len(written)} files in "
+                f"{int(elapsed // 60)}:{int(elapsed % 60):02d}")
+        if st["errors"]:
+            text += f"; {len(st['errors'])} frame(s) failed ({st['errors'][0]})"
+        if st["error"]:
+            text += f"; stopped: {st['error']}"
+        self._copy_status_var.set(text)
+        self._copy_done = {"files": list(written), "dest": job["dest"]} if written else None
+        self._set_copy_running(False)
+        if st["errors"] or st["error"]:
+            messagebox.showwarning("Copy selected frames", text + ("\n\n" + "\n".join(st["errors"][:10])
+                                                                  if st["errors"] else ""),
+                                   parent=self._dlg_parent())
+
+    def _on_copy_create_node(self) -> None:
+        done = self._copy_done
+        if not done:
+            return
+        files = done["files"]
+        params = {"source": "images", "wait_for_files": False, "method": "folder",
+                  "folder": done["dest"], "file_list": "\n".join(files)}
+        src = self._source()
+        what = os.path.basename(src.paths[0]) if src is not None and src.kind == "video" else (
+            self.node_name if getattr(self, "node_name", "") else self.DISPLAY_NAME)
+        name = f"{len(files)} frames of {what}"
+        node = self.spawn_node_near("image_sequence", params, name)
+        if node is None:
+            messagebox.showinfo("Create Image Sequence node",
+                                "The node could not be created here. Make an Image Sequence node yourself and "
+                                f"select the folder:\n{done['dest']}", parent=self._dlg_parent())
+            return
+        self._copy_status_var.set(f"Created the Image Sequence node '{name}' next to this node.")
 
     # ══ Run / stop ═══════════════════════════════════════════════════════
     def _dlg_parent(self):
@@ -1974,11 +2684,42 @@ class MeshTemplateTrackNode(BaseNode):
                 parent=self._dlg_parent(),
             )
             return
-        M, N, u0, v0, u1, v1 = mesh
-        tmpl_w = max(3, int(round((u1 - u0) / N)))
-        tmpl_h = max(3, int(round((v1 - v0) / M)))
+        tmpl_w, tmpl_h = self._auto_template_size(mesh)
         self._set_var(self._tmpl_w_var, str(tmpl_w))
         self._set_var(self._tmpl_h_var, str(tmpl_h))
+
+    @staticmethod
+    def _auto_template_size(mesh) -> tuple[int, int]:
+        M, N, u0, v0, u1, v1 = mesh
+        return max(3, int(round((u1 - u0) / N))), max(3, int(round((v1 - v0) / M)))
+
+    def _follow_mesh_with_template(self) -> None:
+        """When the mesh (cells, corners) changes to a VALID new value, set
+        the template size to the cell size -- as if "Auto (from mesh)" were
+        pressed. Settings just loaded (project / result file) are adopted
+        as they are: their mesh becomes the baseline without touching the
+        saved template size. Skipped while a corner is being picked (the
+        mesh follows the mouse); the picked corner counts on accept."""
+        if self._pick is not None:
+            return
+        cfg, bad = self._collect()
+        mesh = self._mesh_from_cfg(cfg, bad)
+        if mesh is None or mesh == self._tmpl_mesh_seen:
+            return
+        adopt_only = self._tmpl_mesh_seen is _LOADED
+        self._tmpl_mesh_seen = mesh
+        if adopt_only:
+            return
+        tmpl_w, tmpl_h = self._auto_template_size(mesh)
+        if (self._tmpl_w_var.get().strip(), self._tmpl_h_var.get().strip()) == (str(tmpl_w), str(tmpl_h)):
+            return
+        # Both writes, then one validation pass (by the caller).
+        self._suspend_validate = True
+        try:
+            self._set_var(self._tmpl_w_var, str(tmpl_w))
+            self._set_var(self._tmpl_h_var, str(tmpl_h))
+        finally:
+            self._suspend_validate = False
 
     def _on_run(self) -> None:
         if self._running:
@@ -1988,7 +2729,7 @@ class MeshTemplateTrackNode(BaseNode):
         if problem:
             messagebox.showwarning("Run", problem, parent=self._dlg_parent())
             return
-        start, end = cfg["start"], cfg["end"]
+        start, end, ref = cfg["start"], cfg["end"], cfg["ref"]
         M, N = cfg["cells"]
         (u0, v0), (u1, v1) = cfg["tl"], cfg["lr"]
         S = end - start + 1
@@ -2005,10 +2746,14 @@ class MeshTemplateTrackNode(BaseNode):
         result = {
             "points": np.full((S, M, N, 2), np.nan), "status": np.zeros((S, M, N), np.uint8),
             "confidence": np.full((S, M, N), np.nan), "start": start, "end": end, "n_done": 0,
-            "mesh": (M, N, u0, v0, u1, v1), "bad_frames": 0, "n_files": len(self._files),
+            "filled": np.zeros(S, dtype=bool), "ref": ref,
+            "mesh": (M, N, u0, v0, u1, v1), "bad_frames": 0, "n_files": self._n_frames(),
             "settings": self._settings_dict(),        # snapshot: saved together with the result
         }
-        job = {"files": list(self._files[start - 1:end]), "mesh_pts": mesh_pts,
+        job = {"source": self._source(), "seq": list(range(start - 1, end)), "mesh_pts": mesh_pts,
+               "ref_seq": ref - 1,
+               "ref_index": ref - start if start <= ref <= end else None,
+               "ref_before": ref < start,
                "update_template": cfg["update_template"],
                "cfg": {"template_size": cfg["template"], "search_range": cfg["search"],
                        "num_levels": cfg["levels"], "match_method": MATCH_METHODS[cfg["method"]],
@@ -2017,11 +2762,13 @@ class MeshTemplateTrackNode(BaseNode):
         state = {"cancel": threading.Event(), "done": 0, "total": S, "finished": False,
                  "error": None, "bad_frames": 0, "t0": time.time(),
                  "info": {"phase": "starting", "tune": {}}}     # filled by the worker, shown in the Run panel
+        self._source().stop_background()             # tracking gets the CPU / disk
         self._result, self._run_state, self._running = result, state, True
         # Keep self._result_path: it stays the node's result-file property (the
         # default for "Save as"); the new result is marked as not saved in it.
         self._result_saved, self._result_error = True, ""
         self._last_plot_done = 0
+        self._view_filled_drawn = False
         self._series_user_view = False
         self._set_running_ui(True)
         self._update_result_info()
@@ -2041,6 +2788,8 @@ class MeshTemplateTrackNode(BaseNode):
         self._set_state(self._btn_stop, tk.NORMAL if running else tk.DISABLED)
         self._set_state(self._btn_load, tk.DISABLED if running else tk.NORMAL)
         self._set_state(self._btn_save, tk.DISABLED if running else tk.NORMAL)
+        self._set_state(self._btn_save_now, tk.DISABLED if running else tk.NORMAL)
+        self._update_source_info()                  # no changing the input while tracking
         if running:
             self._set_state(self._btn_run, tk.DISABLED)
         else:
@@ -2061,6 +2810,11 @@ class MeshTemplateTrackNode(BaseNode):
             self._progress.configure(maximum=total, value=done)
             elapsed = time.time() - st["t0"]
             eta = "estimating ..." if done <= 1 else self._fmt_time(elapsed * (total - done) / (done - 1))
+            phase = str((st.get("info") or {}).get("phase", ""))
+            if phase.startswith("reading the video"):    # before the first tracked frame
+                self._progress_var.set(f"{phase[0].upper()}{phase[1:]}   "
+                                       f"elapsed {self._fmt_time(elapsed)}")
+                return self._set_run_info(self._run_info_lines(st))
             self._progress_var.set(f"Frame {done}/{total} ({100 * done // total}%)   "
                                    f"elapsed {self._fmt_time(elapsed)}   ETA {eta}")
         except tk.TclError:
@@ -2121,11 +2875,14 @@ class MeshTemplateTrackNode(BaseNode):
         self._update_progress_ui()
         self._update_status_item()
         if done != self._last_plot_done:
-            prev = self._last_plot_done
             self._last_plot_done = done
             self._redraw_series()
-            if res is not None and prev <= self._view_frame - res["start"] < done:
-                self._redraw_preview()               # displayed frame just became available
+            idx = self._view_frame - res["start"] if res is not None else -1
+            if res is not None and 0 <= idx < res["points"].shape[0]:
+                filled_now = bool(self._filled(res)[idx])
+                if filled_now != self._view_filled_drawn:
+                    self._view_filled_drawn = filled_now
+                    self._redraw_preview()           # displayed frame just became available
         if st["finished"]:
             self._finish_run(st)
             return
@@ -2139,7 +2896,7 @@ class MeshTemplateTrackNode(BaseNode):
         self._running, self._run_state = False, None
         if res is not None:
             res["n_done"], res["bad_frames"] = st["done"], st["bad_frames"]
-        if st["done"] == 0:                           # not even the start frame: nothing to keep
+        if st["done"] == 0:                           # no frame at all: nothing to keep
             self._result = None
         self._result_saved = self._result is None
         if st["error"]:
@@ -2169,7 +2926,7 @@ class MeshTemplateTrackNode(BaseNode):
         path = self._result_path
         self._result_file_var.set(path or "")
         if not path:
-            note = "No result file yet (use Save as ... to choose one)."
+            note = "No result file yet (use Save or Save as ... to choose one)."
         else:
             base = self._get_project_base()
             if base is not None:
@@ -2179,7 +2936,7 @@ class MeshTemplateTrackNode(BaseNode):
             if not os.path.isfile(path):
                 note += "\nFile not found."
             elif self._result is not None and not self._result_saved and not self._running:
-                note += "\nThe current result is NOT saved in this file yet (use Save as ...)."
+                note += "\nThe current result is NOT saved in this file yet (use Save, Ctrl+S)."
         self._result_file_note_var.set(note)
 
     def _file_dialog_start(self) -> dict:
@@ -2211,9 +2968,10 @@ class MeshTemplateTrackNode(BaseNode):
                 text += "\nSaved in the file above."
             else:
                 text += "\nNOT saved to a file yet."
-            if self._files and res.get("n_files") and res["n_files"] != len(self._files):
+            n_now = self._n_frames()
+            if n_now and res.get("n_files") and res["n_files"] != n_now:
                 text += (f"\nNote: the result was computed for a sequence of {res['n_files']} files; "
-                         f"the current input has {len(self._files)}.")
+                         f"the current input has {n_now}.")
             color = "#b36b00" if (not self._result_saved and not self._running) else "#334477"
         self._result_info_var.set(text)
         self._update_result_file_field()
@@ -2246,17 +3004,127 @@ class MeshTemplateTrackNode(BaseNode):
                 if mesh is None or len(mesh) != 6:
                     raise ValueError("the file has no mesh description")
                 start = int(meta.get("start", 1))
+                n_done = int(min(max(meta.get("n_done", S), 0), S))
+                # Files saved before tracking ran outward from a reference
+                # frame have no 'filled' array: their frames were a prefix.
+                filled = (np.array(data["filled"]).astype(bool).reshape(-1) if "filled" in names
+                          else np.arange(S) < n_done)
+                if filled.shape != (S,):
+                    raise ValueError("'filled' does not match 'points'")
                 result = {"points": pts, "status": status, "confidence": conf, "start": start,
-                          "end": start + S - 1, "n_done": int(min(max(meta.get("n_done", S), 0), S)),
+                          "end": start + S - 1, "n_done": n_done, "filled": filled,
+                          "ref": (int(meta["ref"]) if meta.get("ref") is not None else None),
                           "mesh": (int(mesh[0]), int(mesh[1])) + tuple(float(v) for v in mesh[2:]),
                           "bad_frames": int(meta.get("bad_frames", 0)),
                           "n_files": int(meta.get("n_files", 0)), "settings": settings}
         return settings, result
 
+    # ── own input selection (used when the 'files' pin has no images) ─────
+    _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".ppm", ".pgm")
+
+    def _local_dialog_dir(self):
+        spec = self._local_spec
+        if spec and spec.get("paths"):
+            return os.path.dirname(spec["paths"][0]) or None
+        base = self._get_project_base()
+        return str(base) if base is not None else None
+
+    def _on_select_video(self) -> None:
+        if self._running or self._pin_source is not None:
+            return
+        exts = " ".join(f"*{e}" for e in VIDEO_EXTS)
+        path = self.ask_open_filename(
+            parent=self._dlg_parent(), title="Select a video to track",
+            filetypes=[("Video files", exts), ("All files", "*.*")], initialdir=self._local_dialog_dir())
+        if path:
+            self._set_local({"kind": "video", "paths": [os.path.abspath(path)]}, show_errors=True)
+
+    def _on_select_images(self) -> None:
+        if self._running or self._pin_source is not None:
+            return
+        exts = " ".join(f"*{e}" for e in self._IMAGE_EXTS)
+        names = self.ask_open_filenames(
+            parent=self._dlg_parent(), title="Select the image files to track (Ctrl / Shift-click)",
+            filetypes=[("Image files", exts), ("All files", "*.*")], initialdir=self._local_dialog_dir())
+        if names:
+            self._set_local({"kind": "images", "paths": sorted(os.path.abspath(n) for n in names)},
+                            show_errors=True)
+
+    def _on_clear_local(self) -> None:
+        if not self._running:
+            self._set_local(None)
+
+    def _set_local(self, spec, show_errors: bool = False) -> None:
+        """Use `spec` ({"kind", "paths"} with absolute paths, or None) as the
+        node's own input. A video that cannot be opened keeps its path (so a
+        project save does not drop it) and shows why in the Input group."""
+        old_n = self._n_frames()
+        if self._local_source is not None:
+            self._local_source.close()
+        self._local_spec, self._local_source, self._local_error = spec, None, ""
+        if spec:
+            try:
+                self._local_source = FrameSource(spec["kind"], spec["paths"])
+            except Exception as e:
+                what = "video" if spec["kind"] == "video" else "images"
+                self._local_error = f"Cannot open the selected {what}:\n{spec['paths'][0]}\n({e})"
+                if show_errors:
+                    messagebox.showerror("Select input", self._local_error, parent=self._dlg_parent())
+        self._on_files_changed(old_n)
+
+    def _local_input_params(self) -> dict | None:
+        """The own selection for the project file, with paths RELATIVE to the
+        project file where possible. Images from one folder are stored as
+        that folder + file names; a very long list goes to a side file next
+        to the project ('<project>.<node id>.mesh_track_images.txt')."""
+        spec = self._local_spec
+        if not spec:
+            return None
+        base = self._get_project_base()
+        rel = [self._to_relative(p, base) for p in spec["paths"]]
+        if spec["kind"] == "video":
+            return {"kind": "video", "path": rel[0]}
+        folders = {os.path.dirname(p) for p in rel}
+        if len(folders) == 1:
+            out = {"kind": "images", "folder": folders.pop(), "names": [os.path.basename(p) for p in rel]}
+        else:
+            out = {"kind": "images", "paths": rel}
+        # However long: long params go to the project file's Data sheet
+        # (project_io.py); 'list_file' side files of older projects are still read.
+        return out
+
+    def _restore_local_input(self, data) -> None:
+        if not isinstance(data, dict) or data.get("kind") not in ("video", "images"):
+            self._set_local(None)
+            return
+        base = self._get_project_base()
+        if data["kind"] == "video":
+            rel = [str(data.get("path", "") or "")]
+        elif data.get("list_file"):
+            try:
+                text = (Path(base) / Path(str(data["list_file"])).name).read_text(encoding="utf-8")
+                rel = [line.strip() for line in text.splitlines() if line.strip()]
+            except (OSError, TypeError):
+                self._local_spec, self._local_source = None, None
+                self._local_error = f"The saved image list {data['list_file']} was not found."
+                self._on_files_changed(self._n_frames())
+                return
+        elif "names" in data:
+            # One folder: resolve it once, not once per file (thousands of
+            # resolve() calls are slow on network / external drives).
+            folder = self._to_absolute(str(data.get("folder", "") or "."), base)
+            paths = [os.path.join(folder, str(n)) for n in data.get("names", []) if n]
+            self._set_local({"kind": "images", "paths": paths} if paths else None)
+            return
+        else:
+            rel = [str(p) for p in data.get("paths", [])]
+        paths = [self._to_absolute(p, base) for p in rel if p]
+        self._set_local({"kind": data["kind"], "paths": paths} if paths else None)
+
     def _on_load(self) -> None:
         if self._running:
             return
-        path = filedialog.askopenfilename(
+        path = self.ask_open_filename(
             parent=self._inspector_win, title="Load mesh tracking settings and result",
             filetypes=[("Mesh tracking files", "*.npz"), ("All files", "*.*")],
             **self._file_dialog_start())
@@ -2283,15 +3151,28 @@ class MeshTemplateTrackNode(BaseNode):
         self._redraw_series()
         self._notify_result_changed()
 
+    def _on_save(self) -> None:
+        """Save to the node's result file without asking (Ctrl+S); the first
+        time, when there is no result file yet, this is Save as."""
+        if self._running:
+            return
+        if not self._result_path:
+            self._on_save_as()
+            return
+        self._write_track_file(self._result_path, "Save")
+
     def _on_save_as(self) -> None:
         if self._running:
             return
-        path = filedialog.asksaveasfilename(
+        path = self.ask_save_as_filename(
             parent=self._inspector_win, title="Save mesh tracking settings and result",
             defaultextension=".npz", filetypes=[("Mesh tracking files", "*.npz")],
             **self._file_dialog_start())
         if not path:
             return
+        self._write_track_file(path, "Save as")
+
+    def _write_track_file(self, path: str, title: str) -> None:
         res = self._result
         # A result is saved with the settings that produced it, so the file is
         # self-consistent even if the UI was edited after the run.
@@ -2301,14 +3182,16 @@ class MeshTemplateTrackNode(BaseNode):
             S = res["points"].shape[0]
             mesh = res["mesh"]
             meta = {"version": 1, "start": int(res["start"]), "end": int(res["end"]),
+                    "ref": (int(res["ref"]) if res.get("ref") is not None else None),
                     "n_done": int(res["n_done"]), "mesh": [int(mesh[0]), int(mesh[1])] + [float(v) for v in mesh[2:]],
                     "bad_frames": int(res.get("bad_frames", 0)), "n_files": int(res.get("n_files", 0))}
             arrays.update(points=res["points"], status=res["status"], confidence=res["confidence"],
+                          filled=self._filled(res),
                           frames=(res["start"] + np.arange(S)), meta_json=np.array(json.dumps(meta)))
         try:
             np.savez_compressed(path, **arrays)
         except Exception as e:
-            messagebox.showerror("Save as", f"Cannot save the file:\n{e}", parent=self._dlg_parent())
+            messagebox.showerror(title, f"Cannot save the file:\n{e}", parent=self._dlg_parent())
             return
         final = path if path.lower().endswith(".npz") else path + ".npz"
         self._result_path, self._result_saved = os.path.abspath(final), True
@@ -2359,8 +3242,12 @@ class MeshTemplateTrackNode(BaseNode):
         self._destroyed = True
         if self._run_state is not None:
             self._run_state["cancel"].set()
-        for attr in ("_poll_id", "_preview_poll_id", "_preview_debounce_id"):
+        if self._copy_job is not None:
+            self._copy_job["state"]["cancel"].set()
+        for attr in ("_poll_id", "_preview_poll_id", "_preview_debounce_id", "_video_poll_id", "_copy_check_id"):
             self._cancel_after(attr)
+        if self._local_source is not None:
+            self._local_source.close()               # stops the video's frame counting too
         if self._preview_executor is not None:
             self._preview_executor.shutdown(wait=False)
         super().on_destroy()

@@ -2,7 +2,7 @@
 
 import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 import threading
 import time
 import re
@@ -15,7 +15,7 @@ import numpy as np
 from node_editor.base_node import BaseNode
 from node_editor.pin_types import PinSchema, PinDef, PinType
 from node_editor.execution import ExecutionMode
-from node_editor.project_context import get_project_directory, get_project_file_path
+from node_editor.project_context import get_project_directory
 from node_editor.video_frame_reader import VideoFrameReader, VIDEO_EXTS
 from node_editor.tooltip import add_tooltip
 
@@ -1273,7 +1273,7 @@ Ctrl+H shows this help.
     # ── image list: folder / files / numbered names ───────────────
 
     def _browse_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Select image folder", parent=self._dialog_parent())
+        folder = self.ask_directory(title="Select image folder", parent=self._dialog_parent())
         if not folder:
             return
 
@@ -1293,7 +1293,7 @@ Ctrl+H shows this help.
 
     def _browse_files(self) -> None:
         exts = " ".join(f"*{e}" for e in sorted(self._IMG_EXTS))
-        names = filedialog.askopenfilenames(
+        names = self.ask_open_filenames(
             title="Select image files", parent=self._dialog_parent(),
             filetypes=[("Image files", exts), ("All files", "*.*")])
         if not names:
@@ -1332,7 +1332,7 @@ Ctrl+H shows this help.
             row=1, column=1, columnspan=2, sticky="ew", pady=(8, 2))
 
         def browse_dir():
-            d = filedialog.askdirectory(title="Folder of the numbered files", parent=top)
+            d = self.ask_directory(title="Folder of the numbered files", parent=top)
             if d:
                 name = Path(self._pattern_var.get().strip()).name or "img_%04d.png"
                 self._pattern_var.set(str(Path(d) / name))
@@ -1390,8 +1390,8 @@ Ctrl+H shows this help.
 
     def _browse_video(self) -> None:
         exts = " ".join(f"*{e}" for e in VIDEO_EXTS)
-        path = filedialog.askopenfilename(title="Open video", parent=self._dialog_parent(),
-                                          filetypes=[("Video files", exts), ("All files", "*.*")])
+        path = self.ask_open_filename(title="Open video", parent=self._dialog_parent(),
+                                      filetypes=[("Video files", exts), ("All files", "*.*")])
         if path:
             self._open_video(path, reset_batch=True)
 
@@ -1547,7 +1547,7 @@ Ctrl+H shows this help.
         tk.Label(f, text="Folder:").grid(row=2, column=0, sticky="w", pady=(8, 2))
         tk.Entry(f, textvariable=folder_var, width=60).grid(row=2, column=1, columnspan=2, sticky="ew", pady=(8, 2))
         tk.Button(f, text="...", command=lambda: folder_var.set(
-            filedialog.askdirectory(parent=top) or folder_var.get())).grid(row=2, column=3, padx=(4, 0), pady=(8, 2))
+            self.ask_directory("save", parent=top) or folder_var.get())).grid(row=2, column=3, padx=(4, 0), pady=(8, 2))
         tk.Label(f, text="File names:").grid(row=3, column=0, sticky="w", pady=2)
         name_entry = tk.Entry(f, textvariable=name_var, width=36)
         name_entry.grid(row=3, column=1, sticky="w", pady=2)
@@ -2034,7 +2034,7 @@ Ctrl+H shows this help.
                     f"overwritten; they are skipped.\n\nContinue?",
                     icon="warning", default="cancel", parent=win):
                 return
-            dest = filedialog.askdirectory(title="Move unselected files to folder", parent=win)
+            dest = self.ask_directory("save", title="Move unselected files to folder", parent=win)
             if not dest:
                 return
             dest = os.path.abspath(dest)
@@ -2806,39 +2806,6 @@ Ctrl+H shows this help.
     def get_help_text(self) -> str:
         return self.HELP_TEXT
 
-    _INLINE_FILE_LIST_MAX = 12000   # longer lists go to a side file (Excel cell limit)
-
-    def _project_sidecar_filename(self) -> str | None:
-        """'<project>.<node_id>.image_sequence_files.txt' next to the project
-        file, or None while the project has no file yet."""
-        project_path = get_project_file_path()
-        if project_path is None:
-            return None
-        safe_node_id = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in self.node_id)
-        return f"{project_path.stem}.{safe_node_id}.image_sequence_files.txt"
-
-    def _write_file_list_sidecar(self, filename: str, paths: list[str]) -> bool:
-        """One project-relative path per line, UTF-8; written atomically."""
-        project_dir = get_project_directory()
-        if project_dir is None:
-            return False
-        path = project_dir / filename
-        text = "\n".join(paths) + "\n"
-        if self._sidecar_unchanged(path, text):
-            return True                              # same content already on disk
-        tmp = path.with_name(path.name + ".tmp")
-        try:
-            tmp.write_text(text, encoding="utf-8")
-            tmp.replace(path)
-            self._remember_sidecar(path, text)
-            return True
-        except OSError:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            return False
-
     def _read_file_list_sidecar(self, filename: str) -> str | None:
         project_dir = get_project_directory()
         if project_dir is None or Path(filename).name != filename:
@@ -2847,28 +2814,7 @@ Ctrl+H shows this help.
             text = (project_dir / filename).read_text(encoding="utf-8")
         except OSError:
             return None
-        self._remember_sidecar(project_dir / filename, text)
         return text
-
-    # The side file is skipped on save when its text equals what was last
-    # read / written AND the file was not touched since (same size + mtime).
-    # Opening a file costs tens of ms on some drives (antivirus, USB, network).
-    def _remember_sidecar(self, path: Path, text: str) -> None:
-        try:
-            st = os.stat(path)
-            self._sidecar_known = (str(path), hash(text), st.st_size, st.st_mtime_ns)
-        except OSError:
-            self._sidecar_known = None
-
-    def _sidecar_unchanged(self, path: Path, text: str) -> bool:
-        known = getattr(self, "_sidecar_known", None)
-        if not known or known[0] != str(path) or known[1] != hash(text):
-            return False
-        try:
-            st = os.stat(path)
-        except OSError:
-            return False
-        return (st.st_size, st.st_mtime_ns) == known[2:]
 
     def get_params(self) -> dict:
         base  = self._get_project_base()
@@ -2878,7 +2824,6 @@ Ctrl+H shows this help.
             cached = (key, self._normalize_paths(self._file_paths, base))
             self._params_paths_cache = cached
         paths = cached[1]
-        method = "pattern" if self._wait_files_var.get() else "folder"
         pattern = self._to_relative(self._pattern_var.get().strip(), base)
 
         folder_value = self._folder_var.get().strip()
@@ -2892,21 +2837,12 @@ Ctrl+H shows this help.
                 if all(p.parent == abs_files[0].parent for p in abs_files):
                     folder_value = self._to_relative(inferred, base)
 
+        # The whole list is kept in the params, however long: a node's params
+        # longer than one Excel cell go to the project file's Data sheet
+        # (project_io.py). Projects saved before used a side file
+        # ('file_list_file'), still read by set_params.
         file_list_text = "\n".join(paths)
-        # All params of a node are stored as JSON in ONE Excel cell (max
-        # 32,767 characters), so a long file list cannot stay inline. It is
-        # written to a side file next to the project instead (same scheme as
-        # the Array Viewer's .npy side file) and set_params reads it back.
-        # Previously a long list was simply dropped in folder mode, and the
-        # project reload re-scanned the folder -- so files the user had
-        # removed from the list came back (the saved edit was lost).
         file_list_file = ""
-        if len(file_list_text) > self._INLINE_FILE_LIST_MAX:
-            sidecar = self._project_sidecar_filename()
-            if sidecar is not None and self._write_file_list_sidecar(sidecar, paths):
-                file_list_file, file_list_text = sidecar, ""
-            elif method == "folder":
-                file_list_text = ""          # last resort: the folder re-scan
 
         video_value = self._video_path_var.get().strip()
         if video_value:

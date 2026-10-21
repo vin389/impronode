@@ -1,20 +1,75 @@
 import json
 import ast
+import os
 import re
+import zipfile
+import zlib
 from pathlib import Path
 from typing import Any
 
 try:
     from openpyxl import Workbook, load_workbook
+    from openpyxl.writer.excel import ExcelWriter
 except Exception:  # pragma: no cover - handled at runtime via clear error
     Workbook = None
     load_workbook = None
+    ExcelWriter = None
 
 SCHEMA_VERSION = "1.0"
+
+# Everything is saved in the ONE .xlsx file. Excel limits a cell to 32,767
+# characters, so longer texts -- a node's params_json that is too long, and
+# node arrays (project_data.py: base64 text) -- go to the hidden 'Data'
+# sheet, split into cells of CHUNK characters (rows: key, part, text).
+DATA_SHEET = "Data"
+CHUNK = 30000
+PARAMS_IN_DATA = "$params_in_data"
+_RESERVED_SHEETS = ("ProjectMeta", "Nodes", "Links", DATA_SHEET)
 
 
 class ProjectFormatError(Exception):
     pass
+
+
+class _XlsxZip(zipfile.ZipFile):
+    """The .xlsx package: a part whose content hardly compresses (the base64
+    text of node arrays) is STORED, not deflated -- deflating it costs most
+    of the save time and gains little. Other parts: fast deflate."""
+
+    @staticmethod
+    def _dense(sample: bytes) -> bool:
+        # base64 text of binary data deflates only to ~75% (its 6 bits per
+        # character); ordinary text (JSON, XML) to 10-25%.
+        return len(zlib.compress(sample, 1)) > 0.6 * len(sample)
+
+    def writestr(self, zinfo_or_arcname, data, compress_type=None, compresslevel=None):
+        if compress_type is None and len(data) > (1 << 20):
+            raw = data.encode("utf-8") if isinstance(data, str) else data
+            if self._dense(raw[len(raw) // 2:len(raw) // 2 + (1 << 18)]):
+                compress_type = zipfile.ZIP_STORED
+        super().writestr(zinfo_or_arcname, data, compress_type=compress_type,
+                         compresslevel=compresslevel if compress_type != zipfile.ZIP_STORED else None)
+
+    def write(self, filename, arcname=None, compress_type=None, compresslevel=None):
+        # write_only worksheets arrive here as temporary files.
+        try:
+            size = os.path.getsize(filename)
+        except OSError:
+            size = 0
+        if compress_type is None and size > (1 << 20):
+            with open(filename, "rb") as f:
+                f.seek(size // 2)
+                if self._dense(f.read(1 << 18)):
+                    compress_type = zipfile.ZIP_STORED
+        super().write(filename, arcname, compress_type=compress_type,
+                      compresslevel=compresslevel if compress_type != zipfile.ZIP_STORED else None)
+
+
+def _set_dimension(ws, n_rows: int, last_col: str) -> None:
+    """Give a write_only sheet its size (<dimension>, written before the
+    first row). Without it, openpyxl's read_only loader parses the WHOLE
+    sheet just to find its size -- for the Data sheet, twice the load time."""
+    ws.calculate_dimension = lambda: f"A1:{last_col}{max(1, n_rows)}"
 
 
 def _require_openpyxl() -> None:
@@ -191,13 +246,21 @@ def save_project(
     nodes: list[dict[str, Any]],
     links: list[dict[str, str]],
     app_meta: dict[str, Any] | None = None,
+    data: dict[str, str] | None = None,
 ) -> None:
+    """Write the project. `data`: long texts (key -> text) for the Data
+    sheet, e.g. project_data.end_save(). Written to a temporary file first,
+    so a failed save never leaves a broken project."""
     _require_openpyxl()
 
-    wb = Workbook()
+    data = dict(data or {})
+    # write_only: rows are streamed to the file -- much faster and lighter
+    # than building the whole workbook in memory.
+    wb = Workbook(write_only=True)
 
-    ws_meta = wb.active
-    ws_meta.title = "ProjectMeta"
+    ws_meta = wb.create_sheet("ProjectMeta")
+    meta_items = [(k, v) for k, v in (app_meta or {}).items() if k != "extra_tables"]
+    _set_dimension(ws_meta, 2 + len(meta_items), "B")
     ws_meta.append(["key", "value"])
     ws_meta.append(["schema_version", SCHEMA_VERSION])
     if app_meta:
@@ -207,6 +270,7 @@ def save_project(
             ws_meta.append([str(key), json.dumps(value, ensure_ascii=False)])
 
     ws_nodes = wb.create_sheet("Nodes")
+    _set_dimension(ws_nodes, 1 + len(nodes), "H")
     fixed_cols = [
         "node_id",
         "node_type",
@@ -222,6 +286,11 @@ def save_project(
     ws_nodes.append(fixed_cols)
 
     for n in nodes:
+        params_text = json.dumps(n.get("params", {}), ensure_ascii=False)
+        if len(params_text) > CHUNK:
+            key = f"params/{n.get('node_id', '')}"
+            data[key] = params_text
+            params_text = json.dumps({PARAMS_IN_DATA: key})
         row = {
             "node_id": n.get("node_id", ""),
             "node_type": n.get("node_type", ""),
@@ -230,12 +299,13 @@ def save_project(
             "y": n.get("y", 0),
             "width": n.get("width", 0),
             "height": n.get("height", 0),
-            "params_json": json.dumps(n.get("params", {}), ensure_ascii=False),
+            "params_json": params_text,
         }
 
         ws_nodes.append([row.get(c, "") for c in fixed_cols])
 
     ws_links = wb.create_sheet("Links")
+    _set_dimension(ws_links, 1 + len(links), "E")
     # geometry_json: optional curve edit points (see link_geometry.py); empty
     # means the default curve. Files written before it existed have only the
     # first four columns and load as default curves.
@@ -255,7 +325,7 @@ def save_project(
     if isinstance(extra_tables, dict):
         for sheet_name, rows in extra_tables.items():
             sname = str(sheet_name)
-            if not sname or sname in ("ProjectMeta", "Nodes", "Links"):
+            if not sname or sname in _RESERVED_SHEETS:
                 continue
             if sname in wb.sheetnames:
                 continue
@@ -272,17 +342,66 @@ def save_project(
                     continue
                 ws.append([r.get(c, "") for c in cols])
 
-    wb.save(str(file_path))
+    if data:
+        ws_data = wb.create_sheet(DATA_SHEET)
+        ws_data.sheet_state = "hidden"
+        _set_dimension(ws_data, 1 + sum(max(1, -(-len(str(t)) // CHUNK)) for t in data.values()), "C")
+        ws_data.append(["key", "part", "text"])
+        for key, text in data.items():
+            text = str(text)
+            for part, start in enumerate(range(0, max(1, len(text)), CHUNK)):
+                ws_data.append([key, part, text[start:start + CHUNK]])
+
+    target = Path(file_path)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        with _XlsxZip(str(tmp), "w", zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=1) as archive:
+            ExcelWriter(wb, archive).save()
+        tmp.replace(target)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def load_project(file_path: str | Path) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
+    """(nodes, links, meta). meta['data'] = the Data sheet (key -> text),
+    for project_data.begin_load()."""
     _require_openpyxl()
 
-    wb = load_workbook(str(file_path), data_only=True)
+    # read_only: rows are streamed from the file -- much faster for big files.
+    wb = load_workbook(str(file_path), data_only=True, read_only=True)
+    try:
+        return _load_workbook(wb)
+    finally:
+        wb.close()
+
+
+def _read_data_sheet(wb) -> dict[str, str]:
+    if DATA_SHEET not in wb.sheetnames:
+        return {}
+    parts: dict[str, list] = {}
+    for row in wb[DATA_SHEET].iter_rows(min_row=2, values_only=True):
+        if not row or row[0] is None:
+            continue
+        key = str(row[0])
+        try:
+            part = int(row[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        text = row[2] if len(row) > 2 and row[2] is not None else ""
+        parts.setdefault(key, []).append((part, str(text)))
+    return {k: "".join(t for _p, t in sorted(v)) for k, v in parts.items()}
+
+
+def _load_workbook(wb) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
     if "Nodes" not in wb.sheetnames:
         raise ProjectFormatError("Missing required worksheet: Nodes")
     if "Links" not in wb.sheetnames:
         raise ProjectFormatError("Missing required worksheet: Links")
+    data = _read_data_sheet(wb)
 
     meta: dict[str, Any] = {}
     issues: list[str] = []
@@ -314,6 +433,7 @@ def load_project(file_path: str | Path) -> tuple[list[dict[str, Any]], list[dict
     for row_no, row in enumerate(ws_nodes.iter_rows(min_row=2, values_only=True), start=2):
         if not row:
             continue
+        row = tuple(row) + (None,) * (len(header) - len(row))   # read-only rows may stop at the last value
 
         node_id = row[col_idx["node_id"]]
         node_type = row[col_idx["node_type"]]
@@ -328,6 +448,17 @@ def load_project(file_path: str | Path) -> tuple[list[dict[str, Any]], list[dict
 
         params: dict[str, Any] = {}
         raw_params = row[col_idx["params_json"]]
+        if isinstance(raw_params, str) and PARAMS_IN_DATA in raw_params:
+            try:
+                key = json.loads(raw_params).get(PARAMS_IN_DATA)
+            except (ValueError, AttributeError):
+                key = None
+            if key in data:
+                raw_params = data.pop(key)
+            else:
+                issues.append(f"Nodes row {row_no} (node_id='{node_id_str}'): its params are missing from the "
+                              f"'{DATA_SHEET}' sheet; defaults used.")
+                raw_params = ""
         if isinstance(raw_params, str) and raw_params.strip():
             parsed_params, parse_error, salvage_warning = _parse_params_object(raw_params)
             if parsed_params is not None:
@@ -394,6 +525,7 @@ def load_project(file_path: str | Path) -> tuple[list[dict[str, Any]], list[dict
     for row_no, row in enumerate(ws_links.iter_rows(min_row=2, values_only=True), start=2):
         if not row:
             continue
+        row = tuple(row)
         src_node, src_pin, dst_node, dst_pin = (row + (None, None, None, None))[:4]
         if None in (src_node, src_pin, dst_node, dst_pin):
             issues.append(f"Links row {row_no}: missing required column value; row skipped.")
@@ -424,7 +556,7 @@ def load_project(file_path: str | Path) -> tuple[list[dict[str, Any]], list[dict
 
     extra_tables: dict[str, list[dict[str, Any]]] = {}
     for sname in wb.sheetnames:
-        if sname in ("ProjectMeta", "Nodes", "Links"):
+        if sname in _RESERVED_SHEETS:
             continue
         ws = wb[sname]
         rows_iter = ws.iter_rows(min_row=1, max_row=1, values_only=True)
@@ -452,5 +584,6 @@ def load_project(file_path: str | Path) -> tuple[list[dict[str, Any]], list[dict
         meta["load_issues"] = issues
     if extra_tables:
         meta["extra_tables"] = extra_tables
+    meta["data"] = data
 
     return nodes, links, meta
